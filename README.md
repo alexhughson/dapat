@@ -17,20 +17,25 @@ dependencies {
 import dapat.*
 import kotlinx.io.files.Path
 
+// Create tasks as objects
+val compile = Task(
+    id = "compile",
+    inputs = setOf(file("src/main.kt")),
+    outputs = setOf(file("build/main.js")),
+    action = { /* compile */ }
+)
+
+val bundle = Task(
+    id = "bundle",
+    inputs = setOf(directory("build/")),  // depends on anything in build/
+    outputs = setOf(file("dist/bundle.js")),
+    action = { /* bundle */ }
+)
+
+// Add to build
 val build = Build(JsonState(Path(".dapat-state.json")))
-
-build.task("compile") {
-    input(file("src/main.kt"))
-    output(file("build/main.js"))
-    action { /* compile */ }
-    onDone { executed -> println("compile: ${if (executed) "ran" else "skipped"}") }
-}
-
-build.task("bundle") {
-    input(directory("build/"))  // depends on anything in build/
-    output(file("dist/bundle.js"))
-    action { /* bundle */ }
-}
+build.addTask(compile)
+build.addTask(bundle)
 
 // Query
 build.outputs()         // all outputs
@@ -41,6 +46,17 @@ build.plan()            // execution order
 runBlocking {
     val result = build.run()
     println("${result.executed.size} executed, ${result.skipped.size} skipped")
+}
+```
+
+### DSL Alternative
+
+```kotlin
+build.task("compile") {
+    input(file("src/main.kt"))
+    output(file("build/main.js"))
+    action { /* compile */ }
+    onDone { executed -> println(if (executed) "ran" else "skipped") }
 }
 ```
 

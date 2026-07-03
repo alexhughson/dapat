@@ -1,11 +1,13 @@
 package dapat
 
 import kotlinx.coroutines.CompletableDeferred
-import kotlinx.coroutines.async
-import kotlinx.coroutines.awaitAll
-import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.time.TimeSource
 
 /**
@@ -16,15 +18,25 @@ import kotlin.time.TimeSource
  * - Detects what needs to rebuild (change detection)
  * - Runs tasks in parallel when possible
  * - Fails fast if any task fails
+ * - Supports dynamic task addition during execution
  *
  * Example:
  * ```
  * val build = Build()
  *
- * build.task("compile") {
- *     input(file("src/main.kt"))
- *     output(file("build/main.js"))
- *     action { /* compile */ }
+ * build.task("discover") {
+ *     input(directory("src/"))
+ *     output(virtual("discovery-done"))
+ *     action {
+ *         // Dynamically add tasks based on discovered files
+ *         findSourceFiles().forEach { file ->
+ *             task("compile-${file.name}") {
+ *                 input(file)
+ *                 output(file.compiled())
+ *                 action { compile(file) }
+ *             }
+ *         }
+ *     }
  * }
  *
  * val result = build.run()
@@ -32,7 +44,7 @@ import kotlin.time.TimeSource
  */
 class Build(private val state: State = MemoryState()) {
 
-    private val tasks = mutableListOf<Task>()
+    private val initialTasks = mutableListOf<Task>()
     private var parallelism = 4
 
     /**
@@ -44,22 +56,17 @@ class Build(private val state: State = MemoryState()) {
     // ===== Task Registration =====
 
     /**
-     * Register a task directly.
+     * Add a task to the build.
      */
-    fun task(
-        id: String,
-        inputs: Set<Artifact>,
-        outputs: Set<Artifact>,
-        action: suspend () -> Unit
-    ) {
-        tasks += Task(id, inputs, outputs, action)
+    fun addTask(task: Task) {
+        initialTasks += task
     }
 
     /**
      * Register a task using the builder DSL.
      */
     fun task(id: String, block: TaskBuilder.() -> Unit) {
-        tasks += TaskBuilder(id).apply(block).build()
+        initialTasks += TaskBuilder(id).apply(block).build()
     }
 
     /**
@@ -68,7 +75,7 @@ class Build(private val state: State = MemoryState()) {
     class TaskBuilder(private val id: String) {
         private val inputs = mutableSetOf<Artifact>()
         private val outputs = mutableSetOf<Artifact>()
-        private var action: suspend () -> Unit = {}
+        private var action: suspend BuildContext.() -> Unit = {}
         private var onDone: (suspend (executed: Boolean) -> Unit)? = null
 
         fun input(a: Artifact) = apply { inputs += a }
@@ -77,7 +84,7 @@ class Build(private val state: State = MemoryState()) {
         fun output(a: Artifact) = apply { outputs += a }
         fun outputs(vararg artifacts: Artifact) = apply { outputs += artifacts }
 
-        fun action(block: suspend () -> Unit) = apply { action = block }
+        fun action(block: suspend BuildContext.() -> Unit) = apply { action = block }
 
         /** Hook that runs when task completes (whether executed or skipped) */
         fun onDone(block: suspend (executed: Boolean) -> Unit) = apply { onDone = block }
@@ -93,18 +100,18 @@ class Build(private val state: State = MemoryState()) {
     // ===== Query API (no execution) =====
 
     /**
-     * All outputs that would be produced by this build.
+     * All outputs that would be produced by initial tasks.
+     * Note: Does not include dynamically added tasks.
      */
-    fun outputs(): Set<Artifact> = tasks.flatMap { it.outputs }.toSet()
+    fun outputs(): Set<Artifact> = initialTasks.flatMap { it.outputs }.toSet()
 
     /**
-     * All inputs required by this build.
+     * All inputs required by initial tasks.
      */
-    fun inputs(): Set<Artifact> = tasks.flatMap { it.inputs }.toSet()
+    fun inputs(): Set<Artifact> = initialTasks.flatMap { it.inputs }.toSet()
 
     /**
-     * Inputs not produced by any task (external dependencies).
-     * These must exist before the build can run.
+     * Inputs not produced by any initial task (external dependencies).
      */
     fun externalInputs(): Set<Artifact> {
         val producedIds = outputs().map { it.id }.toSet()
@@ -112,18 +119,18 @@ class Build(private val state: State = MemoryState()) {
     }
 
     /**
-     * Get execution order (topological sort).
-     * Tasks earlier in the list must complete before later tasks.
+     * Get execution order for initial tasks (topological sort).
+     * Note: Dynamic tasks are not included.
      */
     fun plan(): List<Task> {
-        val deps = buildDependencyMap()
+        val deps = buildDependencyMap(initialTasks)
         val result = mutableListOf<Task>()
         val done = mutableSetOf<Task>()
 
-        while (done.size < tasks.size) {
-            val ready = tasks.filter { it !in done && deps[it]!!.all { d -> d in done } }
+        while (done.size < initialTasks.size) {
+            val ready = initialTasks.filter { it !in done && deps[it]!!.all { d -> d in done } }
             if (ready.isEmpty()) {
-                val remaining = tasks.filter { it !in done }.map { it.id }
+                val remaining = initialTasks.filter { it !in done }.map { it.id }
                 error("Cycle detected in task graph. Remaining tasks: $remaining")
             }
             result += ready
@@ -133,63 +140,196 @@ class Build(private val state: State = MemoryState()) {
         return result
     }
 
+    private fun buildDependencyMap(tasks: List<Task>): Map<Task, Set<Task>> {
+        val producers = mutableMapOf<String, Task>()
+        for (task in tasks) {
+            for (output in task.outputs) {
+                producers[output.id] = task
+            }
+        }
+
+        return tasks.associateWith { task ->
+            task.inputs.mapNotNull { input ->
+                findProducerStatic(input, producers, tasks)
+            }.toSet()
+        }
+    }
+
+    private fun findProducerStatic(
+        input: Artifact,
+        producers: Map<String, Task>,
+        tasks: List<Task>
+    ): Task? {
+        producers[input.id]?.let { return it }
+
+        if (input.isPrefix) {
+            for ((id, task) in producers) {
+                if (id.startsWith(input.id)) return task
+            }
+        }
+
+        for (task in tasks) {
+            for (output in task.outputs) {
+                if (output.isPrefix && input.id.startsWith(output.id)) {
+                    return task
+                }
+            }
+        }
+
+        return null
+    }
+
     // ===== Execution =====
 
     /**
      * Run the build.
      *
      * Tasks are executed in dependency order, with maximum parallelism.
-     * Returns a Result with outcomes for each task.
+     * Tasks can dynamically add new tasks during execution.
+     * Returns a Result with outcomes for each task (including dynamic ones).
      */
-    suspend fun run(): Result = coroutineScope {
-        val start = TimeSource.Monotonic.markNow()
+    suspend fun run(): Result {
+        return kotlinx.coroutines.coroutineScope {
+            val executor = Executor(
+                state = state,
+                parallelism = parallelism,
+                onTaskDone = onTaskDone,
+                scope = this
+            )
 
-        // Build dependency map
-        val deps = buildDependencyMap()
+            // Add initial tasks
+            initialTasks.forEach { executor.addTask(it) }
 
-        // Each task has a CompletableDeferred that signals when it's done
-        val completions = tasks.associateWith { CompletableDeferred<Outcome>() }
+            // Wait for all tasks (including dynamically added ones)
+            executor.awaitCompletion()
+        }
+    }
+}
 
-        // Limit parallelism
-        val semaphore = Semaphore(parallelism)
+/**
+ * Internal executor that handles dynamic task execution.
+ */
+internal class Executor(
+    private val state: State,
+    private val parallelism: Int,
+    private val onTaskDone: (suspend (Task, Boolean) -> Unit)?,
+    private val scope: CoroutineScope
+) : BuildContext {
 
-        // Launch a coroutine for each task
-        // Each coroutine waits for its dependencies, then runs
-        val jobs = tasks.map { task ->
-            async {
-                // Wait for all dependencies to complete
-                for (dep in deps[task]!!) {
-                    val outcome = completions[dep]!!.await()
-                    // Fail fast: if dependency failed, propagate
-                    if (outcome is Outcome.Failed) {
-                        val result = Outcome.Failed(
-                            Exception("Dependency '${dep.id}' failed", outcome.error)
-                        )
-                        completions[task]!!.complete(result)
-                        return@async task to result
-                    }
-                }
+    // Output registry: output ID -> producing task
+    private val outputs = ConcurrentHashMap<String, Task>()
 
-                // All dependencies succeeded - acquire semaphore and run
-                semaphore.withPermit {
-                    val outcome = runTask(task)
-                    completions[task]!!.complete(outcome)
-                    task to outcome
+    // Prefix outputs need separate tracking for matching
+    private val prefixOutputs = CopyOnWriteArrayList<Pair<String, Task>>()
+
+    // Completion signals
+    private val completions = ConcurrentHashMap<Task, CompletableDeferred<Outcome>>()
+
+    // Results
+    private val results = ConcurrentHashMap<Task, Outcome>()
+
+    // Completion detection via reference counting
+    private val pendingCount = AtomicInteger(0)
+    private val allDone = CompletableDeferred<Unit>()
+
+    // Parallelism control
+    private val semaphore = Semaphore(parallelism)
+
+    // Timing
+    private val startTime = TimeSource.Monotonic.markNow()
+
+    // ===== BuildContext Implementation =====
+
+    override fun addTask(task: Task) {
+        // Register outputs (detect duplicates)
+        for (output in task.outputs) {
+            if (output.isPrefix) {
+                prefixOutputs.add(output.id to task)
+            } else {
+                val existing = outputs.putIfAbsent(output.id, task)
+                require(existing == null) {
+                    "Duplicate output '${output.id}': already produced by '${existing?.id}', " +
+                        "cannot add from '${task.id}'"
                 }
             }
         }
 
-        // Wait for all tasks and collect results
-        val outcomes = jobs.awaitAll().toMap()
-        val duration = start.elapsedNow().inWholeMilliseconds
+        // Compute dependencies based on current graph state
+        val deps = findDependencies(task)
 
-        Result(outcomes, duration)
+        // Setup completion tracking
+        completions[task] = CompletableDeferred()
+        pendingCount.incrementAndGet()
+
+        // Launch task coroutine
+        scope.launch {
+            executeTask(task, deps)
+        }
+    }
+
+    override fun task(id: String, block: Build.TaskBuilder.() -> Unit) {
+        addTask(Build.TaskBuilder(id).apply(block).build())
+    }
+
+    // ===== Dependency Resolution =====
+
+    private fun findDependencies(task: Task): Set<Task> {
+        return task.inputs.mapNotNull { input ->
+            findProducer(input)
+        }.toSet()
+    }
+
+    private fun findProducer(input: Artifact): Task? {
+        // Exact match
+        outputs[input.id]?.let { return it }
+
+        // Input is prefix - find any output under it
+        if (input.isPrefix) {
+            for ((id, task) in outputs) {
+                if (id.startsWith(input.id)) return task
+            }
+        }
+
+        // Check prefix outputs - input is under a prefix output
+        for ((prefix, task) in prefixOutputs) {
+            if (input.id.startsWith(prefix)) return task
+        }
+
+        return null // External input
+    }
+
+    // ===== Task Execution =====
+
+    private suspend fun executeTask(task: Task, deps: Set<Task>) {
+        try {
+            // Wait for all dependencies
+            for (dep in deps) {
+                val outcome = completions[dep]!!.await()
+                if (outcome is Outcome.Failed) {
+                    val result = Outcome.Failed(
+                        Exception("Dependency '${dep.id}' failed", outcome.error)
+                    )
+                    complete(task, result)
+                    return
+                }
+            }
+
+            // Execute with semaphore (limits parallelism)
+            semaphore.withPermit {
+                val outcome = runTask(task)
+                complete(task, outcome)
+            }
+        } catch (e: Throwable) {
+            complete(task, Outcome.Failed(e))
+        }
     }
 
     private suspend fun runTask(task: Task): Outcome {
-        return if (needsRebuild(task)) {
+        val needsRebuild = checkNeedsRebuild(task)
+
+        return if (needsRebuild) {
             try {
-                task.action()
+                task.action(this) // Execute with BuildContext
                 recordSignatures(task)
                 task.onDone?.invoke(true)
                 onTaskDone?.invoke(task, true)
@@ -204,91 +344,55 @@ class Build(private val state: State = MemoryState()) {
         }
     }
 
-    // ===== Internal: DAG Construction =====
+    private fun complete(task: Task, outcome: Outcome) {
+        results[task] = outcome
+        completions[task]!!.complete(outcome)
 
-    /**
-     * Build a map from each task to the set of tasks it depends on.
-     * A task depends on another if it has an input that the other produces.
-     */
-    private fun buildDependencyMap(): Map<Task, Set<Task>> {
-        // Map: output artifact ID -> task that produces it
-        val producers = mutableMapOf<String, Task>()
-        for (task in tasks) {
-            for (output in task.outputs) {
-                producers[output.id] = task
-            }
-        }
-
-        // For each task, find which tasks produce its inputs
-        return tasks.associateWith { task ->
-            task.inputs.mapNotNull { input ->
-                findProducer(input, producers)
-            }.toSet()
+        // Check if all tasks are done
+        if (pendingCount.decrementAndGet() == 0) {
+            allDone.complete(Unit)
         }
     }
 
-    /**
-     * Find the task that produces a given input artifact.
-     * Handles exact matches and prefix matching.
-     */
-    private fun findProducer(input: Artifact, producers: Map<String, Task>): Task? {
-        // Exact match first
-        producers[input.id]?.let { return it }
+    // ===== Change Detection =====
 
-        // Prefix match: input is a prefix, find any output under it
-        if (input.isPrefix) {
-            for ((id, task) in producers) {
-                if (id.startsWith(input.id)) return task
-            }
-        }
-
-        // Prefix match: output is a prefix, input is under it
-        for (task in tasks) {
-            for (output in task.outputs) {
-                if (output.isPrefix && input.id.startsWith(output.id)) {
-                    return task
-                }
-            }
-        }
-
-        return null // External input (not produced by any task)
-    }
-
-    // ===== Internal: Change Detection =====
-
-    /**
-     * Determine if a task needs to be rebuilt.
-     *
-     * A task needs rebuild if:
-     * - It has never run before
-     * - The set of inputs changed (added/removed)
-     * - Any input's content changed (signature differs)
-     */
-    private suspend fun needsRebuild(task: Task): Boolean {
+    private suspend fun checkNeedsRebuild(task: Task): Boolean {
         val stored = state.get(task.id)
             ?: return true // Never run before
 
-        // Input set changed?
         val currentIds = task.inputs.map { it.id }.toSet()
         if (currentIds != stored.keys) return true
 
-        // Any input content changed?
         for (input in task.inputs) {
             val current = input.signature() ?: ""
             val previous = stored[input.id] ?: ""
             if (current != previous) return true
         }
 
-        return false // Up to date
+        return false
     }
 
-    /**
-     * Record input signatures after a successful task run.
-     */
     private suspend fun recordSignatures(task: Task) {
         val sigs = task.inputs.associate { input ->
             input.id to (input.signature() ?: "")
         }
         state.set(task.id, sigs)
     }
+
+    // ===== Completion =====
+
+    suspend fun awaitCompletion(): Result {
+        // Handle empty build
+        if (pendingCount.get() == 0) {
+            return Result(emptyMap(), 0)
+        }
+
+        allDone.await()
+
+        return Result(
+            outcomes = results.toMap(),
+            durationMs = startTime.elapsedNow().inWholeMilliseconds
+        )
+    }
 }
+

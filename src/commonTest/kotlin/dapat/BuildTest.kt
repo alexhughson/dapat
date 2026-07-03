@@ -269,4 +269,134 @@ class BuildTest {
         build2.run()
         assertEquals(listOf("task1" to false), taskHookCalls)  // false = skipped
     }
+
+    // ===== Dynamic Task Tests =====
+
+    @Test
+    fun testDynamicTaskAddition() = runTest {
+        val executed = mutableListOf<String>()
+
+        val build = Build()
+
+        build.task("discover") {
+            input(virtual("config"))
+            output(virtual("discovery-done"))
+            action {
+                executed += "discover"
+                // Dynamically add tasks
+                task("dynamic1") {
+                    input(virtual("discovery-done"))
+                    output(virtual("dynamic1-output"))
+                    action { executed += "dynamic1" }
+                }
+                task("dynamic2") {
+                    input(virtual("discovery-done"))
+                    output(virtual("dynamic2-output"))
+                    action { executed += "dynamic2" }
+                }
+            }
+        }
+
+        val result = build.run()
+
+        assertTrue(result.success)
+        assertEquals(3, result.executed.size)
+        assertEquals("discover", executed.first())
+        assertTrue("dynamic1" in executed)
+        assertTrue("dynamic2" in executed)
+    }
+
+    @Test
+    fun testDynamicTaskDependsOnExisting() = runTest {
+        val executed = mutableListOf<String>()
+
+        val build = Build()
+
+        build.task("setup") {
+            output(virtual("setup-done"))
+            action { executed += "setup" }
+        }
+
+        build.task("discover") {
+            input(virtual("setup-done"))
+            output(virtual("discovery-done"))
+            action {
+                executed += "discover"
+                // Dynamic task depends on existing task's output
+                task("process") {
+                    input(virtual("setup-done"))  // Already exists
+                    input(virtual("discovery-done"))
+                    output(virtual("processed"))
+                    action { executed += "process" }
+                }
+            }
+        }
+
+        val result = build.run()
+
+        assertTrue(result.success)
+        assertEquals(3, result.executed.size)
+        // Order: setup, discover, process
+        assertEquals("setup", executed[0])
+        assertEquals("discover", executed[1])
+        assertEquals("process", executed[2])
+    }
+
+    @Test
+    fun testNestedDynamicTasks() = runTest {
+        val executed = mutableListOf<String>()
+
+        val build = Build()
+
+        build.task("level0") {
+            output(virtual("level0-done"))
+            action {
+                executed += "level0"
+                task("level1") {
+                    input(virtual("level0-done"))
+                    output(virtual("level1-done"))
+                    action {
+                        executed += "level1"
+                        task("level2") {
+                            input(virtual("level1-done"))
+                            output(virtual("level2-done"))
+                            action { executed += "level2" }
+                        }
+                    }
+                }
+            }
+        }
+
+        val result = build.run()
+
+        assertTrue(result.success)
+        assertEquals(listOf("level0", "level1", "level2"), executed)
+    }
+
+    @Test
+    fun testDynamicTaskWithAddTask() = runTest {
+        val executed = mutableListOf<String>()
+
+        val build = Build()
+
+        build.task("discover") {
+            output(virtual("discovery-done"))
+            action {
+                executed += "discover"
+                // Use addTask directly instead of DSL
+                addTask(Task(
+                    id = "dynamic-direct",
+                    inputs = setOf(virtual("discovery-done")),
+                    outputs = setOf(virtual("dynamic-output")),
+                    action = { executed += "dynamic-direct" }
+                ))
+            }
+        }
+
+        val result = build.run()
+
+        assertTrue(result.success)
+        assertEquals(2, result.executed.size)
+        assertEquals(listOf("discover", "dynamic-direct"), executed)
+    }
 }
