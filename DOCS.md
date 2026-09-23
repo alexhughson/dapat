@@ -15,7 +15,7 @@ This document has two parts:
 
 You describe your work as **tasks**. Each task names its inputs and its outputs. Inputs and outputs can be files. They can also be S3 objects, database rows, or values in memory.
 
-dapat wraps each input and output in an **artifact**, which is a subclass of `Artifact`. The subclass tells dapat how to find out if the thing changed, with a timestamp, a hash, or both. dapat includes artifact classes for files, S3, and SQLite. For anything else, write a small subclass ([section 4](#4-artifacts)).
+dapat wraps each input and output in an **artifact**, which is a subclass of `Artifact`. The subclass tells dapat how to find out if the thing changed, with a timestamp, a hash, or both. dapat includes artifact classes for files, S3, SQLite, and git commits. For anything else, write a small subclass ([section 4](#4-artifacts)).
 
 When you run a **build**, dapat does these steps for each task:
 
@@ -23,12 +23,12 @@ When you run a **build**, dapat does these steps for each task:
 2. It compares the current artifact stamps with the stamps from the last successful run. The **store** keeps the last stamps.
 3. It skips the task when the stamps show that the outputs are current. Otherwise, it runs the task.
 
-dapat does not know about disks or SQL. It only reads artifact ids and stamps. The adapters in `dapat/contrib` supply files, S3, and SQLite.
+dapat does not know about disks or SQL. It only reads artifact ids and stamps. The adapters in `dapat/contrib` supply files, S3, SQLite, and git commits.
 
 There are two ways to declare tasks:
 
 - Use `Build` and `Task` when you know each task in advance, or when your code decides which tasks to add. Sections 3 to 9 describe this.
-- Use `FileBuild` when you want one task for each file or S3 object that matches a path template. [Section 11](#11-rules-with-filebuild) describes this. `FileBuild` makes `Task` objects and adds them to a `Build`, so sections 5 to 9 also apply to it.
+- Use `FileBuild` when you want one task for each file, S3 object, or other pattern match (for example a git commit). [Section 11](#11-rules-with-filebuild) describes this. `FileBuild` makes `Task` objects and adds them to a `Build`, so sections 5 to 9 also apply to it.
 
 ## 2. Install and import
 
@@ -46,7 +46,7 @@ The package has two entry points:
 | Import | Contents |
 | --- | --- |
 | `dapat` | `Build`, `Task`, `Artifact`, `Prefix`, `IdPrefix`, `MemoryStore`, `Result`, and their types |
-| `dapat/contrib` | `FileArtifact`, `DirectoryArtifact`, `PathPrefix`, `S3ObjectArtifact`, `S3Prefix`, `MemoryS3`, `SqliteRowArtifact`, `SqliteTableArtifact`, `SqliteTablePrefix`, `JsonStore`, `SqliteStore`, `FileBuild`, `FilePattern`, `S3Pattern`, and a short factory function for each artifact and prefix (`file`, `directory`, `pathPrefix`, `s3Object`, `s3Prefix`, `sqliteRow`, `sqliteTable`, `sqliteTablePrefix`) |
+| `dapat/contrib` | `FileArtifact`, `DirectoryArtifact`, `PathPrefix`, `S3ObjectArtifact`, `S3Prefix`, `MemoryS3`, `GitCommitArtifact`, `GitCommitPrefix`, `SqliteRowArtifact`, `SqliteTableArtifact`, `SqliteTablePrefix`, `JsonStore`, `SqliteStore`, `FileBuild`, `FilePattern`, `S3Pattern`, `GitCommitPattern`, and a short factory function for each artifact and prefix (`file`, `directory`, `pathPrefix`, `s3Object`, `s3Prefix`, `gitCommit`, `gitCommitPrefix`, `sqliteRow`, `sqliteTable`, `sqliteTablePrefix`) |
 
 ## 3. First build
 
@@ -163,7 +163,7 @@ dapat compares ids as plain strings. An id is in a folder when the id starts wit
 
 dapat has two kinds of prefix:
 
-- A **plain prefix** is a folder name only. It has no stamp and no value. The classes are `IdPrefix`, `PathPrefix`, `S3Prefix`, and `SqliteTablePrefix`. Use a plain prefix when a task writes files, but you do not know their names before the task runs ([section 5](#5-tasks-and-dependencies)).
+- A **plain prefix** is a folder name only. It has no stamp and no value. The classes are `IdPrefix`, `PathPrefix`, `S3Prefix`, `SqliteTablePrefix`, and `GitCommitPrefix`. Use a plain prefix when a task writes files, but you do not know their names before the task runs ([section 5](#5-tasks-and-dependencies)).
 - A **prefix artifact** is a folder that you can stamp and read. Its stamps come from the artifacts in the folder. The classes are `DirectoryArtifact` and `SqliteTableArtifact`. Use a prefix artifact when a task reads all of the contents of a folder.
 
 ### Write your own artifact
@@ -662,20 +662,20 @@ If a single input matches more than one file for one set of vars, `FileBuild` th
 
 ### 11.4 Outputs
 
-- A **single** output, such as `index/<topic>.txt`, must use only vars that the inputs bind. If an output uses a var that no input binds, `FileBuild` creates no task and gives no error. `FileBuild` creates the parent directory before the task runs. Get the path with `ctx.outputFile(name).path`.
-- A **list** output, such as `pages/<doc>/*.txt`, becomes a plain prefix output. The prefix stops at the first glob. For a `FilePattern`, `FileBuild` creates the directory. The task must call `ctx.produced(new FileArtifact(path))` for each file that it writes. Other rules can then match those files in the same build.
+- A **single** output, such as `index/<topic>.txt`, must use only vars that the inputs bind. If an output uses a var that no input binds, `FileBuild` creates no task and gives no error. Before the task runs, `FileBuild` calls `pattern.prepareOutput(artifact)`. For a `FilePattern`, that creates the parent directory. Get the path with `ctx.outputFile(name).path`.
+- A **list** output, such as `pages/<doc>/*.txt`, becomes a plain prefix output. The prefix stops at the first glob. Before the task runs, `FileBuild` calls `pattern.preparePrefix(prefix)`. For a `FilePattern`, that creates the directory. The task must call `ctx.produced(new FileArtifact(path))` for each file that it writes. Other rules can then match those files in the same build.
 
 ### 11.5 How `FileBuild` finds new files
 
 ```text
 files.run()
 ├─ scan()
-│   ├─ for each rule, for each input pattern: walk the files under the literal start of the template
-│   ├─ match each file id against every input pattern and keep the vars
+│   ├─ for each rule, for each input pattern: pattern.scan(root) → artifact ids
+│   ├─ match each id against every input pattern and keep the vars
 │   └─ for each rule: combine the vars → make tasks → build.add(task)
 └─ build.run()
-    └─ a task writes a file and announces it (declared output or ctx.produced)
-        └─ FileBuild listener (listens under the literal start of every input and output template)
+    └─ a task writes an artifact and announces it (declared output or ctx.produced)
+        └─ FileBuild listener (listens under listenPrefix of every input and output pattern)
             ├─ match the id against every input pattern
             └─ combine the vars again
                 ├─ build.add(task) for each new set of vars
@@ -685,7 +685,9 @@ files.run()
 
 This loop lets one rule feed another rule. It also lets a rule feed itself, as in `examples/agent-loop.ts`. Each turn writes `turns/<sid>/<n+1>/prompt.txt`, and that file matches the first rule of the next turn.
 
-A task that skips sends no events. `FileBuild` still finds the outputs of skipped tasks, because `scan` finds existing files before the build runs.
+A task that skips sends no events. `FileBuild` still finds the outputs of skipped tasks, because `scan` finds existing items before the build runs.
+
+For inputs that nothing produces during the build (for example `GitCommitPattern`), new items appear only on the next `scan`. Listen alone does not find new commits.
 
 ### 11.6 The rule context
 
@@ -706,7 +708,7 @@ A task that skips sends no events. `FileBuild` still finds the outputs of skippe
 | `ctx.produced(item)` | Announces a file or object under a list output |
 | `ctx.signal` | The task's `AbortSignal` |
 
-An `Item` is an `Artifact<Uint8Array>`: a file or an S3 object.
+An `Item` is an `Artifact<Uint8Array>`: a file, an S3 object, a git commit, or another byte artifact a pattern binds.
 
 ### 11.7 S3 rules
 
@@ -1165,7 +1167,7 @@ new FileBuild(build: Build, opts?: { root?: string })
 | Member | Description |
 | --- | --- |
 | `rule(spec: FileRule): void` | Adds a rule and listens under the literal start of each input and output template. Call it before `scan` or `run`. |
-| `scan(): Promise<void>` | Finds existing files and objects for every input pattern and adds the matching tasks to the build. |
+| `scan(): Promise<void>` | Calls `scan` on every input pattern, matches the returned ids, and adds the matching tasks to the build. |
 | `run(): Promise<Result>` | Calls `scan()`, then `build.run()`. |
 
 ### `interface FileRule`
@@ -1173,8 +1175,8 @@ new FileBuild(build: Build, opts?: { root?: string })
 ```ts
 interface FileRule {
   name: string
-  inputs: Record<string, ItemPattern>
-  outputs: Record<string, ItemPattern>
+  inputs: Record<string, InputPattern>
+  outputs: Record<string, OutputPattern>
   id?: (vars: Vars) => string        // default: `${name}:${k=v,...}`
   run: (ctx: FileContext) => Promise<void>
 }
@@ -1184,7 +1186,7 @@ interface FileRule {
 
 See [section 11.6](#116-the-rule-context).
 
-### `class FilePattern implements ItemPattern`
+### `class FilePattern implements InputPattern, OutputPattern`
 
 ```ts
 new FilePattern(template: string, opts?: FilePatternOpts)
@@ -1198,8 +1200,10 @@ type FilePatternOpts = { optional?: boolean; list?: boolean }
 | `staticPrefix(root): string` | Absolute path of the literal start, ending with `/`. |
 | `match(absPath, root): Vars \| null` | Vars bound by the path, or `null` if it does not match. |
 | `render(vars, root): string` | The absolute path for the vars. Throws if a var is missing or the template has a glob. |
+| `prepareOutput(artifact)` | Creates the parent directory of a single file output. |
+| `preparePrefix(prefix)` | Creates the directory of a list file output. Throws if `prefix` is not a `PathPrefix`. |
 
-### `class S3Pattern implements ItemPattern`
+### `class S3Pattern implements InputPattern, OutputPattern`
 
 ```ts
 new S3Pattern(template: string, opts: S3PatternOpts)
@@ -1220,26 +1224,97 @@ type S3PatternOpts = {
 | `keyPrefix(): string` | The literal start of the key, ending with `/`, or `""` |
 | `match(key): Vars \| null` | Vars bound by the key |
 | `render(vars): string` | The key for the vars |
+| `prepareOutput` / `preparePrefix` | No-ops. S3 needs no local directory. |
 
-### `interface ItemPattern`
-
-The interface that `FileBuild` uses for patterns. `FilePattern` and `S3Pattern` implement it. Implement it to match a different type of storage.
+### `class GitCommitPattern implements InputPattern`
 
 ```ts
-interface ItemPattern {
+new GitCommitPattern(repo: string, opts?: GitCommitPatternOpts)
+
+type GitCommitPatternOpts = {
+  rev?: string       // default: "HEAD"
+  optional?: boolean
+  list?: boolean
+}
+```
+
+`repo` is a git working tree. A relative path resolves against the `FileBuild` root. The absolute path must not contain `#`. `scan` runs `git rev-list <rev>` and returns one id per commit. `varNames` is `["sha"]` for a single input, or `[]` when `list: true` (one task gets every commit). A bad `rev`, or a repo with no commits yet (unborn `HEAD`), makes `scan` throw with the git stderr.
+
+`GitCommitPattern` is an input only. It does not implement `OutputPattern`.
+
+New commits appear when `scan` runs at the start of `files.run()`. No process announces commits during the build, so listen alone does not find them.
+
+A task that reads a git commit skips on a later run only when the build has a store (`JsonStore`, `SqliteStore`, or a reused `MemoryStore`). The skip uses the stored content stamp (the sha). Without a store, every commit task runs again.
+
+| Member | Description |
+| --- | --- |
+| `repo`, `rev`, `optional`, `list`, `varNames` | As above |
+| `listenPrefix(root)` | A `GitCommitPrefix` for that absolute repo |
+| `matchId` / `artifact` | Bind or build a `GitCommitArtifact` for `git:<absRepo>#<sha>` |
+| `sortKey` | The commit sha |
+
+### `interface InputPattern`
+
+`FileBuild` uses this for rule inputs. `FilePattern`, `S3Pattern`, and `GitCommitPattern` implement it. Implement it for another kind of input.
+
+```ts
+interface InputPattern {
   readonly optional: boolean
   readonly list: boolean
   readonly varNames: readonly string[]
-  listenPrefix(root: string): Prefix                 // prefix for the literal start of the template
-  boundPrefix(vars: Vars, root: string): Prefix      // prefix up to the first glob or unbound var
+  listenPrefix(root: string): Prefix                 // prefix that covers matching artifact ids
   matchId(id: string, root: string): Vars | null     // bind an artifact id, or null
-  renderId(vars: Vars, root: string): string         // artifact id for the vars
   artifact(id: string, root: string): Item           // make the artifact for an id
-  scan(root: string): Promise<string[]>              // ids of existing items under the literal start
-  prepareOutput(artifact: Item): Promise<void>       // called before run for each single output
+  scan(root: string): Promise<string[]>              // ids that already exist
   sortKey(artifact: Item): string                    // sort key for list inputs
 }
 ```
+
+### `interface OutputPattern`
+
+`FileBuild` uses this for rule outputs. `FilePattern` and `S3Pattern` implement it. Implement it for another kind of output.
+
+```ts
+interface OutputPattern {
+  readonly list: boolean
+  readonly varNames: readonly string[]
+  listenPrefix(root: string): Prefix                 // prefix that covers matching artifact ids
+  renderId(vars: Vars, root: string): string         // artifact id for the vars
+  artifact(id: string, root: string): Item           // make the artifact for an id
+  boundPrefix(vars: Vars, root: string): Prefix      // prefix up to the first glob or unbound var
+  prepareOutput(artifact: Item): Promise<void>       // before run, for each single output
+  preparePrefix(prefix: Prefix): Promise<void>       // before run, for each list output
+}
+```
+
+To write your own input pattern, implement `InputPattern` and return ids that your `Artifact` subclass uses. To write your own output pattern, implement `OutputPattern` and prepare any parent resources in `prepareOutput` / `preparePrefix`.
+
+### `class GitCommitArtifact extends Artifact<Uint8Array>`
+
+```ts
+new GitCommitArtifact(repo: string, sha: string)
+gitCommit(repo: string, sha: string): GitCommitArtifact
+```
+
+The absolute `repo` path must not contain `#`. A task that uses this artifact skips on a later run only when the build has a store (`JsonStore`, `SqliteStore`, or a reused `MemoryStore`), because `orderStamp()` is always `null` and the skip uses the stored content stamp.
+
+| Member | Description |
+| --- | --- |
+| `repo` | Absolute path of the git working tree |
+| `sha` | Commit sha from `git rev-list` |
+| `id` | `git:<absRepo>#<sha>` |
+| `contentStamp()` | The sha |
+| `orderStamp()` | Always `null`. Skip needs a store and the content stamp. |
+| `read()` | Raw commit object bytes from `git cat-file commit <sha>` |
+
+### `class GitCommitPrefix extends Prefix`
+
+```ts
+new GitCommitPrefix(repo: string)
+gitCommitPrefix(repo: string): GitCommitPrefix
+```
+
+`id` is `git:<absRepo>#`, so it covers every commit id of that repo.
 
 ### Types
 

@@ -5,7 +5,7 @@ import { FileArtifact } from "../fs/file"
 import { fileId, resolveFilePath } from "../fs/id"
 import { PathPrefix } from "../fs/prefix"
 import { walkFiles } from "../fs/walk"
-import type { Item, ItemPattern } from "./item"
+import type { InputPattern, Item, OutputPattern } from "./item"
 import {
   boundPrefixSegments,
   collectMeta,
@@ -22,7 +22,7 @@ export type FilePatternOpts = {
   list?: boolean
 }
 
-export class FilePattern implements ItemPattern {
+export class FilePattern implements InputPattern, OutputPattern {
   readonly template: string
   readonly optional: boolean
   readonly list: boolean
@@ -116,6 +116,13 @@ export class FilePattern implements ItemPattern {
       throw new Error("FilePattern.prepareOutput expected a FileArtifact")
     }
     await mkdir(path.dirname(artifact.path), { recursive: true })
+  }
+
+  async preparePrefix(prefix: Prefix): Promise<void> {
+    if (!(prefix instanceof PathPrefix)) {
+      throw new Error("FilePattern.preparePrefix expected a PathPrefix")
+    }
+    await mkdir(prefix.path, { recursive: true })
   }
 
   sortKey(artifact: Item): string {

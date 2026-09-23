@@ -2,7 +2,7 @@ import type { Prefix } from "../../src/prefix"
 import type { S3Client } from "../s3/client"
 import { S3ObjectArtifact } from "../s3/object"
 import { S3Prefix } from "../s3/prefix"
-import type { Item, ItemPattern } from "./item"
+import type { InputPattern, Item, OutputPattern } from "./item"
 import { KeyPattern } from "./key"
 import type { Vars } from "./vars"
 
@@ -13,7 +13,7 @@ export type S3PatternOpts = {
   list?: boolean
 }
 
-export class S3Pattern implements ItemPattern {
+export class S3Pattern implements InputPattern, OutputPattern {
   readonly template: string
   readonly bucket: string
   readonly client: S3Client
@@ -82,6 +82,8 @@ export class S3Pattern implements ItemPattern {
   }
 
   async prepareOutput(_artifact: Item): Promise<void> {}
+
+  async preparePrefix(_prefix: Prefix): Promise<void> {}
 
   sortKey(artifact: Item): string {
     return artifact.id

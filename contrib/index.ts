@@ -10,15 +10,23 @@ export {
   sqliteTablePrefix,
 } from "./sqlite"
 export { MemoryStore, JsonStore, SqliteStore } from "./store"
-export { FileBuild, FilePattern, S3Pattern } from "./filebuild"
+export {
+  GitCommitArtifact,
+  GitCommitPrefix,
+  gitCommit,
+  gitCommitPrefix,
+} from "./git"
+export { FileBuild, FilePattern, S3Pattern, GitCommitPattern } from "./filebuild"
 export type {
   FileContext,
   FileInput,
   FilePatternOpts,
   FileRule,
+  GitCommitPatternOpts,
+  InputPattern,
   Item,
   ItemInput,
-  ItemPattern,
+  OutputPattern,
   S3PatternOpts,
   Vars,
 } from "./filebuild"

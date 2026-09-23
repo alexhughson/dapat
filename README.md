@@ -155,6 +155,7 @@ The `[examples/](examples/)` folder has runnable programs. Run one with `bun run
 - `file-pipeline.ts` has two `FileBuild` rules in a chain.
 - `s3-pages-screenshots.ts` splits S3 documents into pages and writes one file for each page.
 - `agent-loop.ts` is an agent with more than one turn. Each turn writes the prompt for the next turn, and a rule matches it.
+- `git-line-count.ts` counts text lines in every commit of a git repo; with its `SqliteStore`, a second run skips commits that already have stamps.
 
 
 

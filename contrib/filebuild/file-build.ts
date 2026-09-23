@@ -1,4 +1,3 @@
-import { mkdir } from "node:fs/promises"
 import path from "node:path"
 import type { Build } from "../../src/build"
 import type { ArtifactEvent } from "../../src/build"
@@ -6,9 +5,8 @@ import type { Prefix } from "../../src/prefix"
 import type { Result } from "../../src/result"
 import { Task, type Ref } from "../../src/task"
 import { FileArtifact } from "../fs/file"
-import { PathPrefix } from "../fs/prefix"
 import { S3ObjectArtifact } from "../s3/object"
-import type { Item, ItemInput, ItemPattern } from "./item"
+import type { InputPattern, Item, ItemInput, OutputPattern } from "./item"
 import {
   compatible,
   hasAllVars,
@@ -38,8 +36,8 @@ export interface FileContext {
 
 export interface FileRule {
   name: string
-  inputs: Record<string, ItemPattern>
-  outputs: Record<string, ItemPattern>
+  inputs: Record<string, InputPattern>
+  outputs: Record<string, OutputPattern>
   id?: (vars: Vars) => string
   run: (ctx: FileContext) => Promise<void>
 }
@@ -51,7 +49,7 @@ type Row = {
 
 type Slot = {
   name: string
-  pattern: ItemPattern
+  pattern: InputPattern
   rows: Map<string, Row>
 }
 
@@ -280,8 +278,8 @@ export class FileBuild {
             continue
           }
           const prefix = prefixes[name]
-          if (prefix instanceof PathPrefix) {
-            await mkdir(prefix.path, { recursive: true })
+          if (prefix) {
+            await pattern.preparePrefix(prefix)
           }
         }
         await rule.spec.run(
