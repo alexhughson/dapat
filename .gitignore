@@ -19,3 +19,6 @@ Thumbs.db
 
 # Build state
 .dapat-state.json
+
+# TypeScript
+node_modules/
