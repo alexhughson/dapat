@@ -1,6 +1,9 @@
 import { hasAllVars, type Vars } from "./vars"
 
-export type Part = { kind: "lit"; value: string } | { kind: "var"; name: string } | { kind: "star" }
+export type Part =
+  | { kind: "lit"; value: string }
+  | { kind: "var"; name: string }
+  | { kind: "star" }
 
 export type Segment =
   | { kind: "lit"; value: string }
@@ -8,8 +11,8 @@ export type Segment =
   | { kind: "rest" }
   | { kind: "mix"; parts: Part[] }
 
-/** `/`-separated key template. Files add a filesystem root on top. */
-export class KeyPattern {
+/** `/`-separated key template shared by file and S3 patterns. */
+export class KeyTemplate {
   readonly template: string
   readonly varNames: readonly string[]
   readonly hasGlob: boolean
@@ -39,7 +42,7 @@ export class KeyPattern {
 
   render(vars: Vars): string {
     if (!hasAllVars(this.varNames, vars)) {
-      throw new Error(`pattern '${this.template}' missing vars to render`)
+      throw new Error(`template '${this.template}' missing vars to render`)
     }
     const out: string[] = []
     for (const segment of this.segments) {
@@ -48,18 +51,11 @@ export class KeyPattern {
         continue
       }
       if (segment.kind === "star" || segment.kind === "rest") {
-        throw new Error(`pattern '${this.template}' cannot render a glob`)
+        throw new Error(`template '${this.template}' cannot render a glob`)
       }
-      out.push(renderMix(segment.parts, vars))
+      out.push(renderMix(segment.parts, vars, this.template))
     }
     return out.join("/")
-  }
-
-  /** Literal key up to the first glob or unbound name. Always ends with `/` when non-empty. */
-  boundPrefix(vars: Vars): string {
-    const lit = boundPrefixSegments(this.segments, vars)
-    if (lit.length === 0) return ""
-    return `${lit.join("/")}/`
   }
 }
 
@@ -168,7 +164,7 @@ export function matchMix(parts: Part[], value: string, vars: Vars): Vars | null 
   source += "$"
   const match = new RegExp(source).exec(value)
   if (!match) return null
-  const out: Vars = {}
+  const out: Record<string, string> = {}
   for (const key of Object.keys(vars)) {
     out[key] = vars[key]!
   }
@@ -181,43 +177,38 @@ export function matchMix(parts: Part[], value: string, vars: Vars): Vars | null 
   return out
 }
 
-export function boundPrefixSegments(segments: Segment[], vars: Vars): string[] {
-  const lit: string[] = []
-  for (const segment of segments) {
-    if (segment.kind === "lit") {
-      lit.push(segment.value)
-      continue
-    }
-    if (segment.kind === "star" || segment.kind === "rest") break
-    let stop = false
-    for (const part of segment.parts) {
-      if (part.kind === "star") {
-        stop = true
-        break
-      }
-      if (part.kind === "var" && vars[part.name] === undefined) {
-        stop = true
-        break
-      }
-    }
-    if (stop) break
-    lit.push(renderMix(segment.parts, vars))
-  }
-  return lit
-}
-
-export function renderMix(parts: Part[], vars: Vars): string {
+export function renderMix(parts: Part[], vars: Vars, template: string): string {
   let out = ""
   for (const part of parts) {
     if (part.kind === "lit") {
       out += part.value
     } else if (part.kind === "var") {
-      out += vars[part.name]
+      const value = vars[part.name]!
+      assertSafeVarValue(template, part.name, value)
+      out += value
     } else {
       throw new Error("cannot render a glob segment")
     }
   }
   return out
+}
+
+/** Empty, `.`, `..`, or a value with `/` must not become a path segment. */
+export function assertSafeVarValue(
+  template: string,
+  name: string,
+  value: string,
+): void {
+  if (
+    value.length === 0 ||
+    value === "." ||
+    value === ".." ||
+    value.includes("/")
+  ) {
+    throw new Error(
+      `template '${template}' var '${name}' has unsafe value ${JSON.stringify(value)}`,
+    )
+  }
 }
 
 function escapeRe(value: string): string {

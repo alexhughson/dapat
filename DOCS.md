@@ -342,7 +342,7 @@ dapat makes the decision for each task after the tasks that write its inputs fin
    2. An input has a content stamp now and in the record, and the two stamps are different. dapat **runs** the task.
    3. Each input has a content stamp now and in the record, and all of the stamps are equal. dapat **skips** the task with the reason `"content"`.
    4. Otherwise, dapat goes to rule 3.
-3. **Order check.** All inputs and outputs have an order stamp, and the newest input is not newer than the oldest output. dapat **skips** the task with the reason `"order"`.
+3. **Order check.** All inputs and outputs have an order stamp, and the newest input is not newer than the oldest output. dapat **skips** the task with the reason `"order"`. A task that **replaces** another task with the same id never uses this rule; see [section 8](#replacement).
 4. In all other cases, dapat **runs** the task.
 
 Some results of these rules:
@@ -386,10 +386,7 @@ const store = new SqliteStore(".dapat/state.db")
 const build = new Build({ store })
 ```
 
-`JsonStore` reads the whole file and writes it again for each change. It writes to `<path>.tmp` and then renames that file to `<path>`. It does not lock the file, so two processes must not use the same file at the same time. Parallel tasks in one build can also call `store.set` at the same time:
-
-- Two calls that overlap can lose one record. The next build then uses only the order check for that task.
-- Overlapping calls share one `.tmp` file, so one `rename` can fail. The task that called it then fails.
+`JsonStore` reads the whole file and writes it again for each change. It writes to `<path>.tmp` and then renames that file to `<path>`. It does not lock the file across processes, so two processes must not use the same file at the same time. In one process, `JsonStore` runs `set` and `delete` one after another for the same path, so parallel tasks in one build do not collide on the rename.
 
 `SqliteStore` accepts an open `Database` from `bun:sqlite` or a file path. If you give a path, the store opens the database, and `close()` closes it. If you give a `Database`, `close()` does nothing.
 
@@ -430,7 +427,7 @@ Call `build.add()` with a task id that is already in the build. The new task rep
 - **The old task is running.** dapat aborts `ctx.signal` of the old task. The old run ends as `cancelled`, even if it finishes without an error. dapat retracts the artifacts that the old run produced.
 - **The old task is finished.** dapat retracts the artifacts that the old task produced and that the new task does not declare.
 
-In each case, the new task then waits, skips, or runs in the usual way.
+In each case, the new task then waits, skips, or runs in the usual way. The new task never skips by order: a replacement means an input entry changed in this build, so leftover output files from the old run must not decide the skip.
 
 Your task code must stop work when `ctx.signal` aborts. dapat does not stop a running function.
 
@@ -468,6 +465,8 @@ dapat sends a `produced` event at these times:
 
 When you call `listen()`, dapat first replays the artifacts that were already produced in this build and that are in the folder of the prefix.
 
+Build delivers events **one at a time**, in the order they happen. For each event it calls every matching listener, in the order you added them, and it waits for each listener to finish before it calls the next. A listener gets the next event only after every listener has finished with the current one. A listener may call `build.add` or `build.remove`; those calls enqueue more events and return at once. They do not wait for the new events. A listener must not wait for a task to finish, because the build waits for the listener before dependent tasks of the writer can start.
+
 A task that skips sends no events ([section 13](#13-limits)).
 
 A listener can add tasks. This listener adds one task for each page from the `split` sample in section 5. Add it to that sample before `build.run()`:
@@ -494,10 +493,10 @@ const result = await build.run()
 // executed: split, shot:pages/1, shot:pages/2
 ```
 
-Handle errors inside the listener. dapat reports listener errors in different ways for different events:
+Handle errors inside the listener when you can recover. If a listener throws or rejects:
 
-- **A declared output of a task that succeeded.** The task that wrote the output fails.
-- **`ctx.produced`, a retraction, or a replay from `listen`.** dapat does not wait for the listener. The error becomes an unhandled promise rejection.
+- **`build.run()` rejects** with that error after the build becomes idle. The error is a build failure, not only a task outcome, because the listener is part of the control of the build.
+- When the throw happens during the announce of a declared output (the `await` inside `recordSuccess`), that announce rejects, and the writing task ends as **failed** with the listener's error.
 
 `RuleBuild` ([section 11](#11-rules-with-rulebuild)) uses this mechanism. Each input generator that calls `feed.listen` adds one listener.
 
@@ -733,7 +732,7 @@ input "attachments"   new FileGlob("attachments/<specialty>/<section>/**")
 2. It joins the var sets of those tables on the var names that they share. Two var sets join when each shared name has the same value. The result is the list of **task vars**. When two inputs share no var name, the join gives every combination of their entries.
 3. For each set of task vars, it gives each input the value of its matching entry. An optional input with no matching entry gives `undefined`.
 4. It renders each output from the task vars.
-5. It adds a task for each new set of task vars. It adds a task again when one of its input entries changed. It removes the task for each set of task vars that no longer exists.
+5. It adds a task for each new set of task vars. It adds a task again when a generator sets or deletes one of its input entries. It removes the task for each set of task vars that no longer exists.
 
 Each captured var is a task var. So each value of a var makes a different task. To give several artifacts to one task, use a generator whose value is a list. For example, use a template with `*` or `**`, or leave an identity field out of a field spec ([section 11.8](#118-write-your-own-input-generator)).
 
@@ -758,7 +757,7 @@ The optional list belongs to the rule, not to the generator. One generator can b
 
 A generator with no vars has at most one entry. If it is a required input, every task gets its value when the entry exists, and the rule makes no tasks when the entry does not exist. For example, `new FileGlob("config/*.json")` gives all the config files to every task. Put it in `optional` if the rule must run when no config file exists.
 
-The default task id is `<name>:<var>=<value>,...`, with the vars sorted by name. Give `id: (vars) => string` in the rule to set a different id.
+The default task id is `<name>:<var>=<value>,...`, with the vars sorted by name. When the task has no vars, the default id is just `<name>` (no colon). Give `id: (vars) => string` in the rule to set a different id.
 
 ### 11.3 Template syntax
 
@@ -1202,8 +1201,10 @@ The repo has these examples. Run them with `bun run examples/<name>.ts`:
 - `custom-gen.ts` joins the `Values` generator from [section 11.8](#118-write-your-own-input-generator) with files.
 - `s3-pages-screenshots.ts` shows an S3 prefix output, and one file for each page.
 - `agent-loop.ts` shows an agent with more than one turn. Each turn writes the prompt for the next turn, and a rule matches the new prompt. The code has no `while` loop.
+- `git-gens.ts` defines `GitCommitArtifact`, `GitCommits`, and `GitBranches` from [section 11.8](#118-write-your-own-input-generator).
+- `git-line-count.ts` counts lines in each commit of a repo (default: the current repo).
 
-The last three examples run in a temporary directory. They import from `../src` and `../contrib`. In your project, import from `dapat` and `dapat/contrib`.
+The last examples that use a temporary directory import from `../src` and `../contrib`. In your project, import from `dapat` and `dapat/contrib`.
 
 ## 12. Recipes
 
@@ -1276,8 +1277,12 @@ dapat then uses the content check, which does not depend on modification times. 
 ## 13. Limits
 
 - **A task that skips sends no events.** This applies to its prefix outputs and to its declared outputs. A `build.listen()` handler sees nothing from that task on the next build. The file and S3 generators of `RuleBuild` do not have this problem, because they list the existing files and objects before the build runs. A generator that you write must do the same in `start`.
-- **A template var does not match `/`.** A git branch such as `feature/x` never matches `branchNotes/<branch>.md`, and the output `reports/<branch>.md` makes a subfolder. A generator that gives such values must encode `/`, for example as `%2F`, so that its vars are equal to the vars from the file names. This is not solved yet.
+- **A retracted file stays on disk.** dapat does not delete files or objects. Retraction only sends events. The file and S3 generators treat a retracted artifact as gone for the rest of the build; the next build finds it again when `start` walks the files or objects.
+- **A rule whose output removes one of its own required inputs undoes itself.** RuleBuild removes the task, and Build retracts its outputs ([section 8](#removal)).
+- **A template var does not match `/`, and render rejects unsafe values.** A git branch such as `feature/x` never matches `branchNotes/<branch>.md`. Rendering a template throws when a var value is empty, `.`, `..`, or contains `/`. A generator that gives such values must encode `/`, for example as `%2F`, so that its vars are equal to the vars from the file names.
+- **The file generators skip symbolic links.** `FilePattern` and `FileGlob` walk only real files and directories. A symlink under the pattern root is ignored.
 - **A generator cannot add values from outside `RuleBuild`.** A generator sets values in `start` and in `listen` callbacks only. A change that comes from a person or another program during the build, such as a new commit, is not seen until the next build.
+- **Build reads the stamps of a task once, before it decides to skip.** A change that another program makes to an input or output while the build runs can be missed until the next build.
 - **Order stamps have different units.** dapat compares the order stamps of all artifacts in one task as plain integers. `FileArtifact` and `DirectoryArtifact` use nanoseconds. `S3ObjectArtifact` uses milliseconds. `SqliteRowArtifact` uses `rowid` or your `orderColumn`. If one task has artifacts of two kinds, the order check gives wrong results. For example, an S3 input and a file output always look current. The content check comes first, so a persistent store decides correctly after the first successful run. On the first run, and each time the task has no store record, the order check decides.
 - **A prefix artifact input does not wait for a plain prefix output in a subfolder.** See [section 5](#how-dapat-finds-dependencies).
 - **`FileArtifact` stamp methods return `null` for all errors.** For example, a permission error on a file looks like a missing file. The task then runs again and does not fail. Check file permissions when a task always runs.
@@ -1304,7 +1309,7 @@ new Build(opts?: { store?: Store })
 | `add(task: Task): void` | Adds a task. If a task with the same id exists, replaces it (see [section 8](#replacement)). If `run()` has started, the task starts at once. Throws if another task already declares one of its exact outputs, or if the task declares one output twice. |
 | `remove(id: string): void` | Removes a task. Aborts it if it is running and retracts its announced artifacts. Starts to delete its store record, but does not wait for the delete. Does nothing if the id is not known. |
 | `listen(prefix: Prefix, fn: ArtifactListener): () => void` | Calls `fn` for each announced artifact that `prefix` covers. It first replays the artifacts that were already announced. Returns a function that removes the listener. |
-| `run(): Promise<Result>` | Starts every task and resolves when no task and no listener is in progress. Does not reject when a task fails. |
+| `run(): Promise<Result>` | Starts every task and resolves when no task and no listener is in progress. Does not reject when a task fails. Rejects when a listener throws or rejects (see [section 9](#9-listen-to-produced-artifacts)). |
 
 ### `class Task`
 

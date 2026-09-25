@@ -16,6 +16,22 @@ type Phase = "pending" | "running" | "completed"
 
 type WaitResult = "ok" | "failed" | "cancelled" | "deadlock"
 
+type Delivery = {
+  seq: number
+  event: ArtifactEvent
+  artifact: Artifact
+  only: ArtifactListener | undefined
+  resolve: () => void
+  reject: (error: Error) => void
+}
+
+type ListenerEntry = {
+  prefix: Prefix
+  fn: ArtifactListener
+  /** Deliveries with seq < since are skipped (registered after they were queued). */
+  since: number
+}
+
 class Slot {
   generation = 1
   launched = 0
@@ -23,6 +39,8 @@ class Slot {
   abort: AbortController | null = null
   produced: Artifact[] = []
   outcome: Outcome | null = null
+  /** True when this slot replaced a task that already had this id. */
+  replaced = false
 
   constructor(public task: Task) {}
 }
@@ -33,12 +51,18 @@ export class Build {
   private readonly exactOutputs = new Map<string, { artifact: Artifact; taskId: string }>()
   private readonly prefixOutputs: { prefix: Prefix; taskId: string }[] = []
   private readonly provisions = new Map<string, { artifact: Artifact; taskId: string }>()
-  private readonly listeners: { prefix: Prefix; fn: ArtifactListener }[] = []
+  private readonly listeners: ListenerEntry[] = []
   private readonly outcomes = new Map<Task, Outcome>()
+
+  private readonly queue: Delivery[] = []
+  private draining = false
+  private listenerError: Error | null = null
+  private nextSeq = 0
 
   private started = false
   private runningCount = 0
   private workCount = 0
+  /** Pending and in-flight event deliveries. */
   private listenerCount = 0
   private waiters: Array<() => void> = []
   private idleWaiters: Array<() => void> = []
@@ -64,6 +88,9 @@ export class Build {
     }
 
     const slot = new Slot(task)
+    if (existing) {
+      slot.replaced = true
+    }
     this.slots.set(task.id, slot)
     this.index(task)
 
@@ -77,6 +104,8 @@ export class Build {
     const slot = this.slots.get(id)
     if (!slot) return
 
+    // Same as replace: stop an in-flight execute that is waiting or running.
+    slot.generation += 1
     this.unindex(slot.task)
     if (slot.phase === "running" && slot.abort) {
       slot.abort.abort()
@@ -93,6 +122,13 @@ export class Build {
   }
 
   listen(prefix: Prefix, fn: ArtifactListener): () => void {
+    // Register first so live events already in the queue (seq < since) are
+    // skipped; then replay from provisions, which includes every artifact
+    // produced before this call (provisions is set before enqueue).
+    const since = this.nextSeq
+    const entry: ListenerEntry = { prefix, fn, since }
+    this.listeners.push(entry)
+
     for (const provision of this.provisions.values()) {
       if (prefix.covers(provision.artifact)) {
         this.fire(
@@ -107,8 +143,6 @@ export class Build {
       }
     }
 
-    const entry = { prefix, fn }
-    this.listeners.push(entry)
     return () => {
       const index = this.listeners.indexOf(entry)
       if (index >= 0) {
@@ -119,10 +153,14 @@ export class Build {
 
   async run(): Promise<Result> {
     this.started = true
+    this.listenerError = null
     for (const slot of this.slots.values()) {
       this.kick(slot)
     }
     await this.idle()
+    if (this.listenerError) {
+      throw this.listenerError
+    }
     return new Result(this.outcomes)
   }
 
@@ -278,7 +316,12 @@ export class Build {
       return
     }
 
-    const skip = await this.decideSkip(slot.task)
+    const inputStamps = await this.stampMap(
+      this.artifactRefs(slot.task.inputs),
+    )
+    if (generation !== slot.generation) return
+
+    const skip = await this.decideSkip(slot, inputStamps)
     if (generation !== slot.generation) return
     if (skip) {
       this.finish(slot, { type: "skipped", reason: skip })
@@ -295,15 +338,30 @@ export class Build {
       await slot.task.run(ctx)
       if (generation !== slot.generation || abort.signal.aborted) {
         this.retractAll(slot)
-        this.finish(slot, { type: "cancelled", reason: "replaced" })
+        if (slot.outcome === null) {
+          this.finish(slot, { type: "cancelled", reason: "replaced" })
+        }
         return
       }
-      await this.recordSuccess(slot)
+      await this.recordSuccess(slot, inputStamps)
+      if (generation !== slot.generation || abort.signal.aborted) {
+        // remove/replace during announce already finished the slot, or left it
+        // for us to mark cancelled.
+        if (slot.outcome === null) {
+          this.finish(slot, { type: "cancelled", reason: "replaced" })
+        }
+        return
+      }
+      if (slot.outcome !== null) {
+        return
+      }
       this.finish(slot, { type: "executed" })
     } catch (error) {
       if (abort.signal.aborted || generation !== slot.generation) {
         this.retractAll(slot)
-        this.finish(slot, { type: "cancelled", reason: "replaced" })
+        if (slot.outcome === null) {
+          this.finish(slot, { type: "cancelled", reason: "replaced" })
+        }
         return
       }
       const err = error instanceof Error ? error : new Error(String(error))
@@ -363,7 +421,10 @@ export class Build {
     }
     this.provisions.set(artifact.id, { artifact, taskId: slot.task.id })
     slot.produced.push(artifact)
-    this.fire({ type: "produced", id: artifact.id, taskId: slot.task.id }, artifact)
+    this.fire(
+      { type: "produced", id: artifact.id, taskId: slot.task.id },
+      artifact,
+    )
   }
 
   private outputCovers(task: Task, artifact: Artifact): boolean {
@@ -374,50 +435,116 @@ export class Build {
     return false
   }
 
-  private async recordSuccess(slot: Slot): Promise<void> {
+  private async recordSuccess(
+    slot: Slot,
+    inputStamps: Record<string, Stamp>,
+  ): Promise<void> {
+    const generation = slot.generation
+
     for (const output of slot.task.outputs) {
       if (!isArtifact(output)) continue
       const already = slot.produced.some((a) => a.id === output.id)
       if (already) continue
       this.provisions.set(output.id, { artifact: output, taskId: slot.task.id })
       slot.produced.push(output)
-      await this.emitAll(
+      await this.enqueue(
         { type: "produced", id: output.id, taskId: slot.task.id },
         output,
       )
+      // remove() may have finished this slot during announce.
+      if (slot.outcome !== null) return
+      // Replacement during announce: stop announcing, but still write the store
+      // below so the new task can content-skip (e.g. self-optional rematch).
+      if (slot.generation !== generation) break
     }
 
+    if (slot.outcome !== null) return
     if (!this.store) return
-    const inputStamps = await this.stampMap(this.artifactRefs(slot.task.inputs))
+    // Input stamps are from before task.run. Output stamps are from after.
     const outputStamps = await this.stampMap(this.artifactRefs(slot.task.outputs))
+    if (slot.outcome !== null) return
     const state: TaskState = { inputStamps, outputStamps }
     await this.store.set(slot.task.id, state)
   }
 
+  /**
+   * Enqueue an event and return without waiting. Used for ctx.produced,
+   * retract, and listen() replay.
+   */
   private fire(
     event: ArtifactEvent,
     artifact: Artifact,
     only?: ArtifactListener,
   ): void {
-    this.listenerCount += 1
-    void this.emitAll(event, artifact, only).finally(() => {
-      this.listenerCount -= 1
-      this.maybeIdle()
-    })
+    // Swallow the delivery promise: errors are stored on the build and
+    // surface from run(). A void rejection here would be unhandled.
+    void this.enqueue(event, artifact, only).catch(() => {})
   }
 
-  private async emitAll(
+  /**
+   * Append one delivery and ensure the drain loop is running. Resolves when
+   * this delivery has been given to every matching listener. Does not wait
+   * for later events that listeners may enqueue during this delivery.
+   */
+  private enqueue(
     event: ArtifactEvent,
     artifact: Artifact,
     only?: ArtifactListener,
   ): Promise<void> {
-    if (only) {
-      await only(event)
+    return new Promise<void>((resolve, reject) => {
+      const seq = this.nextSeq
+      this.nextSeq += 1
+      this.queue.push({ seq, event, artifact, only, resolve, reject })
+      this.listenerCount += 1
+      this.ensureDrain()
+    })
+  }
+
+  private ensureDrain(): void {
+    if (this.draining) return
+    this.draining = true
+    void this.drainLoop().finally(() => {
+      this.draining = false
+      if (this.queue.length > 0) {
+        this.ensureDrain()
+      }
+    })
+  }
+
+  private async drainLoop(): Promise<void> {
+    while (this.queue.length > 0) {
+      const delivery = this.queue.shift()!
+      try {
+        await this.deliverOne(delivery)
+        delivery.resolve()
+      } catch (error) {
+        const err = error instanceof Error ? error : new Error(String(error))
+        if (this.listenerError === null) {
+          this.listenerError = err
+        }
+        delivery.reject(err)
+      } finally {
+        this.listenerCount -= 1
+        this.wake()
+        this.maybeIdle()
+      }
+    }
+  }
+
+  private async deliverOne(delivery: Delivery): Promise<void> {
+    if (delivery.only) {
+      await delivery.only(delivery.event)
       return
     }
-    for (const listener of this.listeners) {
-      if (!listener.prefix.covers(artifact)) continue
-      await listener.fn(event)
+    // Snapshot so unsubscribe during delivery does not skip later listeners.
+    // Skip entries that unsubscribed, or that registered after this event
+    // was queued (seq < since).
+    const snapshot = this.listeners.slice()
+    for (const listener of snapshot) {
+      if (delivery.seq < listener.since) continue
+      if (this.listeners.indexOf(listener) < 0) continue
+      if (!listener.prefix.covers(delivery.artifact)) continue
+      await listener.fn(delivery.event)
     }
   }
 
@@ -447,10 +574,13 @@ export class Build {
     this.fire({ type: "retracted", id: artifact.id, taskId }, artifact)
   }
 
-  private async decideSkip(task: Task): Promise<"content" | "order" | null> {
+  private async decideSkip(
+    slot: Slot,
+    inputStamps: Record<string, Stamp>,
+  ): Promise<"content" | "order" | null> {
+    const task = slot.task
     const inputs = this.artifactRefs(task.inputs)
     const outputs = this.artifactRefs(task.outputs)
-    const inputStamps = await this.stampMap(inputs)
     const outputStamps = await this.stampMap(outputs)
 
     for (const output of outputs) {
@@ -467,6 +597,12 @@ export class Build {
       const content = contentDecision(inputs, inputStamps, last.inputStamps)
       if (content === "match") return "content"
       if (content === "differ") return null
+    }
+
+    // A replacement means an input entry changed in this build. Order skip
+    // would trust leftover output files from the prior run.
+    if (slot.replaced) {
+      return null
     }
 
     if (ordersFresh(inputs, outputs, inputStamps, outputStamps)) {

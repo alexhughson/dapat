@@ -1,11 +1,14 @@
-// inbox/<doc> → paginate writes pages/<doc>/*.txt and produced() each page.
-// shot matches pages/<doc>/<page>.txt and writes one screenshot per page.
-
 import { mkdtemp, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import path from "node:path"
-import { FileBuild, FilePattern, S3Pattern } from "../contrib/filebuild"
-import { MemoryS3, S3ObjectArtifact } from "../contrib/s3"
+import {
+  FileOutput,
+  MemoryS3,
+  RuleBuild,
+  S3ObjectArtifact,
+  S3Pattern,
+  S3PrefixOutput,
+} from "../contrib"
 import { Build, MemoryStore } from "../src/index"
 
 const encode = (text: string) => new TextEncoder().encode(text)
@@ -19,40 +22,40 @@ try {
   await s3.put("docs", "inbox/notes.txt", encode("only"))
 
   const build = new Build({ store: new MemoryStore() })
-  const files = new FileBuild(build, { root })
+  const rules = new RuleBuild(build)
 
-  files.rule({
+  rules.rule({
     name: "paginate",
     inputs: {
       src: new S3Pattern("s3://docs/inbox/<doc>.txt", { client: s3 }),
     },
     outputs: {
-      pages: new S3Pattern("s3://docs/pages/<doc>/*.txt", { client: s3 }),
+      pages: new S3PrefixOutput("s3://docs/pages/<doc>/"),
     },
     run: async (ctx) => {
-      const text = decode(await ctx.item("src").read())
+      const text = decode(await ctx.inputs.src.read())
       const lines = text.split("\n")
       for (let i = 0; i < lines.length; i++) {
-        const key = `pages/${ctx.vars.doc}/${i + 1}.txt`
+        const key = `${ctx.outputs.pages.keyPrefix}${i + 1}.txt`
         await s3.put("docs", key, encode(lines[i]!))
         ctx.produced(new S3ObjectArtifact(s3, "docs", key))
       }
     },
   })
 
-  files.rule({
+  rules.rule({
     name: "shot",
     inputs: {
       page: new S3Pattern("s3://docs/pages/<doc>/<page>.txt", { client: s3 }),
     },
-    outputs: { shot: new FilePattern("shots/<doc>/<page>.png") },
+    outputs: { shot: new FileOutput("shots/<doc>/<page>.png", { root }) },
     run: async (ctx) => {
-      const body = decode(await ctx.item("page").read())
-      await Bun.write(ctx.outputFile("shot").path, `shot:${body}`)
+      const body = decode(await ctx.inputs.page.read())
+      await Bun.write(ctx.outputs.shot.path, `shot:${body}`)
     },
   })
 
-  const result = await files.run()
+  const result = await rules.run()
   if (!result.success) {
     throw new Error("build failed")
   }
