@@ -1,13 +1,14 @@
-// Agent loop as FileBuild rematch, not a while:
-//   inbox → prompt → tools.json → result/* (glob + produced) → next prompt
-// think() is a fake model. templates bind <sid> and <n>; the next turn is
-// produced as turns/<sid>/<n+1>/prompt.txt under a glob output prefix.
-
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import path from "node:path"
-import { FileBuild, FilePattern } from "../contrib/filebuild"
-import { FileArtifact } from "../contrib/fs/file"
+import {
+  DirOutput,
+  FileArtifact,
+  FileGlob,
+  FileOutput,
+  FilePattern,
+  RuleBuild,
+} from "../contrib"
 import { Build, MemoryStore } from "../src/index"
 
 type Call = { id: string; name: string; arg: string }
@@ -29,93 +30,96 @@ try {
   await writeFile(path.join(root, "inbox/demo.txt"), "What is dapat?")
 
   const build = new Build({ store: new MemoryStore() })
-  const files = new FileBuild(build, { root })
+  const rules = new RuleBuild(build)
 
-  files.rule({
+  rules.rule({
     name: "seed",
-    inputs: { inbox: new FilePattern("inbox/<sid>.txt") },
-    outputs: { prompt: new FilePattern("turns/<sid>/0/prompt.txt") },
+    inputs: { inbox: new FilePattern("inbox/<sid>.txt", { root }) },
+    outputs: { prompt: new FileOutput("turns/<sid>/0/prompt.txt", { root }) },
     run: async (ctx) => {
-      const body = await ctx.file("inbox").read()
-      await writeFile(ctx.outputFile("prompt").path, body)
+      const body = await ctx.inputs.inbox.read()
+      await Bun.write(ctx.outputs.prompt.path, body)
     },
   })
 
-  files.rule({
+  rules.rule({
     name: "think",
-    inputs: { prompt: new FilePattern("turns/<sid>/<n>/prompt.txt") },
-    outputs: { tools: new FilePattern("turns/<sid>/<n>/tools.json") },
+    inputs: { prompt: new FilePattern("turns/<sid>/<n>/prompt.txt", { root }) },
+    outputs: { tools: new FileOutput("turns/<sid>/<n>/tools.json", { root }) },
     run: async (ctx) => {
       thinkRuns += 1
-      const prompt = new TextDecoder().decode(await ctx.file("prompt").read())
+      const prompt = new TextDecoder().decode(await ctx.inputs.prompt.read())
       const calls = think(prompt)
-      await writeFile(ctx.outputFile("tools").path, JSON.stringify(calls))
+      await Bun.write(ctx.outputs.tools.path, JSON.stringify(calls))
     },
   })
 
-  files.rule({
+  rules.rule({
     name: "dispatch",
-    inputs: { tools: new FilePattern("turns/<sid>/<n>/tools.json") },
-    outputs: { results: new FilePattern("turns/<sid>/<n>/result/*.txt") },
+    inputs: { tools: new FilePattern("turns/<sid>/<n>/tools.json", { root }) },
+    outputs: { results: new DirOutput("turns/<sid>/<n>/result/", { root }) },
     run: async (ctx) => {
-      const calls = parseCalls(await ctx.file("tools").read())
-      const resultDir = path.join(root, "turns", ctx.vars.sid!, ctx.vars.n!, "result")
+      const calls = parseCalls(await ctx.inputs.tools.read())
       if (calls.length === 0) {
-        const nonePath = path.join(resultDir, "none.txt")
-        await writeFile(nonePath, "none")
+        const nonePath = path.join(ctx.outputs.results.path, "none.txt")
+        await Bun.write(nonePath, "none")
         ctx.produced(new FileArtifact(nonePath))
         return
       }
       for (const call of calls) {
-        const resultPath = path.join(resultDir, `${call.id}.txt`)
-        await writeFile(resultPath, `${call.name}:${call.arg}`)
+        const resultPath = path.join(ctx.outputs.results.path, `${call.id}.txt`)
+        await Bun.write(resultPath, `${call.name}:${call.arg}`)
         ctx.produced(new FileArtifact(resultPath))
       }
     },
   })
 
-  files.rule({
+  rules.rule({
     name: "gather",
     inputs: {
-      tools: new FilePattern("turns/<sid>/<n>/tools.json"),
-      results: new FilePattern("turns/<sid>/<n>/result/*.txt"),
+      tools: new FilePattern("turns/<sid>/<n>/tools.json", { root }),
+      results: new FileGlob("turns/<sid>/<n>/result/*.txt", { root }),
     },
-    outputs: { reply: new FilePattern("turns/<sid>/<n>/reply.txt") },
+    outputs: { reply: new FileOutput("turns/<sid>/<n>/reply.txt", { root }) },
     run: async (ctx) => {
-      const tools = new TextDecoder().decode(await ctx.file("tools").read())
+      const tools = new TextDecoder().decode(await ctx.inputs.tools.read())
       const parts: string[] = [tools]
-      for (const file of ctx.files("results")) {
+      for (const file of ctx.inputs.results) {
         parts.push(new TextDecoder().decode(await file.read()))
       }
-      await writeFile(ctx.outputFile("reply").path, parts.join("\n"))
+      await Bun.write(ctx.outputs.reply.path, parts.join("\n"))
     },
   })
 
-  files.rule({
+  rules.rule({
     name: "advance",
     inputs: {
-      tools: new FilePattern("turns/<sid>/<n>/tools.json"),
-      reply: new FilePattern("turns/<sid>/<n>/reply.txt"),
+      tools: new FilePattern("turns/<sid>/<n>/tools.json", { root }),
+      reply: new FilePattern("turns/<sid>/<n>/reply.txt", { root }),
     },
-    outputs: { more: new FilePattern("turns/<sid>/**") },
+    outputs: { more: new DirOutput("turns/<sid>/", { root }) },
     run: async (ctx) => {
-      const calls = parseCalls(await ctx.file("tools").read())
-      const reply = new TextDecoder().decode(await ctx.file("reply").read())
+      const calls = parseCalls(await ctx.inputs.tools.read())
+      const reply = new TextDecoder().decode(await ctx.inputs.reply.read())
       if (calls.length === 0) {
-        const donePath = path.join(root, "turns", ctx.vars.sid!, "done.txt")
-        await writeFile(donePath, "ok")
+        const donePath = path.join(ctx.outputs.more.path, "done.txt")
+        await Bun.write(donePath, "ok")
         ctx.produced(new FileArtifact(donePath))
         return
       }
       const n = Number(ctx.vars.n)
-      const nextPath = path.join(root, "turns", ctx.vars.sid!, String(n + 1), "prompt.txt")
+      const nextPath = path.join(
+        ctx.outputs.more.path,
+        String(n + 1),
+        "prompt.txt",
+      )
       await mkdir(path.dirname(nextPath), { recursive: true })
-      await writeFile(nextPath, `What is dapat?\n## Observations\n${reply}`)
+      await Bun.write(nextPath, `What is dapat?\n## Observations\n${reply}`)
       ctx.produced(new FileArtifact(nextPath))
     },
   })
 
-  const result = await files.run()
+  const result = await rules.run()
   if (!result.success) {
     throw new Error("build failed")
   }

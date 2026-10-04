@@ -6,8 +6,10 @@ export async function walkFiles(root: string): Promise<string[]> {
   let entries
   try {
     entries = await readdir(root, { withFileTypes: true })
-  } catch {
-    return []
+  } catch (error) {
+    const err = error as NodeJS.ErrnoException
+    if (err.code === "ENOENT") return []
+    throw error
   }
   const files: string[] = []
   const stack: { dir: string; items: typeof entries }[] = [

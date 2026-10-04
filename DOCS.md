@@ -28,7 +28,7 @@ dapat does not know about disks or SQL. It only reads artifact ids and stamps. T
 There are two ways to declare tasks:
 
 - Use `Build` and `Task` when you know each task in advance, or when your code decides which tasks to add. Sections 3 to 9 describe this.
-- Use `FileBuild` when you want one task for each file or S3 object that matches a path template. [Section 11](#11-rules-with-filebuild) describes this. `FileBuild` makes `Task` objects and adds them to a `Build`, so sections 5 to 9 also apply to it.
+- Use `RuleBuild` when you want one task for each set of matching inputs, for example each file that matches a path template, or each commit in a repository. [Section 11](#11-rules-with-rulebuild) describes this. `RuleBuild` makes `Task` objects and adds them to a `Build`, so sections 5 to 9 also apply to it.
 
 ## 2. Install and import
 
@@ -46,7 +46,7 @@ The package has two entry points:
 | Import | Contents |
 | --- | --- |
 | `dapat` | `Build`, `Task`, `Artifact`, `Prefix`, `IdPrefix`, `MemoryStore`, `Result`, and their types |
-| `dapat/contrib` | `FileArtifact`, `DirectoryArtifact`, `PathPrefix`, `S3ObjectArtifact`, `S3Prefix`, `MemoryS3`, `SqliteRowArtifact`, `SqliteTableArtifact`, `SqliteTablePrefix`, `JsonStore`, `SqliteStore`, `FileBuild`, `FilePattern`, `S3Pattern`, and a short factory function for each artifact and prefix (`file`, `directory`, `pathPrefix`, `s3Object`, `s3Prefix`, `sqliteRow`, `sqliteTable`, `sqliteTablePrefix`) |
+| `dapat/contrib` | `FileArtifact`, `DirectoryArtifact`, `PathPrefix`, `S3ObjectArtifact`, `S3Prefix`, `MemoryS3`, `SqliteRowArtifact`, `SqliteTableArtifact`, `SqliteTablePrefix`, `JsonStore`, `SqliteStore`, `RuleBuild`, `InputGen`, `FieldGen`, `capture`, `VarsMap`, `FilePattern`, `FileGlob`, `FileOutput`, `DirOutput`, `S3Pattern`, `S3Glob`, `S3Output`, `S3PrefixOutput`, and a short factory function for each artifact and prefix (`file`, `directory`, `pathPrefix`, `s3Object`, `s3Prefix`, `sqliteRow`, `sqliteTable`, `sqliteTablePrefix`) |
 
 ## 3. First build
 
@@ -342,7 +342,7 @@ dapat makes the decision for each task after the tasks that write its inputs fin
    2. An input has a content stamp now and in the record, and the two stamps are different. dapat **runs** the task.
    3. Each input has a content stamp now and in the record, and all of the stamps are equal. dapat **skips** the task with the reason `"content"`.
    4. Otherwise, dapat goes to rule 3.
-3. **Order check.** All inputs and outputs have an order stamp, and the newest input is not newer than the oldest output. dapat **skips** the task with the reason `"order"`.
+3. **Order check.** All inputs and outputs have an order stamp, and the newest input is not newer than the oldest output. dapat **skips** the task with the reason `"order"`. A task that **replaces** another task with the same id never uses this rule; see [section 8](#replacement).
 4. In all other cases, dapat **runs** the task.
 
 Some results of these rules:
@@ -386,10 +386,7 @@ const store = new SqliteStore(".dapat/state.db")
 const build = new Build({ store })
 ```
 
-`JsonStore` reads the whole file and writes it again for each change. It writes to `<path>.tmp` and then renames that file to `<path>`. It does not lock the file, so two processes must not use the same file at the same time. Parallel tasks in one build can also call `store.set` at the same time:
-
-- Two calls that overlap can lose one record. The next build then uses only the order check for that task.
-- Overlapping calls share one `.tmp` file, so one `rename` can fail. The task that called it then fails.
+`JsonStore` reads the whole file and writes it again for each change. It writes to `<path>.tmp` and then renames that file to `<path>`. It does not lock the file across processes, so two processes must not use the same file at the same time. In one process, `JsonStore` runs `set` and `delete` one after another for the same path, so parallel tasks in one build do not collide on the rename.
 
 `SqliteStore` accepts an open `Database` from `bun:sqlite` or a file path. If you give a path, the store opens the database, and `close()` closes it. If you give a `Database`, `close()` does nothing.
 
@@ -430,7 +427,7 @@ Call `build.add()` with a task id that is already in the build. The new task rep
 - **The old task is running.** dapat aborts `ctx.signal` of the old task. The old run ends as `cancelled`, even if it finishes without an error. dapat retracts the artifacts that the old run produced.
 - **The old task is finished.** dapat retracts the artifacts that the old task produced and that the new task does not declare.
 
-In each case, the new task then waits, skips, or runs in the usual way.
+In each case, the new task then waits, skips, or runs in the usual way. The new task never skips by order: a replacement means an input entry changed in this build, so leftover output files from the old run must not decide the skip.
 
 Your task code must stop work when `ctx.signal` aborts. dapat does not stop a running function.
 
@@ -468,6 +465,8 @@ dapat sends a `produced` event at these times:
 
 When you call `listen()`, dapat first replays the artifacts that were already produced in this build and that are in the folder of the prefix.
 
+Build delivers events **one at a time**, in the order they happen. For each event it calls every matching listener, in the order you added them, and it waits for each listener to finish before it calls the next. A listener gets the next event only after every listener has finished with the current one. A listener may call `build.add` or `build.remove`; those calls enqueue more events and return at once. They do not wait for the new events. A listener must not wait for a task to finish, because the build waits for the listener before dependent tasks of the writer can start.
+
 A task that skips sends no events ([section 13](#13-limits)).
 
 A listener can add tasks. This listener adds one task for each page from the `split` sample in section 5. Add it to that sample before `build.run()`:
@@ -494,12 +493,12 @@ const result = await build.run()
 // executed: split, shot:pages/1, shot:pages/2
 ```
 
-Handle errors inside the listener. dapat reports listener errors in different ways for different events:
+Handle errors inside the listener when you can recover. If a listener throws or rejects:
 
-- **A declared output of a task that succeeded.** The task that wrote the output fails.
-- **`ctx.produced`, a retraction, or a replay from `listen`.** dapat does not wait for the listener. The error becomes an unhandled promise rejection.
+- **`build.run()` rejects** with that error after the build becomes idle. The error is a build failure, not only a task outcome, because the listener is part of the control of the build.
+- When the throw happens during the announce of a declared output (the `await` inside `recordSuccess`), that announce rejects, and the writing task ends as **failed** with the listener's error.
 
-`FileBuild` ([section 11](#11-rules-with-filebuild)) uses this mechanism.
+`RuleBuild` ([section 11](#11-rules-with-rulebuild)) uses this mechanism. Each input generator that calls `feed.listen` adds one listener.
 
 ## 10. Built-in artifacts
 
@@ -560,47 +559,209 @@ These classes take a `bun:sqlite` `Database`. Table and column names must match 
 
 An `UPDATE` does not change the `rowid`. If rows change in place, give an `orderColumn` that your code increases on each write, or use a persistent store so that the content check decides.
 
-## 11. Rules with `FileBuild`
+## 11. Rules with `RuleBuild`
 
-A `Task` names exact artifacts. Many builds instead need a rule such as "for each `src/<name>.txt`, write `out/<name>.txt`". `FileBuild` does this. You write rules with path templates. `FileBuild` finds the matching files, and it adds one task to a `Build` for each set of template values.
+A `Task` names exact artifacts. Many builds instead need a rule such as "for each `src/<name>.txt`, write `out/<name>.txt`". `RuleBuild` does this.
+
+A rule has named inputs. Each input is an **input generator**. A generator finds its source items and groups them by a set of **vars**. For each set of vars, it gives one value: one artifact, or a list of artifacts. The generator decides which. `RuleBuild` joins the values of all inputs on the var names that they share. It adds one task to a `Build` for each joined set of vars.
+
+The generators in `dapat/contrib` read files and S3 objects. You can write a generator for any other source, for example the commits of a git repository ([section 11.8](#118-write-your-own-input-generator)).
 
 ```ts
 import { Build } from "dapat"
-import { FileBuild, FilePattern, JsonStore } from "dapat/contrib"
+import { FileOutput, FilePattern, JsonStore, RuleBuild } from "dapat/contrib"
 
 const build = new Build({ store: new JsonStore(".dapat/state.json") })
-const files = new FileBuild(build, { root: "." })
+const rules = new RuleBuild(build)
 
-files.rule({
+rules.rule({
   name: "upper",
   inputs: { src: new FilePattern("src/<name>.txt") },
-  outputs: { mid: new FilePattern("mid/<name>.txt") },
+  outputs: { mid: new FileOutput("mid/<name>.txt") },
   run: async (ctx) => {
-    const text = new TextDecoder().decode(await ctx.file("src").read())
-    await Bun.write(ctx.outputFile("mid").path, text.toUpperCase())
+    const text = new TextDecoder().decode(await ctx.inputs.src.read())
+    await Bun.write(ctx.outputs.mid.path, text.toUpperCase())
   },
 })
 
-files.rule({
+rules.rule({
   name: "wrap",
   inputs: { mid: new FilePattern("mid/<name>.txt") },
-  outputs: { out: new FilePattern("out/<name>.txt") },
+  outputs: { out: new FileOutput("out/<name>.txt") },
   run: async (ctx) => {
-    const text = new TextDecoder().decode(await ctx.file("mid").read())
-    await Bun.write(ctx.outputFile("out").path, `[${text}]`)
+    const text = new TextDecoder().decode(await ctx.inputs.mid.read())
+    await Bun.write(ctx.outputs.out.path, `[${text}]`)
   },
 })
 
-const result = await files.run()
+const result = await rules.run()
 ```
 
-When `src/hello.txt` exists, `files.run()` creates the task `upper:name=hello`. That task writes `mid/hello.txt`. `FileBuild` then matches the new file against the `wrap` rule, and it creates `wrap:name=hello`. The `mid/` directory does not have to exist before the build.
+When `src/hello.txt` exists, `rules.run()` creates the task `upper:name=hello`. That task writes `mid/hello.txt`. The `mid/` generator sees the new file, and `RuleBuild` creates `wrap:name=hello`. The `mid/` directory does not have to exist before the build.
 
-`files.run()` scans the files under each input pattern, creates the tasks, and calls `build.run()`. It returns the same `Result`.
+`rules.run()` starts every generator, creates the tasks, and calls `build.run()`. It returns the same `Result`.
 
-### 11.1 Template syntax
+Inputs and outputs use different classes. `FilePattern` finds files and gives them to tasks. `FileOutput` names the file that a task writes. The two classes use the same template syntax.
 
-A template is a list of segments separated by `/`:
+`ctx.inputs.src` and `ctx.outputs.mid` both have the type `FileArtifact`. TypeScript gets these types from the generators, so a rule needs no casts.
+
+### 11.1 A complete pipeline
+
+This pipeline writes one draft for each pair of a specialty and a section. Then it revises each draft with the feedback that a person wrote.
+
+```text
+inputs/<section>.md                     brief for one section
+generic/<specialty>.md                  style guide for one specialty
+process/<specialty>/<section>.md        process notes for one pair
+        │
+        ▼  rule "draft"
+drafts/<specialty>/<section>.md
+feedback/<specialty>/<section>.md       optional: comments from a reviewer
+attachments/<specialty>/<section>/**    optional: any number of extra files
+        │
+        ▼  rule "revise"
+final/<specialty>/<section>.md
+```
+
+```ts
+import { Build } from "dapat"
+import { FileGlob, FileOutput, FilePattern, JsonStore, RuleBuild } from "dapat/contrib"
+import * as model from "./model"
+
+const build = new Build({ store: new JsonStore(".dapat/state.json") })
+const rules = new RuleBuild(build)
+
+rules.rule({
+  name: "draft",
+  inputs: {
+    brief: new FilePattern("inputs/<section>.md"),
+    guide: new FilePattern("generic/<specialty>.md"),
+    process: new FilePattern("process/<specialty>/<section>.md"),
+  },
+  outputs: { draft: new FileOutput("drafts/<specialty>/<section>.md") },
+  run: async (ctx) => {
+    const text = await model.draft(ctx.inputs.brief, ctx.inputs.guide, ctx.inputs.process)
+    await Bun.write(ctx.outputs.draft.path, text)
+  },
+})
+
+rules.rule({
+  name: "revise",
+  inputs: {
+    draft: new FilePattern("drafts/<specialty>/<section>.md"),
+    feedback: new FilePattern("feedback/<specialty>/<section>.md"),
+    attachments: new FileGlob("attachments/<specialty>/<section>/**"),
+  },
+  optional: ["feedback", "attachments"],
+  outputs: { final: new FileOutput("final/<specialty>/<section>.md") },
+  run: async (ctx) => {
+    if (ctx.inputs.feedback === undefined) {
+      await Bun.write(ctx.outputs.final.path, await ctx.inputs.draft.read())
+      return
+    }
+    const attachments = ctx.inputs.attachments ?? []
+    const text = await model.revise(ctx.inputs.draft, ctx.inputs.feedback, attachments)
+    await Bun.write(ctx.outputs.final.path, text)
+  },
+})
+
+const result = await rules.run()
+```
+
+The `attachments` input is a `FileGlob`. Its template ends with `**`, so it can match many files for one set of vars, and its value is a list. The other inputs are `FilePattern`s. A template with no glob names one path for each set of vars, so each of their values is one file.
+
+In `revise`, the context has these types:
+
+| Member | Type |
+| --- | --- |
+| `ctx.inputs.draft` | `FileArtifact` |
+| `ctx.inputs.feedback` | `FileArtifact \| undefined` |
+| `ctx.inputs.attachments` | `FileArtifact[] \| undefined` |
+| `ctx.outputs.final` | `FileArtifact` |
+| `ctx.vars` | `Vars`, for example `{ specialty: "law", section: "intro" }` |
+
+Start with these files:
+
+```text
+inputs/intro.md
+inputs/costs.md
+generic/law.md
+generic/tax.md
+process/law/intro.md
+process/law/costs.md
+process/tax/intro.md
+feedback/law/intro.md
+attachments/law/intro/chart.png
+attachments/law/intro/table.csv
+```
+
+`rules.run()` makes these tasks:
+
+| Task | Reason |
+| --- | --- |
+| `draft:section=costs,specialty=law` | All three inputs have a value for these vars. |
+| `draft:section=intro,specialty=law` | All three inputs have a value for these vars. |
+| `draft:section=intro,specialty=tax` | All three inputs have a value for these vars. |
+| no task for `tax` and `costs` | `process/tax/costs.md` does not exist. A required input removes each set of vars that it has no value for. |
+| `revise:section=intro,specialty=law` | It gets its draft, `feedback/law/intro.md`, and a list of both attachments, sorted by path. |
+| `revise:section=costs,specialty=law` | `feedback` and `attachments` are `undefined`. Optional inputs do not remove tasks. |
+| `revise:section=intro,specialty=tax` | The same as the row above. |
+
+The `revise` tasks do not exist when the build starts, because no drafts exist yet. Each `draft` task writes its output. The `drafts/` generator then sets a value for the new file, and `RuleBuild` adds the matching `revise` task during the same build. Each `revise` task waits for its `draft` task, because the draft file is an output of one task and an input of the other.
+
+Run the script again with no change, and all six tasks skip. Then add `feedback/tax/intro.md`. Only `revise:section=intro,specialty=tax` executes, because its list of inputs changed.
+
+### 11.2 How `RuleBuild` makes tasks
+
+Each input of a rule keeps a table. The generator of the input fills the table. The table has at most one entry for each set of vars. The value of an entry is one artifact or a list of artifacts:
+
+```text
+input "process"       new FilePattern("process/<specialty>/<section>.md")
+  { specialty: "law", section: "intro" }  →  FileArtifact process/law/intro.md
+  { specialty: "law", section: "costs" }  →  FileArtifact process/law/costs.md
+  { specialty: "tax", section: "intro" }  →  FileArtifact process/tax/intro.md
+
+input "attachments"   new FileGlob("attachments/<specialty>/<section>/**")
+  { specialty: "law", section: "intro" }  →  [ FileArtifact attachments/law/intro/chart.png,
+                                               FileArtifact attachments/law/intro/table.csv ]
+```
+
+`RuleBuild` makes the tasks of a rule in these steps:
+
+1. It takes the tables of the **required** inputs. An input is required when its name is not in `optional`.
+2. It joins the var sets of those tables on the var names that they share. Two var sets join when each shared name has the same value. The result is the list of **task vars**. When two inputs share no var name, the join gives every combination of their entries.
+3. For each set of task vars, it gives each input the value of its matching entry. An optional input with no matching entry gives `undefined`.
+4. It renders each output from the task vars.
+5. It adds a task for each new set of task vars. It adds a task again when a generator sets or deletes one of its input entries. It removes the task for each set of task vars that no longer exists.
+
+Each captured var is a task var. So each value of a var makes a different task. To give several artifacts to one task, use a generator whose value is a list. For example, use a template with `*` or `**`, or leave an identity field out of a field spec ([section 11.8](#118-write-your-own-input-generator)).
+
+The generator class decides the type of its value, because only the generator knows if one set of vars can match more than one item. The type in `ctx.inputs` comes from the generator:
+
+| Input | Value in `ctx.inputs` |
+| --- | --- |
+| `new FilePattern("feedback/<specialty>/<section>.md")` | `FileArtifact` |
+| `new FileGlob("attachments/<specialty>/<section>/**")` | `FileArtifact[]`, sorted by path |
+| `new GitCommits(repo, { commit: capture("sha") })` | `GitCommitArtifact` |
+| `new GitCommits(repo, { branch: capture("branch") })` | `GitCommitArtifact[]` |
+| any of these, with its name in `optional` | the same type, or `undefined` |
+
+The optional list belongs to the rule, not to the generator. One generator can be required in one rule and optional in a different rule.
+
+`rule()` checks the shape of the rule. It throws in these conditions:
+
+- A name in `optional` is not the name of an input.
+- The rule has no required input.
+- An optional input uses a var that no required input captures. Because of this check, an optional input never changes the number of tasks. Use `*` for that part of the template.
+- An output uses a var that no required input captures.
+
+A generator with no vars has at most one entry. If it is a required input, every task gets its value when the entry exists, and the rule makes no tasks when the entry does not exist. For example, `new FileGlob("config/*.json")` gives all the config files to every task. Put it in `optional` if the rule must run when no config file exists.
+
+The default task id is `<name>:<var>=<value>,...`, with the vars sorted by name. When the task has no vars, the default id is just `<name>` (no colon). Give `id: (vars) => string` in the rule to set a different id.
+
+### 11.3 Template syntax
+
+All the file and S3 classes take a template. A template is a list of segments separated by `/`:
 
 | Segment | Matches | Example |
 | --- | --- | --- |
@@ -613,146 +774,437 @@ When a var appears more than one time in a template, all of its matches must be 
 
 A var match is greedy. For the segment `x-y-z`, the template `<a>-<b>` saves `a = "x-y"` and `b = "z"`.
 
-A relative template starts at the `root` of the `FileBuild`. A template that starts with `/` is absolute.
+A var matches in one segment only. It never matches a `/`.
 
-Start each input template with a literal directory. `scan` walks every file under the literal start of the template. A template such as `<name>.txt` has no literal start, so `scan` walks all of `root`, including `node_modules` and `.git`.
+Choose the class from the template:
 
-### 11.2 Input kinds
+| Class | Role | Template | Value for each set of vars |
+| --- | --- | --- | --- |
+| `FilePattern` | input | no `*` and no `**` | one `FileArtifact` |
+| `FileGlob` | input | at least one `*` or `**` | a `FileArtifact[]` of every matching file, sorted by path |
+| `FileOutput` | output | no `*` and no `**` | one `FileArtifact` |
+| `DirOutput` | output | ends with `/`, no glob | one `PathPrefix` |
 
-| Kind | How to declare | Value in `ctx` |
-| --- | --- | --- |
-| single | `new FilePattern("src/<name>.txt")` | `ctx.file("src")`. Exactly one file must match for each set of vars. |
-| list | a template with `*` or `**`, or `{ list: true }` | `ctx.files("posts")`, sorted by path. It can be empty. |
-| optional | `{ optional: true }` | `ctx.inputs.meta` is `undefined` when no file matches |
+Each constructor throws if the template does not agree with its class. For example, `new FilePattern("posts/*.md")` throws and tells you to use `FileGlob`.
 
-### 11.3 How `FileBuild` makes tasks
+An output template can use only the vars that the required inputs capture, so an output never uses a glob.
 
-A rule creates one task for each combination of var values that all required inputs share. The required inputs are the single inputs and the list inputs that contain a var. A list input with a var needs at least one match. A list input without a var does not change the combinations. It gets every match. An optional input adds its file when a match exists. It does not remove combinations.
+When the last file for a set of vars goes away, a `FileGlob` deletes that entry. So a required `FileGlob` input needs at least one file.
 
-This rule creates one index for each topic. It adds a metadata file when one exists:
+A relative file template starts at `process.cwd()` when the constructor runs. Give `{ root }` to start somewhere else, for example `new FilePattern("src/<name>.txt", { root: dir })`. A template that starts with `/` is absolute.
+
+An S3 template starts with `s3://<bucket>/`. `S3Pattern`, `S3Glob`, and `S3Output` also take `{ client }`.
+
+Start each template with a literal directory. The generator walks every file under the literal start of the template. A template such as `<name>.txt` has no literal start, so the generator walks all of the root, including `node_modules` and `.git`.
+
+### 11.4 Outputs
+
+An output is an **output generator**. It renders one artifact or one prefix from the task vars:
+
+| Output | Declare | Value in `ctx.outputs` | Before the task runs |
+| --- | --- | --- | --- |
+| one file | `new FileOutput("index/<topic>.txt")` | `FileArtifact` | `RuleBuild` creates the parent directory. |
+| file prefix | `new DirOutput("pages/<doc>/")` | `PathPrefix` | `RuleBuild` creates the directory. |
+| one S3 object | `new S3Output("s3://docs/index/<topic>.txt", { client })` | `S3ObjectArtifact` | nothing |
+| S3 prefix | `new S3PrefixOutput("s3://docs/pages/<doc>/")` | `S3Prefix` | nothing |
+
+An input generator is not an output generator. TypeScript rejects a `FilePattern` or a `FileGlob` in `outputs`, and it rejects a `FileOutput` in `inputs`.
+
+A task with a prefix output must call `ctx.produced(artifact)` for each file or object that it writes under the prefix. Other rules can then match those artifacts in the same build:
 
 ```ts
-import path from "node:path"
-
-files.rule({
-  name: "index",
-  inputs: {
-    posts: new FilePattern("posts/<topic>/*.md"),
-    meta: new FilePattern("meta/<topic>.txt", { optional: true }),
-  },
-  outputs: { out: new FilePattern("index/<topic>.txt") },
+rules.rule({
+  name: "paginate",
+  inputs: { src: new FilePattern("inbox/<doc>.txt") },
+  outputs: { pages: new DirOutput("pages/<doc>/") },
   run: async (ctx) => {
-    const names = ctx.files("posts").map((f) => path.basename(f.path))
-    const meta = ctx.inputs.meta ? "meta" : "nometa"
-    await Bun.write(ctx.outputFile("out").path, `${names.join(",")} ${meta}`)
+    const text = new TextDecoder().decode(await ctx.inputs.src.read())
+    const lines = text.split("\n")
+    for (let i = 0; i < lines.length; i++) {
+      const page = new FileArtifact(path.join(ctx.outputs.pages.path, `${i + 1}.txt`))
+      await Bun.write(page.path, lines[i]!)
+      ctx.produced(page)
+    }
   },
 })
 ```
 
-The start state is `posts/a/1.md`, `posts/a/2.md`, `posts/b/1.md`, and `meta/a.txt`. These runs use one `JsonStore`:
-
-1. **First run.** `index:topic=a` and `index:topic=b` execute. `index/a.txt` contains `1.md,2.md meta`.
-2. **No change.** Both tasks skip.
-3. **Add `posts/b/2.md`.** `index:topic=b` executes, because its list of inputs changed. `index:topic=a` skips.
-4. **Delete `posts/a/2.md`.** `index:topic=a` executes, and `index/a.txt` now contains `1.md meta`. `index:topic=b` skips.
-
-The default task id is `<name>:<var>=<value>,...`, with the vars sorted by name. Give `id: (vars) => string` in the rule to set a different id.
-
-If a single input matches more than one file for one set of vars, `FileBuild` throws `rule '<name>' input '<input>' matched <n> items for <vars>`. During `scan`, this error rejects `files.run()`. During the build, the error comes from a listener, so the rules for listener errors in [section 9](#9-listen-to-produced-artifacts) apply.
-
-### 11.4 Outputs
-
-- A **single** output, such as `index/<topic>.txt`, must use only vars that the inputs bind. If an output uses a var that no input binds, `FileBuild` creates no task and gives no error. `FileBuild` creates the parent directory before the task runs. Get the path with `ctx.outputFile(name).path`.
-- A **list** output, such as `pages/<doc>/*.txt`, becomes a plain prefix output. The prefix stops at the first glob. For a `FilePattern`, `FileBuild` creates the directory. The task must call `ctx.produced(new FileArtifact(path))` for each file that it writes. Other rules can then match those files in the same build.
-
-### 11.5 How `FileBuild` finds new files
+### 11.5 How `RuleBuild` finds new values
 
 ```text
-files.run()
-├─ scan()
-│   ├─ for each rule, for each input pattern: walk the files under the literal start of the template
-│   ├─ match each file id against every input pattern and keep the vars
-│   └─ for each rule: combine the vars → make tasks → build.add(task)
+rules.run()
+├─ load()
+│   └─ for each rule, for each input: await gen.start(feed)
+│       ├─ the generator sets the values that exist now    feed.set(vars, value)
+│       └─ the generator asks for events                   feed.listen(prefix, fn) → build.listen(prefix, …)
+├─ sync(): for each rule, join the tables → build.add(task) and build.remove(id)
 └─ build.run()
-    └─ a task writes a file and announces it (declared output or ctx.produced)
-        └─ FileBuild listener (listens under the literal start of every input and output template)
-            ├─ match the id against every input pattern
-            └─ combine the vars again
-                ├─ build.add(task) for each new set of vars
-                ├─ build.add(task) again for each task whose input was announced again
-                └─ build.remove(id) for each set of vars that no longer exists
+    └─ a task writes an artifact and announces it (declared output or ctx.produced)
+        └─ Build calls each listener whose prefix covers the artifact
+            └─ generator callback: feed.set(vars, value) or feed.delete(vars)
+                └─ RuleBuild syncs each rule that uses this input
+                    ├─ build.add(task) for each new set of task vars
+                    ├─ build.add(task) again for each task whose input entry changed
+                    └─ build.remove(id) for each set of task vars that no longer exists
 ```
 
 This loop lets one rule feed another rule. It also lets a rule feed itself, as in `examples/agent-loop.ts`. Each turn writes `turns/<sid>/<n+1>/prompt.txt`, and that file matches the first rule of the next turn.
 
-A task that skips sends no events. `FileBuild` still finds the outputs of skipped tasks, because `scan` finds existing files before the build runs.
+A task that skips sends no events. The file and S3 generators still find the outputs of skipped tasks, because `start` lists the existing files and objects before the build runs.
 
 ### 11.6 The rule context
 
-`run(ctx)` gets a `FileContext`:
+`run(ctx)` gets a `RuleContext`:
 
-| Member | Returns |
+| Member | Value |
 | --- | --- |
-| `ctx.vars` | The var values of this task, for example `{ name: "hello" }` |
-| `ctx.file(name)` | The single input `name` as a `FileArtifact`. It throws if the input is a list, missing, or not a file. |
-| `ctx.files(name)` | The input `name` as a `FileArtifact[]` |
-| `ctx.item(name)` | The single input `name` as an `Item`. Use it for S3 inputs. |
-| `ctx.items(name)` | The input `name` as an `Item[]` |
-| `ctx.inputs` | Every input by name, as `Item`, `Item[]`, or `undefined` |
-| `ctx.outputFile(name)` | The single output `name` as a `FileArtifact` |
-| `ctx.outputObject(name)` | The single output `name` as an `S3ObjectArtifact` |
-| `ctx.outputPrefix(name)` | The prefix of the list output `name` |
-| `ctx.outputs` | Every single output by name |
-| `ctx.produced(item)` | Announces a file or object under a list output |
-| `ctx.signal` | The task's `AbortSignal` |
-
-An `Item` is an `Artifact<Uint8Array>`: a file or an S3 object.
+| `ctx.vars` | The task vars, for example `{ specialty: "law", section: "intro" }` |
+| `ctx.inputs.<name>` | The value of each input. The generator sets its type. An optional input can also be `undefined` ([section 11.2](#112-how-rulebuild-makes-tasks)). |
+| `ctx.outputs.<name>` | The artifact or prefix of each output ([section 11.4](#114-outputs)) |
+| `ctx.produced(artifact)` | Announces an artifact under a prefix output |
+| `ctx.signal` | The `AbortSignal` of the task |
 
 ### 11.7 S3 rules
 
-`S3Pattern` has the same template syntax and options for S3 keys. Give the bucket in the template, as `s3://docs/...`, or in the options, as `{ client, bucket: "docs" }`. You can use file patterns and S3 patterns in the same rule:
+`S3Pattern`, `S3Glob`, `S3Output`, and `S3PrefixOutput` do for S3 keys what the file classes do for paths. They use the same template syntax, after `s3://<bucket>/`. One rule can use file generators and S3 generators together:
 
 ```ts
-import { FilePattern, MemoryS3, S3ObjectArtifact, S3Pattern } from "dapat/contrib"
+import { FileOutput, MemoryS3, S3ObjectArtifact, S3Pattern, S3PrefixOutput } from "dapat/contrib"
 
 const s3 = new MemoryS3()
 
-files.rule({
+rules.rule({
   name: "paginate",
   inputs: { src: new S3Pattern("s3://docs/inbox/<doc>.txt", { client: s3 }) },
-  outputs: { pages: new S3Pattern("s3://docs/pages/<doc>/*.txt", { client: s3 }) },
+  outputs: { pages: new S3PrefixOutput("s3://docs/pages/<doc>/") },
   run: async (ctx) => {
-    const lines = new TextDecoder().decode(await ctx.item("src").read()).split("\n")
+    const text = new TextDecoder().decode(await ctx.inputs.src.read())
+    const lines = text.split("\n")
     for (let i = 0; i < lines.length; i++) {
-      const key = `pages/${ctx.vars.doc}/${i + 1}.txt`
+      const key = `${ctx.outputs.pages.keyPrefix}${i + 1}.txt`
       await s3.put("docs", key, new TextEncoder().encode(lines[i]!))
       ctx.produced(new S3ObjectArtifact(s3, "docs", key))
     }
   },
 })
 
-files.rule({
+rules.rule({
   name: "shot",
   inputs: { page: new S3Pattern("s3://docs/pages/<doc>/<page>.txt", { client: s3 }) },
-  outputs: { shot: new FilePattern("shots/<doc>/<page>.png") },
+  outputs: { shot: new FileOutput("shots/<doc>/<page>.png") },
   run: async (ctx) => {
-    await Bun.write(ctx.outputFile("shot").path, await ctx.item("page").read())
+    await Bun.write(ctx.outputs.shot.path, await ctx.inputs.page.read())
   },
 })
 ```
 
-For S3 inputs, use `ctx.item(name)` and `ctx.items(name)`. For S3 outputs, use `ctx.outputObject(name)`. `S3Pattern` scans with `client.list`.
+`S3Pattern` and `S3Glob` list the existing objects with `client.list`. `S3Output` needs a client, because an `S3ObjectArtifact` reads its stamps through the client. `S3PrefixOutput` gives a plain prefix, so it needs no client.
 
-### 11.8 More examples
+### 11.8 Write your own input generator
+
+An input generator is a subclass of `InputGen<V>`. `V` is the type of its value for one set of vars: one artifact, or a list of artifacts:
+
+```ts
+type Value = Artifact | readonly Artifact[]
+
+abstract class InputGen<V extends Value> {
+  abstract readonly varNames: readonly string[]
+  abstract start(feed: Feed<V>): Promise<void>
+}
+
+interface Feed<V extends Value> {
+  set(vars: Vars, value: V): void
+  delete(vars: Vars): void
+  listen(prefix: Prefix, fn: (event: ArtifactEvent) => void | Promise<void>): void
+}
+```
+
+The generator does all of the work of finding items and grouping them. `RuleBuild` only stores the value for each set of vars, joins the tables, and makes tasks.
+
+Obey these rules when you write a generator:
+
+- `start` sets each value that exists now. `RuleBuild` waits for the promise before it makes tasks.
+- After `start`, set or delete values only inside a `listen` callback. `RuleBuild` syncs the tasks after each callback. The `Build` waits for its listeners, so it cannot finish before that sync. A value that you set from a timer or a file watcher can arrive after `build.run()` returns, and then no task uses it.
+- The vars must have exactly the names in `varNames`. `feed.set` and `feed.delete` throw if they do not.
+- There is one entry for each set of vars. `feed.set` replaces the value of an existing entry, and the tasks that use it are added again.
+- A generator whose value is a list keeps that list itself. It adds and removes items, sorts them, and sets the whole list again after each change. An empty list is a valid value, and a required input with an empty list still makes a task. To remove the task, delete the entry.
+- `RuleBuild` calls `start` one time for each input that uses the generator. Keep the state of one input inside `start`, not in fields of the generator. `VarsMap` is a map with `Vars` keys that helps with this state.
+- Each value must contain artifacts. The `Build` decides when to wait and when to skip from the artifacts of a task. If a source has no natural artifact, make a small one whose content stamp is the value. The first example below does this.
+
+#### A fixed list of values
+
+This generator gives one value for each item in a list. It reads no files:
+
+```ts
+import { Artifact } from "dapat"
+import { InputGen, type Feed } from "dapat/contrib"
+
+class ValueArtifact extends Artifact<string> {
+  readonly id: string
+
+  constructor(readonly name: string, readonly value: string) {
+    super()
+    this.id = `value:${name}=${value}`
+  }
+
+  async orderStamp(): Promise<bigint | null> {
+    return null
+  }
+
+  async contentStamp(): Promise<string | null> {
+    return this.value
+  }
+
+  async read(): Promise<string> {
+    return this.value
+  }
+}
+
+class Values extends InputGen<ValueArtifact> {
+  readonly varNames: readonly string[]
+
+  constructor(private readonly name: string, private readonly values: string[]) {
+    super()
+    this.varNames = [name]
+  }
+
+  async start(feed: Feed<ValueArtifact>): Promise<void> {
+    for (const value of this.values) {
+      feed.set({ [this.name]: value }, new ValueArtifact(this.name, value))
+    }
+  }
+}
+```
+
+This rule joins the values with files on the shared var `locale`:
+
+```ts
+rules.rule({
+  name: "translate",
+  inputs: {
+    locale: new Values("locale", ["fr", "de"]),
+    page: new FilePattern("pages/<locale>/<page>.md"),
+  },
+  outputs: { out: new FileOutput("site/<locale>/<page>.html") },
+  run: async (ctx) => {
+    // ...
+  },
+})
+```
+
+The file `pages/es/home.md` makes no task, because `es` is not in the list.
+
+#### How the glob generator groups files
+
+`FileGlob` extends `InputGen<FileArtifact[]>`, as your generator does. It groups the matching files for each set of vars itself. This is a short form of its `start` method:
+
+```ts
+async start(feed: Feed<FileArtifact[]>): Promise<void> {
+  const groups = new VarsMap<Set<string>>()
+
+  const update = (filePath: string, present: boolean): void => {
+    const vars = this.match(filePath)
+    if (vars === null) return
+    const paths = groups.get(vars) ?? new Set<string>()
+    if (present) {
+      paths.add(filePath)
+    } else {
+      paths.delete(filePath)
+    }
+    if (paths.size === 0) {
+      groups.delete(vars)
+      feed.delete(vars)
+      return
+    }
+    groups.set(vars, paths)
+    const sorted = [...paths].sort()
+    const files: FileArtifact[] = []
+    for (const p of sorted) {
+      files.push(new FileArtifact(p))
+    }
+    feed.set(vars, files)
+  }
+
+  const existing = await walkFiles(this.staticPrefix)
+  for (const filePath of existing) {
+    update(filePath, true)
+  }
+  feed.listen(new PathPrefix(this.staticPrefix), (event) => {
+    const filePath = event.id.slice("file:".length)
+    update(filePath, event.type === "produced")
+  })
+}
+```
+
+`FilePattern` is the same without the groups. Each path gives one value, and a retracted path deletes its entry.
+
+#### Field generators
+
+Many sources give records with named fields. For example, a git commit record has a `commit` field and a `branch` field. A subclass of `FieldGen` lets the user of the generator choose one of three settings for each field:
+
+| Field spec | Effect |
+| --- | --- |
+| `branch: "main"` | Keep only the records where `branch` is `main`. |
+| `commit: capture("sha")` | Save the field as the var `sha`. |
+| field left out | Ignore the field. Records that are different only in this field go to the same set of vars. |
+
+When two fields capture the same var name, the two values must be equal.
+
+The subclass also names its **identity fields**. These are the fields that together pick one artifact. For a commit, the identity field is `commit`. The spec then decides the type of the value:
+
+- When the spec gives every identity field, as a literal or a capture, one set of vars picks one artifact. The value is `A`.
+- When the spec leaves out an identity field, one set of vars can pick many artifacts. The value is `A[]`, sorted by artifact id, with no duplicates.
+
+```ts
+abstract class FieldGen<
+  F extends string,              // all field names
+  Id extends F,                  // identity fields
+  A extends Artifact,            // artifact of one record
+  S extends FieldSpec<F>,        // the spec that the user gave
+> extends InputGen<FieldValue<Id, A, S>> {
+  constructor(spec: S, identity: readonly Id[])
+  protected abstract records(): Promise<FieldRecord<F, A>[]>
+  protected literal(field: F): string | undefined
+}
+
+type FieldSpec<F extends string> = Partial<Record<F, string | Capture>>
+type FieldRecord<F extends string, A extends Artifact> = {
+  fields: Record<F, string>
+  artifact: A
+}
+type FieldValue<Id extends string, A extends Artifact, S> =
+  [Exclude<Id, keyof S>] extends [never] ? A : A[]
+```
+
+A subclass implements `records`. `FieldGen.start` calls `records` one time, applies the spec, groups the records by vars, and sets the values. It does not listen. If your source can change during a build, override `start`. A subclass can call `this.literal(field)` to ask its source for fewer records.
+
+When the value is one artifact, two records with the same vars must have the same artifact id. If they do not, the identity fields are wrong, and `start` throws.
+
+This generator gives the commits of a git repository:
+
+```ts
+import { $ } from "bun"
+import { Artifact } from "dapat"
+import { FieldGen, type FieldRecord, type FieldSpec } from "dapat/contrib"
+
+class GitCommitArtifact extends Artifact<string> {
+  readonly id: string
+
+  constructor(readonly repo: string, readonly sha: string) {
+    super()
+    this.id = `git:${repo}@${sha}`
+  }
+
+  async orderStamp(): Promise<bigint | null> {
+    return null
+  }
+
+  async contentStamp(): Promise<string | null> {
+    return this.sha
+  }
+
+  async read(): Promise<string> {
+    return this.sha
+  }
+}
+
+type CommitField = "commit" | "branch"
+
+class GitCommits<S extends FieldSpec<CommitField>>
+  extends FieldGen<CommitField, "commit", GitCommitArtifact, S> {
+  constructor(readonly repo: string, spec: S) {
+    super(spec, ["commit"])
+  }
+
+  protected async records(): Promise<FieldRecord<CommitField, GitCommitArtifact>[]> {
+    const branches: string[] = []
+    const only = this.literal("branch")
+    if (only !== undefined) {
+      branches.push(only)
+    } else {
+      const refs = await $`git -C ${this.repo} for-each-ref --format=%(refname:short) refs/heads`.text()
+      for (const line of refs.split("\n")) {
+        if (line.length > 0) branches.push(line)
+      }
+    }
+
+    const records: FieldRecord<CommitField, GitCommitArtifact>[] = []
+    for (const branch of branches) {
+      const shas = await $`git -C ${this.repo} rev-list ${branch}`.text()
+      for (const sha of shas.split("\n")) {
+        if (sha.length === 0) continue
+        const artifact = new GitCommitArtifact(this.repo, sha)
+        records.push({ fields: { commit: sha, branch }, artifact })
+      }
+    }
+    return records
+  }
+}
+```
+
+The same class gives four different sets of tasks:
+
+| Input | Tasks | Value |
+| --- | --- | --- |
+| `new GitCommits(repo, { commit: capture("sha") })` | one for each commit in any branch | `GitCommitArtifact` |
+| `new GitCommits(repo, { branch: "main", commit: capture("sha") })` | one for each commit in `main` | `GitCommitArtifact` |
+| `new GitCommits(repo, { branch: capture("branch"), commit: capture("sha") })` | one for each pair of a branch and a commit in that branch | `GitCommitArtifact` |
+| `new GitCommits(repo, { branch: capture("branch") })` | one for each branch | `GitCommitArtifact[]`, every commit in the branch |
+
+In the first row, the spec leaves out `branch`. A commit that is in two branches gives two records with the same vars and the same artifact, so it gives one value. In the last row, the spec leaves out `commit`, which is an identity field, so the value is a list.
+
+This rule counts the lines of the files in each commit:
+
+```ts
+rules.rule({
+  name: "count",
+  inputs: { commit: new GitCommits(repo, { commit: capture("sha") }) },
+  outputs: { count: new FileOutput("counts/<sha>.txt") },
+  run: async (ctx) => {
+    const sha = ctx.inputs.commit.sha
+    const out = await $`git -C ${repo} grep -c "" ${sha}`.nothrow().text()
+    let total = 0
+    for (const line of out.split("\n")) {
+      if (line.length === 0) continue
+      total += Number(line.slice(line.lastIndexOf(":") + 1))
+    }
+    await Bun.write(ctx.outputs.count.path, String(total))
+  },
+})
+```
+
+The content stamp of a commit artifact is its sha, and a commit never changes. So with a store, each old commit skips, and only new commits execute.
+
+Other git generators follow the same shape. A `GitBranches` generator with a `branch` field, and an artifact whose content stamp is the sha at the tip of the branch, pairs with files:
+
+```ts
+inputs: {
+  branch: new GitBranches(repo, { branch: capture("branch") }),
+  notes: new FilePattern("branchNotes/<branch>.md"),
+},
+optional: ["notes"],
+```
+
+With `optional: ["notes"]`, each branch gets a task, and `ctx.inputs.notes` is `undefined` for a branch with no notes file. Without it, only the branches with a notes file get a task. A branch name that contains `/` never matches `<branch>` ([section 13](#13-limits)).
+
+To give each commit task the list of the branches that contain it, write a `GitCommitBranches` generator whose artifact is the branch and whose identity field is `branch`. Capture only `commit`. The spec leaves out the identity field, so the value is a list of branches.
+
+The git generators in this section are examples. `dapat/contrib` does not include them yet.
+
+### 11.9 More examples
 
 The repo has these examples. Run them with `bun run examples/<name>.ts`:
 
 - `first-build.ts` shows the two tasks from section 3. Run it from a directory that contains `in.txt`.
 - `file-pipeline.ts` shows two rules in a chain.
-- `s3-pages-screenshots.ts` shows an S3 list output, and one file for each page.
+- `draft-revise.ts` is the pipeline from [section 11.1](#111-a-complete-pipeline), with a fake model.
+- `custom-gen.ts` joins the `Values` generator from [section 11.8](#118-write-your-own-input-generator) with files.
+- `s3-pages-screenshots.ts` shows an S3 prefix output, and one file for each page.
 - `agent-loop.ts` shows an agent with more than one turn. Each turn writes the prompt for the next turn, and a rule matches the new prompt. The code has no `while` loop.
+- `git-gens.ts` defines `GitCommitArtifact`, `GitCommits`, and `GitBranches` from [section 11.8](#118-write-your-own-input-generator).
+- `git-line-count.ts` counts lines in each commit of a repo (default: the current repo).
 
-The last three examples run in a temporary directory. They import from `../src` and `../contrib`. In your project, import from `dapat` and `dapat/contrib`.
+The last examples that use a temporary directory import from `../src` and `../contrib`. In your project, import from `dapat` and `dapat/contrib`.
 
 ## 12. Recipes
 
@@ -824,7 +1276,13 @@ dapat then uses the content check, which does not depend on modification times. 
 
 ## 13. Limits
 
-- **A task that skips sends no events.** This applies to its prefix outputs and to its declared outputs. A `build.listen()` handler sees nothing from that task on the next build. `FileBuild` does not have this problem, because it scans for existing files before it runs.
+- **A task that skips sends no events.** This applies to its prefix outputs and to its declared outputs. A `build.listen()` handler sees nothing from that task on the next build. The file and S3 generators of `RuleBuild` do not have this problem, because they list the existing files and objects before the build runs. A generator that you write must do the same in `start`.
+- **A retracted file stays on disk.** dapat does not delete files or objects. Retraction only sends events. The file and S3 generators treat a retracted artifact as gone for the rest of the build; the next build finds it again when `start` walks the files or objects.
+- **A rule whose output removes one of its own required inputs undoes itself.** RuleBuild removes the task, and Build retracts its outputs ([section 8](#removal)).
+- **A template var does not match `/`, and render rejects unsafe values.** A git branch such as `feature/x` never matches `branchNotes/<branch>.md`. Rendering a template throws when a var value is empty, `.`, `..`, or contains `/`. A generator that gives such values must encode `/`, for example as `%2F`, so that its vars are equal to the vars from the file names.
+- **The file generators skip symbolic links.** `FilePattern` and `FileGlob` walk only real files and directories. A symlink under the pattern root is ignored.
+- **A generator cannot add values from outside `RuleBuild`.** A generator sets values in `start` and in `listen` callbacks only. A change that comes from a person or another program during the build, such as a new commit, is not seen until the next build.
+- **Build reads the stamps of a task once, before it decides to skip.** A change that another program makes to an input or output while the build runs can be missed until the next build.
 - **Order stamps have different units.** dapat compares the order stamps of all artifacts in one task as plain integers. `FileArtifact` and `DirectoryArtifact` use nanoseconds. `S3ObjectArtifact` uses milliseconds. `SqliteRowArtifact` uses `rowid` or your `orderColumn`. If one task has artifacts of two kinds, the order check gives wrong results. For example, an S3 input and a file output always look current. The content check comes first, so a persistent store decides correctly after the first successful run. On the first run, and each time the task has no store record, the order check decides.
 - **A prefix artifact input does not wait for a plain prefix output in a subfolder.** See [section 5](#how-dapat-finds-dependencies).
 - **`FileArtifact` stamp methods return `null` for all errors.** For example, a permission error on a file looks like a missing file. The task then runs again and does not fail. Check file permissions when a task always runs.
@@ -851,7 +1309,7 @@ new Build(opts?: { store?: Store })
 | `add(task: Task): void` | Adds a task. If a task with the same id exists, replaces it (see [section 8](#replacement)). If `run()` has started, the task starts at once. Throws if another task already declares one of its exact outputs, or if the task declares one output twice. |
 | `remove(id: string): void` | Removes a task. Aborts it if it is running and retracts its announced artifacts. Starts to delete its store record, but does not wait for the delete. Does nothing if the id is not known. |
 | `listen(prefix: Prefix, fn: ArtifactListener): () => void` | Calls `fn` for each announced artifact that `prefix` covers. It first replays the artifacts that were already announced. Returns a function that removes the listener. |
-| `run(): Promise<Result>` | Starts every task and resolves when no task and no listener is in progress. Does not reject when a task fails. |
+| `run(): Promise<Result>` | Starts every task and resolves when no task and no listener is in progress. Does not reject when a task fails. Rejects when a listener throws or rejects (see [section 9](#9-listen-to-produced-artifacts)). |
 
 ### `class Task`
 
@@ -1152,100 +1610,237 @@ Creates the table `dapat_task_state (task_id TEXT PRIMARY KEY, payload TEXT)` if
 
 The same class as the core `MemoryStore`.
 
-## FileBuild (`dapat/contrib`)
+## Rules (`dapat/contrib`)
 
-### `class FileBuild`
+### `class RuleBuild`
 
 ```ts
-new FileBuild(build: Build, opts?: { root?: string })
+new RuleBuild(build: Build)
 ```
-
-`root` is the directory for relative templates. The default is `process.cwd()`.
 
 | Member | Description |
 | --- | --- |
-| `rule(spec: FileRule): void` | Adds a rule and listens under the literal start of each input and output template. Call it before `scan` or `run`. |
-| `scan(): Promise<void>` | Finds existing files and objects for every input pattern and adds the matching tasks to the build. |
-| `run(): Promise<Result>` | Calls `scan()`, then `build.run()`. |
+| `rule<I, Opt, O>(spec: Rule<I, Opt, O>): void` | Checks the shape of the rule ([section 11.2](#112-how-rulebuild-makes-tasks)) and adds it. Throws if the shape is bad. Call it before `load` or `run`. |
+| `load(): Promise<void>` | Calls `start` on the generator of each input, waits for the values, and adds the matching tasks to the build. |
+| `run(): Promise<Result>` | Calls `load()`, then `build.run()`. |
 
-### `interface FileRule`
+### `interface Rule<I, Opt, O>`
 
 ```ts
-interface FileRule {
+interface Rule<
+  I extends Record<string, InputGen<Value>>,
+  Opt extends keyof I,
+  O extends Record<string, OutputGen>,
+> {
   name: string
-  inputs: Record<string, ItemPattern>
-  outputs: Record<string, ItemPattern>
+  inputs: I
+  optional?: readonly Opt[]          // default: [] (every input is required)
+  outputs: O
   id?: (vars: Vars) => string        // default: `${name}:${k=v,...}`
-  run: (ctx: FileContext) => Promise<void>
+  run: (ctx: RuleContext<I, Opt, O>) => Promise<void>
 }
 ```
 
-### `interface FileContext`
+TypeScript infers `Opt` from the names in `optional`.
+
+### `interface RuleContext<I, Opt, O>`
+
+```ts
+interface RuleContext<I, Opt extends keyof I, O> {
+  readonly vars: Vars
+  readonly inputs: {
+    [K in keyof I]: K extends Opt ? InputValue<I[K]> | undefined : InputValue<I[K]>
+  }
+  readonly outputs: { [K in keyof O]: OutputRef<O[K]> }
+  readonly signal: AbortSignal
+  produced(artifact: Artifact): void
+}
+
+type InputValue<G> = G extends InputGen<infer V> ? V : never
+type OutputRef<G> = G extends OutputGen<infer R> ? R : never
+```
 
 See [section 11.6](#116-the-rule-context).
 
-### `class FilePattern implements ItemPattern`
+### `type Value`
 
 ```ts
-new FilePattern(template: string, opts?: FilePatternOpts)
-
-type FilePatternOpts = { optional?: boolean; list?: boolean }
+type Value = Artifact | readonly Artifact[]
 ```
+
+The value of one input for one set of vars. `RuleBuild` gives each artifact in the value to the task as an input, so the task waits for the writers of those artifacts and uses their stamps to decide if it skips.
+
+### `abstract class InputGen<V extends Value>`
 
 | Member | Description |
 | --- | --- |
-| `template`, `optional`, `list`, `varNames` | The template, the options, and the var names in template order. `list` is `true` if you set it or if the template has a glob. |
-| `staticPrefix(root): string` | Absolute path of the literal start, ending with `/`. |
-| `match(absPath, root): Vars \| null` | Vars bound by the path, or `null` if it does not match. |
-| `render(vars, root): string` | The absolute path for the vars. Throws if a var is missing or the template has a glob. |
+| `abstract readonly varNames: readonly string[]` | The var names of each entry, in a fixed order |
+| `abstract start(feed: Feed<V>): Promise<void>` | Sets the values that exist now, and calls `feed.listen` for later changes. `RuleBuild` calls it one time for each input. |
 
-### `class S3Pattern implements ItemPattern`
+See [section 11.8](#118-write-your-own-input-generator) for the rules that a generator must obey.
 
-```ts
-new S3Pattern(template: string, opts: S3PatternOpts)
-
-type S3PatternOpts = {
-  client: S3Client
-  bucket?: string
-  optional?: boolean
-  list?: boolean
-}
-```
-
-`template` is `s3://<bucket>/<key template>`, or a key template when you give `bucket`. The constructor throws if it cannot find a bucket, or if the two buckets are different.
+### `interface Feed<V extends Value>`
 
 | Member | Description |
 | --- | --- |
-| `template`, `bucket`, `client`, `optional`, `list`, `varNames` | As for `FilePattern` |
-| `keyPrefix(): string` | The literal start of the key, ending with `/`, or `""` |
-| `match(key): Vars \| null` | Vars bound by the key |
-| `render(vars): string` | The key for the vars |
+| `set(vars: Vars, value: V): void` | Adds the entry for `vars`, or replaces its value. Throws if the names in `vars` are not equal to `varNames`. |
+| `delete(vars: Vars): void` | Removes the entry for `vars`. It does nothing if the entry does not exist. |
+| `listen(prefix: Prefix, fn): void` | Calls `fn(event)` for each artifact that a task produces or retracts under `prefix`. `RuleBuild` syncs the tasks after `fn` returns. |
 
-### `interface ItemPattern`
+### `class VarsMap<T>`
 
-The interface that `FileBuild` uses for patterns. `FilePattern` and `S3Pattern` implement it. Implement it to match a different type of storage.
+A map whose keys are `Vars`. Two `Vars` objects with the same names and values are the same key. It has `get(vars)`, `set(vars, value)`, `delete(vars)`, `size`, and `entries()`. Generators use it to keep their groups.
+
+### `interface OutputGen<R extends Ref = Ref>`
 
 ```ts
-interface ItemPattern {
-  readonly optional: boolean
-  readonly list: boolean
+interface OutputGen<R extends Ref = Ref> {
   readonly varNames: readonly string[]
-  listenPrefix(root: string): Prefix                 // prefix for the literal start of the template
-  boundPrefix(vars: Vars, root: string): Prefix      // prefix up to the first glob or unbound var
-  matchId(id: string, root: string): Vars | null     // bind an artifact id, or null
-  renderId(vars: Vars, root: string): string         // artifact id for the vars
-  artifact(id: string, root: string): Item           // make the artifact for an id
-  scan(root: string): Promise<string[]>              // ids of existing items under the literal start
-  prepareOutput(artifact: Item): Promise<void>       // called before run for each single output
-  sortKey(artifact: Item): string                    // sort key for list inputs
+  ref(vars: Vars): R                 // the output artifact or prefix for the task vars
+  prepare(ref: R): Promise<void>     // called before the task runs, for example to make a directory
 }
+
+type OutputRef<O> = O extends OutputGen<infer R> ? R : never
 ```
+
+### `abstract class FieldGen<F, Id, A, S> extends InputGen<FieldValue<Id, A, S>>`
+
+```ts
+new (spec: S, identity: readonly Id[])
+
+type FieldSpec<F extends string> = Partial<Record<F, string | Capture>>
+type FieldRecord<F extends string, A extends Artifact> = {
+  fields: Record<F, string>
+  artifact: A
+}
+type FieldValue<Id extends string, A extends Artifact, S> =
+  [Exclude<Id, keyof S>] extends [never] ? A : A[]
+```
+
+| Type parameter | Meaning |
+| --- | --- |
+| `F extends string` | All field names of a record |
+| `Id extends F` | The identity fields, which together pick one artifact |
+| `A extends Artifact` | The artifact of one record |
+| `S extends FieldSpec<F>` | The spec that the user gave. The subclass passes it through, so TypeScript can find the value type. |
+
+| Member | Description |
+| --- | --- |
+| `spec`, `identity` | The values from the constructor |
+| `varNames` | The names of the captures in `spec`, in the order of the spec keys, with no duplicates |
+| `many: boolean` | `true` when `spec` leaves out an identity field. The value is then `A[]`. |
+| `protected abstract records(): Promise<FieldRecord<F, A>[]>` | Every record of the source. The subclass implements this. |
+| `protected literal(field: F): string \| undefined` | The literal value of `field` in the spec, or `undefined` |
+| `start(feed)` | Calls `records()` one time. Drops each record that does not match a literal, or whose captures of one name are different. Groups the other records by vars, and sets one value for each group. When `many` is `false`, it throws if a group has two different artifact ids. It does not listen. |
+
+### `class Capture` and `capture(name)`
+
+```ts
+new Capture(name: string)
+capture(name: string): Capture
+```
+
+In a field spec, a `Capture` saves the field as the var `name`.
+
+### `class FilePattern extends InputGen<FileArtifact>`
+
+```ts
+new FilePattern(template: string, opts?: { root?: string })   // root default: process.cwd()
+```
+
+An input. The template has no glob. The constructor throws if the template contains `*` or `**`. See [section 11.3](#113-template-syntax).
+
+| Member | Description |
+| --- | --- |
+| `template`, `varNames` | The template and the var names in template order |
+| `staticPrefix: string` | The absolute path of the literal start, ending with `/` |
+| `match(absPath: string): Vars \| null` | The vars that the path binds, or `null` if it does not match |
+| `start(feed)` | Walks the files under `staticPrefix`, and sets one value for each file that matches. It listens on `staticPrefix`, sets a value for each produced file, and deletes the entry of each retracted file. |
+
+### `class FileOutput implements OutputGen<FileArtifact>`
+
+```ts
+new FileOutput(template: string, opts?: { root?: string })   // root default: process.cwd()
+```
+
+An output of one file. The constructor throws if the template contains `*` or `**`, or ends with `/`.
+
+| Member | Description |
+| --- | --- |
+| `template`, `varNames` | The template and the var names in template order |
+| `render(vars: Vars): string` | The absolute path for the vars. Throws if a var is missing. |
+| `ref(vars)` | `new FileArtifact(render(vars))` |
+| `prepare(artifact)` | Creates the parent directory |
+
+### `class FileGlob extends InputGen<FileArtifact[]>`
+
+```ts
+new FileGlob(template: string, opts?: { root?: string })
+```
+
+An input. The template has at least one `*` or `**`. The constructor throws if the template has no glob.
+
+| Member | Description |
+| --- | --- |
+| `template`, `varNames`, `staticPrefix`, `match` | As for `FilePattern` |
+| `start(feed)` | Groups the matching files by vars. Sets the sorted list for each group after each change, and deletes a group when its last file goes away. |
+
+### `class DirOutput implements OutputGen<PathPrefix>`
+
+```ts
+new DirOutput(template: string, opts?: { root?: string })
+```
+
+An output of a directory. The constructor throws if the template does not end with `/`, or if it contains a glob. `ref(vars)` gives a `PathPrefix` for the rendered directory. `prepare` creates the directory.
+
+### `class S3Pattern extends InputGen<S3ObjectArtifact>`
+
+```ts
+new S3Pattern(template: string, opts: { client: S3Client })   // template: s3://<bucket>/<key template>
+```
+
+An input. The constructor throws if the template does not start with `s3://<bucket>/`, or if it contains a glob.
+
+| Member | Description |
+| --- | --- |
+| `template`, `bucket`, `client`, `varNames` | The values from the constructor, and the var names in template order |
+| `keyPrefix: string` | The literal start of the key, ending with `/`, or `""` |
+| `match(key: string): Vars \| null` | The vars that the key binds |
+| `start(feed)` | Lists the objects under `keyPrefix` with `client.list`, and listens on the prefix |
+
+### `class S3Output implements OutputGen<S3ObjectArtifact>`
+
+```ts
+new S3Output(template: string, opts: { client: S3Client })   // template: s3://<bucket>/<key template>
+```
+
+An output of one S3 object. The constructor throws if the template does not start with `s3://<bucket>/`, contains a glob, or ends with `/`.
+
+| Member | Description |
+| --- | --- |
+| `template`, `bucket`, `client`, `varNames` | The values from the constructor, and the var names in template order |
+| `render(vars: Vars): string` | The key for the vars |
+| `ref(vars)` | `new S3ObjectArtifact(client, bucket, render(vars))` |
+| `prepare()` | Does nothing |
+
+### `class S3Glob extends InputGen<S3ObjectArtifact[]>`
+
+```ts
+new S3Glob(template: string, opts: { client: S3Client })
+```
+
+As `FileGlob`, for S3 keys.
+
+### `class S3PrefixOutput implements OutputGen<S3Prefix>`
+
+```ts
+new S3PrefixOutput(template: string)   // s3://<bucket>/<key template>/
+```
+
+An output of a key prefix. The constructor throws if the template does not end with `/`, or if it contains a glob. `ref(vars)` gives an `S3Prefix` for the rendered key. `prepare` does nothing.
 
 ### Types
 
 ```ts
-type Vars = Record<string, string>
-type Item = Artifact<Uint8Array>
-type ItemInput = Item | Item[] | undefined
-type FileInput = ItemInput
+type Vars = Readonly<Record<string, string>>
 ```

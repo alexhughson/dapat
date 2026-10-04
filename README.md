@@ -98,31 +98,40 @@ if (!result.success) {
 
 `build.run()` does not throw when a task fails. Always check `result.success`.
 
-## Rules over many files
+## Rules over many inputs
 
-`FileBuild` creates one task for each file that matches a path template. When a task writes a file that another rule matches, `FileBuild` adds the next task during the same build.
+`RuleBuild` creates one task for each set of matching inputs. Each input is a generator, for example the files that match a path template. A generator gives one value for each set of vars: one artifact, or a list. `RuleBuild` joins the inputs on the vars that they share. When a task writes a file that another rule matches, `RuleBuild` adds the next task during the same build.
 
 ```ts
 import { Build } from "dapat"
-import { FileBuild, FilePattern, JsonStore } from "dapat/contrib"
+import { FileOutput, FilePattern, JsonStore, RuleBuild } from "dapat/contrib"
 
 const build = new Build({ store: new JsonStore(".dapat/state.json") })
-const files = new FileBuild(build, { root: "." })
+const rules = new RuleBuild(build)
 
-files.rule({
-  name: "upper",
-  inputs: { src: new FilePattern("src/<name>.txt") },
-  outputs: { out: new FilePattern("out/<name>.txt") },
+rules.rule({
+  name: "revise",
+  inputs: {
+    plan: new FilePattern("plan/<task>.md"),
+    feedback: new FilePattern("feedback/<task>.md"),
+  },
+  optional: ["feedback"],
+  outputs: { out: new FileOutput("revised/<task>.md") },
   run: async (ctx) => {
-    const text = new TextDecoder().decode(await ctx.file("src").read())
-    await Bun.write(ctx.outputFile("out").path, text.toUpperCase())
+    let text = new TextDecoder().decode(await ctx.inputs.plan.read())
+    if (ctx.inputs.feedback !== undefined) {
+      text += "\n\n" + new TextDecoder().decode(await ctx.inputs.feedback.read())
+    }
+    await Bun.write(ctx.outputs.out.path, text)
   },
 })
 
-const result = await files.run()
+const result = await rules.run()
 ```
 
-`S3Pattern` does the same for S3 keys. One rule can mix files and S3 objects.
+With `plan/a.md`, `plan/b.md`, and `feedback/b.md`, this makes two tasks. Remove the `optional` line, and only `b` gets a task.
+
+`FileGlob` gives a list of files for each set of vars. `S3Pattern` and `S3Glob` do the same for S3 keys. One rule can mix files and S3 objects. To use a different source, such as git commits, write a subclass of `InputGen`.
 
 ## What is in the package
 
@@ -130,7 +139,7 @@ const result = await files.run()
 | Import          | Contents                                                                                                                                                                             |
 | --------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `dapat`         | the engine: `Build`, `Task`, `Artifact`, `Prefix`, `MemoryStore`, `Result`                                                                                                           |
-| `dapat/contrib` | `FileArtifact`, `DirectoryArtifact`, `S3ObjectArtifact`, `SqliteRowArtifact`, `SqliteTableArtifact`. Stores that write to JSON or SQLite. `FileBuild` for rules with path templates. |
+| `dapat/contrib` | `FileArtifact`, `DirectoryArtifact`, `S3ObjectArtifact`, `SqliteRowArtifact`, `SqliteTableArtifact`. Stores that write to JSON or SQLite. `RuleBuild`, `InputGen`, and `FieldGen` for rules; `FilePattern`, `FileGlob`, `S3Pattern`, and `S3Glob` for inputs; `FileOutput`, `DirOutput`, `S3Output`, and `S3PrefixOutput` for outputs. |
 
 
 
@@ -144,7 +153,8 @@ const result = await files.run()
 - the exact rules for when a task skips, and how to find out why a task ran
 - failure, cancellation, and replacement of tasks
 - listeners for artifacts that a task writes during the build
-- the `FileBuild` template syntax
+- how `RuleBuild` joins inputs, and how to write your own input generator
+- the template syntax
 - recipes: force a rebuild, limit parallel work, run in CI
 - known limits
 - the full API reference
@@ -152,7 +162,9 @@ const result = await files.run()
 The `[examples/](examples/)` folder has runnable programs. Run one with `bun run examples/<name>.ts`:
 
 - `first-build.ts` is the example above. Run it from a directory that contains `in.txt`.
-- `file-pipeline.ts` has two `FileBuild` rules in a chain.
+- `file-pipeline.ts` has two rules in a chain.
+- `draft-revise.ts` joins three inputs, then revises each draft with optional feedback.
+- `custom-gen.ts` defines an input generator and joins it with files.
 - `s3-pages-screenshots.ts` splits S3 documents into pages and writes one file for each page.
 - `agent-loop.ts` is an agent with more than one turn. Each turn writes the prompt for the next turn, and a rule matches it.
 
