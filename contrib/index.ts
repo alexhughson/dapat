@@ -13,10 +13,10 @@ export { MemoryStore, JsonStore, SqliteStore } from "./store"
 export { FileBuild, FilePattern, S3Pattern } from "./filebuild"
 export {
   FixedRowArtifact,
+  InputGen,
   StubRowGenerator,
   type Feed,
   type Generator,
-  type InputGen,
   type Row,
   type StubRow,
 } from "./generator"

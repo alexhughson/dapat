@@ -1,23 +1,24 @@
 import type { Vars } from "../filebuild/vars"
 import { FixedRowArtifact } from "./fixed-row"
-import type { Feed, Generator } from "./types"
+import { InputGen, type Feed, type Row } from "./types"
 
 export type StubRow = {
   vars: Vars
-  row: Readonly<Record<string, string>>
+  row: Row
 }
 
 /**
  * Example generator: emits a fixed list of rows. No git or filesystem scan.
  */
-export class StubRowGenerator implements Generator<FixedRowArtifact> {
+export class StubRowGenerator extends InputGen<FixedRowArtifact> {
   readonly varNames: readonly string[]
 
   constructor(
     private readonly rows: readonly StubRow[],
-    varNames: readonly string[] = inferVarNames(rows),
+    varNames?: readonly string[],
   ) {
-    this.varNames = varNames
+    super()
+    this.varNames = varNames ?? inferVarNames(rows)
   }
 
   async start(feed: Feed<FixedRowArtifact>): Promise<void> {

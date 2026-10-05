@@ -15,6 +15,9 @@ const feed: Feed<FixedRowArtifact> & {
   delete(_vars) {
     // stub example does not remove rows
   },
+  listen(_prefix, _fn) {
+    // row-only generator; walk-driven inputs use listen in FilePattern.start (future)
+  },
 }
 
 const gen = new StubRowGenerator([

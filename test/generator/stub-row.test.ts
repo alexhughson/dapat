@@ -1,7 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { StubRowGenerator } from "../../contrib/generator"
-import type { Feed } from "../../contrib/generator"
-import { FixedRowArtifact } from "../../contrib/generator/fixed-row"
+import { FixedRowArtifact, StubRowGenerator, type Feed } from "../../contrib/generator"
 
 describe("StubRowGenerator", () => {
   test("start calls feed.set once per hard-coded row", async () => {
@@ -16,6 +14,7 @@ describe("StubRowGenerator", () => {
         fed.push({ vars, artifact })
       },
       delete() {},
+      listen() {},
     }
 
     await gen.start(feed)
