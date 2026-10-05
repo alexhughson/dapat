@@ -9,7 +9,8 @@ export type Row = Readonly<Record<string, string>>
 export type GeneratorValue = Artifact<unknown> | readonly Artifact<unknown>[]
 
 /**
- * Row-shaped rule input. Subclass and implement `start`; call `feed.set` from there.
+ * Author code that supplies a fixed list of inputs (named values plus readable content).
+ * Subclass and implement `start`; call `feed.set` from there.
  *
  * Reference: `StubRowGenerator` in `./stub-row.ts`, runnable `examples/stub-generator.ts`.
  *

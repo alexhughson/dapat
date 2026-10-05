@@ -22,7 +22,7 @@ const feed: Feed<FixedRowArtifact> & {
 
 const gen = new StubRowGenerator([
   { vars: { locale: "fr" }, row: { greeting: "bonjour" } },
-  { vars: { locale: "es" }, row: { greeting: "hola" } },
+  { vars: { locale: "de" }, row: { greeting: "hallo" } },
 ])
 
 await gen.start(feed)
