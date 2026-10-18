@@ -120,7 +120,7 @@ The repo has this build in `examples/first-build.ts`. Run it with `bun run examp
 - `skipped` lists the tasks that dapat did not run, because their outputs were current.
 - `failed` is a `Map<Task, Error>`.
 - `cancelled` lists the tasks that were replaced or removed before they finished ([section 8](#8-failure-cancellation-and-replacement)).
-- `errors` lists the subscriber errors that no task owns ([section 9](#9-subscribe-to-artifact-events)).
+- `errors` lists the errors that no task owns ([section 9](#9-subscribe-to-artifact-events)). These are subscriber errors from sends that no running task caused, errors that a task throws after it was stopped or after a subscriber error failed it, and async subscriber rejections.
 
 A failed task does not stop the build. The other tasks continue. `build.run()` does not throw when a task fails, so always check `result.success`.
 
@@ -513,12 +513,15 @@ dapat reports each error one time, in one of these ways:
   - The task fails even if it catches the error. If the task then throws its own error, its own error goes into `result.errors`.
   - `ctx.produced`, `ctx.add`, and `ctx.remove` throw the first error after they send all events.
   - If one call gets more than one error, the other errors go into `result.errors`.
+  - A subscriber error on one declared output does not stop the events for the other declared outputs. The task fails, and those artifacts stay produced until the task is removed or replaced.
   - If a subscriber removes or replaces the task during these sends, the task ends as `cancelled`. dapat sends no more events for it, writes no store record for it, and puts its error into `result.errors`.
 - **No running task caused the send.** For example, you call `build.remove(id)` from outside a task, or you replace a task with `build.add(task)`, and a subscriber throws on the `retracted` event. Then `build.remove` and `build.add` do not throw. The error goes into `result.errors`, and `result.success` is `false`. This also applies to a `ctx` call from a task that already finished. When a running task calls `ctx.add` or `ctx.remove`, the retractions go to that task, as in the first case.
 
 `result.errors` holds every error of the build so far that no task owns. An error that occurs after `build.run()` returns appears in the result of the next `build.run()` on the same build.
 
 dapat does not ignore a subscriber error.
+
+A subscriber must not call the `ctx` of a task. Use `build.add` and `build.remove`. A `ctx` that a subscriber calls can report one error for two tasks.
 
 ### Event order with more than one subscriber
 
@@ -800,7 +803,7 @@ Keeps records in a `Map`. The records are lost when the process ends. `MemorySto
 | `skipped` | `readonly Task[]` | Tasks that the skip rules skipped. |
 | `failed` | `ReadonlyMap<Task, Error>` | Tasks that threw, whose producer failed, or that were in a deadlock. |
 | `cancelled` | `readonly Task[]` | Tasks that were replaced or removed before they completed. |
-| `errors` | `readonly Error[]` | Subscriber errors that no task owns, for example from a retraction that `build.remove` sent from outside a task. It keeps the errors of earlier runs of the same build. |
+| `errors` | `readonly Error[]` | Errors that no task owns: subscriber errors from sends that no running task caused, errors that a task throws after it was stopped or after a subscriber error failed it, and async subscriber rejections. It keeps the errors of earlier runs of the same build. |
 
 `Result` does not give the reason for a skip. The build keeps an `Outcome` for each task, but no public member returns it. See [section 6.1](#61-why-did-a-task-run-or-skip).
 
@@ -820,6 +823,7 @@ type Outcome =
 | --- | --- |
 | `subscribe(listener: (event: E) => void): void` | Adds a listener. Listeners get events in the order that they subscribed. |
 | `protected send(event: E): void` | Calls each listener synchronously, in order. If a listener throws, `send` stops and throws that error to its caller. If a listener returns a promise, `send` throws an error. |
+| `protected rejected(reason: unknown): void` | Called when a listener's returned promise rejects. The default throws `reason` again, so the rejection stays unhandled. `Build` overrides it and puts the error in `result.errors`. |
 
 `Build` extends `Emitter<ArtifactEvent>`.
 

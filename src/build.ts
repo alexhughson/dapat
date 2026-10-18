@@ -63,15 +63,17 @@ export class Build extends Emitter<ArtifactEvent> {
       existing.generation += 1
       this.unindex(existing.task)
       retractions = this.release(existing, slot)
-      if (existing.phase === "running" && existing.abort) {
-        existing.abort.abort()
-      } else if (existing.phase === "pending") {
+      if (existing.phase === "pending") {
         this.finish(existing, { type: "cancelled", reason: "replaced" })
       }
     }
 
     this.slots.set(task.id, slot)
     this.index(task)
+    // abort() runs the task's abort listeners at once, so the state must be whole first.
+    if (existing && existing.phase === "running" && existing.abort) {
+      existing.abort.abort()
+    }
 
     if (this.started) {
       this.kick(slot)
@@ -87,9 +89,7 @@ export class Build extends Emitter<ArtifactEvent> {
     // A running task sees the new generation, so its later ctx.produced does nothing.
     slot.generation += 1
     this.unindex(slot.task)
-    if (slot.phase === "running" && slot.abort) {
-      slot.abort.abort()
-    }
+    const wasRunning = slot.phase === "running"
     const retractions = this.release(slot, null)
     this.slots.delete(id)
     if (this.store) {
@@ -97,6 +97,10 @@ export class Build extends Emitter<ArtifactEvent> {
     }
     if (slot.phase !== "completed") {
       this.finish(slot, { type: "cancelled", reason: "removed" })
+    }
+    // abort() runs the task's abort listeners at once, so the state must be whole first.
+    if (wasRunning && slot.abort) {
+      slot.abort.abort()
     }
     this.wake()
     this.sendAll(retractions)
@@ -299,14 +303,11 @@ export class Build extends Emitter<ArtifactEvent> {
       }
       // A listener error fails the task even if the task caught it.
       // The task's own error, if it threw another one, goes to `errors`.
-      let owned = err
-      if (slot.listenerError !== null) {
-        owned = slot.listenerError
-      }
-      if (owned !== err) {
+      const listenerError = slot.listenerError
+      if (listenerError !== null && listenerError !== err) {
         this.addError(err)
       }
-      this.finish(slot, { type: "failed", error: owned })
+      this.finish(slot, { type: "failed", error: listenerError ?? err })
     }
   }
 
