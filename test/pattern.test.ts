@@ -21,6 +21,13 @@ describe("KeyPattern", () => {
     expect(pattern.match("proj/input/moby.txt")).toEqual({ book: "moby" })
   })
 
+  test("** then a glob segment matches files at any depth", () => {
+    const pattern = new KeyPattern("site/<lang>/**/*.html")
+    expect(pattern.match("site/en/a/b/x.html")).toEqual({ lang: "en" })
+    expect(pattern.match("site/en/x.html")).toEqual({ lang: "en" })
+    expect(pattern.match("site/en/x.md")).toBeNull()
+  })
+
   test("a glob does not bind a name and marks the pattern as a glob", () => {
     const pattern = new KeyPattern("input/<book>/pages/*.txt")
     expect(pattern.hasGlob).toBe(true)

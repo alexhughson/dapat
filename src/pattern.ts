@@ -13,6 +13,7 @@ type Segment =
 /**
  * A `/`-separated template such as `content/<lang>/<slug>.md` or `notes/<topic>/*.md`.
  * `<name>` binds a var, `*` matches within one segment, and `**` matches any number of segments.
+ * Keys are relative: a leading `/` is ignored, so a caller strips its root before it matches a key.
  */
 export class KeyPattern {
   readonly template: string

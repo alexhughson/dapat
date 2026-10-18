@@ -10,7 +10,7 @@ When you run a build, dapat does these things:
 
 - **Order:** it starts a task only after the tasks that write its inputs have finished.
 - **Skip:** it skips a task when its inputs did not change since the last run and its outputs still exist. It compares content hashes, so an edit that restores the old bytes does not cause a rebuild.
-- **Grow:** it adds tasks during the build. A listener sees each output that a task writes, and it can add the task that reads that output.
+- **Grow:** it adds tasks during the build. A listener sees each output that a running task writes, and it can add the task that reads that output.
 
 ```
 Use dapat for data pipelines, generated files, and agent loops, where a step is expensive and must run again only when its inputs change.
@@ -123,9 +123,7 @@ if (!result.success) {
 - known limits
 - the full API reference
 
-The `[examples/](examples/)` folder has a runnable program. Run it with `bun run examples/first-build.ts`:
-
-- `first-build.ts` is the example above. Run it from a directory that contains `in.txt`.
+[examples/first-build.ts](examples/first-build.ts) is a runnable version of the example above. It keeps its state in memory, so it does not remember the last run. Run it with `bun run examples/first-build.ts` from a directory that contains `in.txt`.
 
 
 
