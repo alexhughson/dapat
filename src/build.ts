@@ -18,8 +18,8 @@ class Slot {
   launched = 0
   phase: Phase = "pending"
   abort: AbortController | null = null
-  // The artifacts this task owns. Each id is here once. Remove and replace retract them.
-  produced: Artifact[] = []
+  // The artifacts this task owns, by id. Remove and replace retract them.
+  produced = new Map<string, Artifact>()
   // The ids that this run reported with ctx.produced.
   reported = new Set<string>()
   outcome: Outcome | null = null
@@ -62,7 +62,7 @@ export class Build extends Emitter<ArtifactEvent> {
       // A running task sees the new generation, so its later ctx.produced does nothing.
       existing.generation += 1
       this.unindex(existing.task)
-      retractions = this.handOver(existing, slot)
+      retractions = this.release(existing, slot)
       if (existing.phase === "running" && existing.abort) {
         existing.abort.abort()
       } else if (existing.phase === "pending") {
@@ -90,7 +90,7 @@ export class Build extends Emitter<ArtifactEvent> {
     if (slot.phase === "running" && slot.abort) {
       slot.abort.abort()
     }
-    const retractions = this.retractAll(slot)
+    const retractions = this.release(slot, null)
     this.slots.delete(id)
     if (this.store) {
       void this.store.delete(id)
@@ -288,19 +288,25 @@ export class Build extends Emitter<ArtifactEvent> {
       }
       this.finish(slot, { type: "executed" })
     } catch (error) {
-      // A stopped task often throws because ctx.signal aborted. That is not an error.
-      if (this.endIfStopped(slot, generation)) return
       const err = toError(error)
-      if (slot.listenerError === null) {
-        this.finish(slot, { type: "failed", error: err })
+      if (generation !== slot.generation) {
+        // A stopped task often throws because ctx.signal aborted. That is not an error.
+        if (!isAbort(error, slot.abort.signal)) {
+          this.addError(err)
+        }
+        this.endIfStopped(slot, generation)
         return
       }
       // A listener error fails the task even if the task caught it.
       // The task's own error, if it threw another one, goes to `errors`.
-      if (err !== slot.listenerError) {
+      let owned = err
+      if (slot.listenerError !== null) {
+        owned = slot.listenerError
+      }
+      if (owned !== err) {
         this.addError(err)
       }
-      this.finish(slot, { type: "failed", error: slot.listenerError })
+      this.finish(slot, { type: "failed", error: owned })
     }
   }
 
@@ -313,14 +319,11 @@ export class Build extends Emitter<ArtifactEvent> {
     if (slot.phase !== "completed") {
       this.finish(slot, { type: "cancelled", reason: "replaced" })
     }
-    this.keepStrayError(slot)
+    // A cancelled task does not own its listener error, so the error goes to `errors`.
+    if (slot.listenerError !== null) {
+      this.addError(slot.listenerError)
+    }
     return true
-  }
-
-  /** A cancelled task does not own its listener error, so the error goes to `errors`. */
-  private keepStrayError(slot: Slot): void {
-    if (slot.listenerError === null) return
-    this.addError(slot.listenerError)
   }
 
   private async waitForInputs(slot: Slot, generation: number): Promise<WaitResult> {
@@ -370,9 +373,7 @@ export class Build extends Emitter<ArtifactEvent> {
       )
     }
     slot.reported.add(artifact.id)
-    if (!hasId(slot.produced, artifact.id)) {
-      slot.produced.push(artifact)
-    }
+    slot.produced.set(artifact.id, artifact)
     this.sendAll([{ kind: "produced", artifact, taskId: slot.task.id }])
   }
 
@@ -385,19 +386,22 @@ export class Build extends Emitter<ArtifactEvent> {
   }
 
   private async recordSuccess(slot: Slot, generation: number): Promise<void> {
-    const events: ArtifactEvent[] = []
     for (const output of slot.task.outputs) {
+      // A subscriber can remove or replace this task. Then it owns no more artifacts.
+      if (generation !== slot.generation) return
       if (!isArtifact(output)) continue
       if (slot.reported.has(output.id)) continue
-      if (!hasId(slot.produced, output.id)) {
-        slot.produced.push(output)
+      slot.produced.set(output.id, output)
+      const event: ArtifactEvent = { kind: "produced", artifact: output, taskId: slot.task.id }
+      try {
+        this.asTask(slot, () => this.sendAll([event]))
+      } catch {
+        // sendAll kept the error in slot.listenerError, and execute fails the task with it.
       }
-      events.push({ kind: "produced", artifact: output, taskId: slot.task.id })
     }
-    this.asTask(slot, () => this.sendAll(events))
 
-    // A subscriber can remove or replace this task. Then it must not write a record.
     if (generation !== slot.generation) return
+    if (slot.listenerError !== null) return
     if (!this.store) return
     const inputStamps = await this.stampMap(this.artifactRefs(slot.task.inputs))
     const outputStamps = await this.stampMap(this.artifactRefs(slot.task.outputs))
@@ -465,32 +469,25 @@ export class Build extends Emitter<ArtifactEvent> {
   }
 
   /**
-   * Moves the artifacts that the new task also declares to the new slot, so
-   * the new task retracts them later. Returns retractions for the others.
+   * Empties `slot.produced` and returns a retraction for each artifact.
+   * An artifact that `keep` also declares moves to `keep`, so `keep` retracts it later.
    */
-  private handOver(oldSlot: Slot, next: Slot): ArtifactEvent[] {
+  private release(slot: Slot, keep: Slot | null): ArtifactEvent[] {
     const declared = new Set<string>()
-    for (const output of next.task.outputs) {
-      if (isArtifact(output)) declared.add(output.id)
-    }
-    const events: ArtifactEvent[] = []
-    for (const artifact of oldSlot.produced) {
-      if (declared.has(artifact.id)) {
-        next.produced.push(artifact)
-      } else {
-        events.push({ kind: "retracted", artifact, taskId: oldSlot.task.id })
+    if (keep !== null) {
+      for (const output of keep.task.outputs) {
+        if (isArtifact(output)) declared.add(output.id)
       }
     }
-    oldSlot.produced = []
-    return events
-  }
-
-  private retractAll(slot: Slot): ArtifactEvent[] {
     const events: ArtifactEvent[] = []
-    for (const artifact of slot.produced) {
-      events.push({ kind: "retracted", artifact, taskId: slot.task.id })
+    for (const artifact of slot.produced.values()) {
+      if (keep !== null && declared.has(artifact.id)) {
+        keep.produced.set(artifact.id, artifact)
+      } else {
+        events.push({ kind: "retracted", artifact, taskId: slot.task.id })
+      }
     }
-    slot.produced = []
+    slot.produced = new Map()
     return events
   }
 
@@ -665,9 +662,8 @@ function toError(value: unknown): Error {
   return new Error(String(value))
 }
 
-function hasId(artifacts: readonly Artifact[], id: string): boolean {
-  for (const artifact of artifacts) {
-    if (artifact.id === id) return true
-  }
-  return false
+function isAbort(error: unknown, signal: AbortSignal): boolean {
+  if (error === signal.reason) return true
+  if (typeof error !== "object" || error === null) return false
+  return (error as { name?: unknown }).name === "AbortError"
 }

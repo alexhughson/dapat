@@ -1097,6 +1097,104 @@ describe("Build", () => {
     expect(result.errors.map((error) => error.message)).toEqual(["async subscriber broke"])
   })
 
+  test("replacing a running task retracts the artifacts the new task does not declare, at once", async () => {
+    const a = new Mem("mem:a")
+    const events: string[] = []
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    let started!: () => void
+    const reached = new Promise<void>((resolve) => {
+      started = resolve
+    })
+    const build = new Build()
+    build.subscribe((event) => {
+      events.push(`${event.kind} ${event.artifact.id}`)
+    })
+    build.add(
+      new Task({
+        id: "t",
+        outputs: [a],
+        run: async (ctx) => {
+          ctx.produced(a)
+          started()
+          await gate
+        },
+      }),
+    )
+
+    const running = build.run()
+    await reached
+    build.add(new Task({ id: "t", run: async () => {} }))
+    expect(events).toEqual(["produced mem:a", "retracted mem:a"])
+    release()
+    const result = await running
+    expect(result.success).toBe(true)
+    expect(events).toEqual(["produced mem:a", "retracted mem:a"])
+  })
+
+  test("a subscriber that removes the writer on its first declared output stops the later ones", async () => {
+    const a = new Mem("mem:a")
+    const b = new Mem("mem:b")
+    const events: string[] = []
+    const build = new Build()
+    build.subscribe((event) => {
+      events.push(`${event.kind} ${event.artifact.id}`)
+      if (event.kind === "produced" && event.artifact === a) build.remove("t")
+    })
+    build.add(new Task({ id: "t", outputs: [a, b], run: async () => {} }))
+
+    const result = await build.run()
+    expect(events).toEqual(["produced mem:a", "retracted mem:a"])
+    expect(result.cancelled.map((task) => task.id)).toEqual(["t"])
+    expect(result.success).toBe(true)
+  })
+
+  for (const honoursSignal of [true, false]) {
+    const name = honoursSignal ? "ignores the abort error" : "keeps any other error"
+    test(`a removed running task ${name}`, async () => {
+      let release!: () => void
+      const gate = new Promise<void>((resolve) => {
+        release = resolve
+      })
+      let started!: () => void
+      const reached = new Promise<void>((resolve) => {
+        started = resolve
+      })
+      const build = new Build()
+      build.add(
+        new Task({
+          id: "t",
+          run: async (ctx) => {
+            started()
+            await gate
+            if (honoursSignal) {
+              ctx.signal.throwIfAborted()
+            }
+            throw new Error("real bug")
+          },
+        }),
+      )
+
+      const running = build.run()
+      await reached
+      build.remove("t")
+      release()
+      const result = await running
+
+      expect(result.cancelled.map((task) => task.id)).toEqual(["t"])
+      expect(result.failed.size).toBe(0)
+      if (honoursSignal) {
+        expect(result.errors).toEqual([])
+        expect(result.success).toBe(true)
+      } else {
+        expect(result.errors.map((error) => error.message)).toEqual(["real bug"])
+        expect(result.success).toBe(false)
+      }
+    })
+  }
+
   test("task can add another task during run", async () => {
     const done = new Mem("mem:done")
     const childOut = new Mem("mem:child")
