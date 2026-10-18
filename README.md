@@ -10,7 +10,7 @@ When you run a build, dapat does these things:
 
 - **Order:** it starts a task only after the tasks that write its inputs have finished.
 - **Skip:** it skips a task when its inputs did not change since the last run and its outputs still exist. It compares content hashes, so an edit that restores the old bytes does not cause a rebuild.
-- **Grow:** it adds tasks during the build. When a task writes a new output that a rule matches, dapat adds the task that reads that output.
+- **Grow:** it adds tasks during the build. A listener sees each output that a task writes, and it can add the task that reads that output.
 
 ```
 Use dapat for data pipelines, generated files, and agent loops, where a step is expensive and must run again only when its inputs change.
@@ -18,6 +18,7 @@ Use dapat for data pipelines, generated files, and agent loops, where a step is 
 
 ```
 Status: version 0.1.0. dapat is not published to a registry, and the API can change.
+Rules that make one task for each matched file are being rebuilt. They will return as `build.each`.
 ```
 
 ```
@@ -98,39 +99,13 @@ if (!result.success) {
 
 `build.run()` does not throw when a task fails. Always check `result.success`.
 
-## Rules over many files
-
-`FileBuild` creates one task for each file that matches a path template. When a task writes a file that another rule matches, `FileBuild` adds the next task during the same build.
-
-```ts
-import { Build } from "dapat"
-import { FileBuild, FilePattern, JsonStore } from "dapat/contrib"
-
-const build = new Build({ store: new JsonStore(".dapat/state.json") })
-const files = new FileBuild(build, { root: "." })
-
-files.rule({
-  name: "upper",
-  inputs: { src: new FilePattern("src/<name>.txt") },
-  outputs: { out: new FilePattern("out/<name>.txt") },
-  run: async (ctx) => {
-    const text = new TextDecoder().decode(await ctx.file("src").read())
-    await Bun.write(ctx.outputFile("out").path, text.toUpperCase())
-  },
-})
-
-const result = await files.run()
-```
-
-`S3Pattern` does the same for S3 keys. One rule can mix files and S3 objects.
-
 ## What is in the package
 
 
-| Import          | Contents                                                                                                                                                                             |
-| --------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `dapat`         | the engine: `Build`, `Task`, `Artifact`, `Prefix`, `MemoryStore`, `Result`                                                                                                           |
-| `dapat/contrib` | `FileArtifact`, `DirectoryArtifact`, `S3ObjectArtifact`, `SqliteRowArtifact`, `SqliteTableArtifact`. Stores that write to JSON or SQLite. `FileBuild` for rules with path templates. |
+| Import          | Contents                                                                                                                                  |
+| --------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| `dapat`         | the engine: `Build`, `Task`, `Artifact`, `Prefix`, `MemoryStore`, `Result`                                                                |
+| `dapat/contrib` | `FileArtifact`, `DirectoryArtifact`, `S3ObjectArtifact`, `SqliteRowArtifact`, `SqliteTableArtifact`. Stores that write to JSON or SQLite. |
 
 
 
@@ -144,17 +119,13 @@ const result = await files.run()
 - the exact rules for when a task skips, and how to find out why a task ran
 - failure, cancellation, and replacement of tasks
 - listeners for artifacts that a task writes during the build
-- the `FileBuild` template syntax
 - recipes: force a rebuild, limit parallel work, run in CI
 - known limits
 - the full API reference
 
-The `[examples/](examples/)` folder has runnable programs. Run one with `bun run examples/<name>.ts`:
+The `[examples/](examples/)` folder has a runnable program. Run it with `bun run examples/first-build.ts`:
 
 - `first-build.ts` is the example above. Run it from a directory that contains `in.txt`.
-- `file-pipeline.ts` has two `FileBuild` rules in a chain.
-- `s3-pages-screenshots.ts` splits S3 documents into pages and writes one file for each page.
-- `agent-loop.ts` is an agent with more than one turn. Each turn writes the prompt for the next turn, and a rule matches it.
 
 
 

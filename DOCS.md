@@ -25,10 +25,7 @@ When you run a **build**, dapat does these steps for each task:
 
 dapat does not know about disks or SQL. It only reads artifact ids and stamps. The adapters in `dapat/contrib` supply files, S3, and SQLite.
 
-There are two ways to declare tasks:
-
-- Use `Build` and `Task` when you know each task in advance, or when your code decides which tasks to add. Sections 3 to 9 describe this.
-- Use `FileBuild` when you want one task for each file or S3 object that matches a path template. [Section 11](#11-rules-with-filebuild) describes this. `FileBuild` makes `Task` objects and adds them to a `Build`, so sections 5 to 9 also apply to it.
+You declare tasks with `Build` and `Task`. You can know each task in advance, or your code can decide which tasks to add. Sections 3 to 9 describe this.
 
 ## 2. Install and import
 
@@ -46,7 +43,7 @@ The package has two entry points:
 | Import | Contents |
 | --- | --- |
 | `dapat` | `Build`, `Task`, `Artifact`, `Prefix`, `IdPrefix`, `MemoryStore`, `Result`, and their types |
-| `dapat/contrib` | `FileArtifact`, `DirectoryArtifact`, `PathPrefix`, `S3ObjectArtifact`, `S3Prefix`, `MemoryS3`, `SqliteRowArtifact`, `SqliteTableArtifact`, `SqliteTablePrefix`, `JsonStore`, `SqliteStore`, `FileBuild`, `FilePattern`, `S3Pattern`, and a short factory function for each artifact and prefix (`file`, `directory`, `pathPrefix`, `s3Object`, `s3Prefix`, `sqliteRow`, `sqliteTable`, `sqliteTablePrefix`) |
+| `dapat/contrib` | `FileArtifact`, `DirectoryArtifact`, `PathPrefix`, `S3ObjectArtifact`, `S3Prefix`, `MemoryS3`, `SqliteRowArtifact`, `SqliteTableArtifact`, `SqliteTablePrefix`, `JsonStore`, `SqliteStore`, and a short factory function for each artifact and prefix (`file`, `directory`, `pathPrefix`, `s3Object`, `s3Prefix`, `sqliteRow`, `sqliteTable`, `sqliteTablePrefix`) |
 
 ## 3. First build
 
@@ -108,6 +105,8 @@ Put `hello` into `in.txt`, and then run the script more than one time:
 4. **Run `touch in.txt`.** The modification time changes, but the bytes do not. Both tasks skip, because dapat compares the content of `in.txt` with the stored hash.
 
 [Section 6](#6-when-a-task-skips) gives the full rules.
+
+The repo has this build in `examples/first-build.ts`. Run it with `bun run examples/first-build.ts` from a directory that contains `in.txt`.
 
 ### Read the result
 
@@ -205,7 +204,7 @@ class MapEntry extends Artifact<string> {
 }
 ```
 
-Keep order stamps in the same unit as the other artifacts in the same task. dapat compares order stamps as plain integers ([section 13](#13-limits)).
+Keep order stamps in the same unit as the other artifacts in the same task. dapat compares order stamps as plain integers ([section 12](#12-limits)).
 
 ### Write your own prefix artifact
 
@@ -283,7 +282,7 @@ A waiting task finds its producers again each time a task is added, removed, or 
 
 If you add a producer after `build.run()` starts, a consumer waits for it only if that consumer is still waiting for other inputs. A consumer that has already started does not stop.
 
-Tasks with no dependency between them run at the same time. dapat has no concurrency limit. [Section 12.2](#122-limit-parallel-work) shows how to limit parallel work inside `run`.
+Tasks with no dependency between them run at the same time. dapat has no concurrency limit. [Section 11.2](#112-limit-parallel-work) shows how to limit parallel work inside `run`.
 
 ### Outputs with unknown names
 
@@ -395,7 +394,7 @@ const build = new Build({ store })
 
 The store keeps stamps for artifact inputs and outputs only. It does not keep prefixes. It does not keep the artifacts that a task produced with `ctx.produced()`.
 
-Add the store file to `.gitignore`. To make tasks run again, see [section 12.1](#121-force-tasks-to-run-again).
+Add the store file to `.gitignore`. To make tasks run again, see [section 11.1](#111-force-tasks-to-run-again).
 
 ## 8. Failure, cancellation, and replacement
 
@@ -468,7 +467,7 @@ dapat sends a `produced` event at these times:
 
 When you call `listen()`, dapat first replays the artifacts that were already produced in this build and that are in the folder of the prefix.
 
-A task that skips sends no events ([section 13](#13-limits)).
+A task that skips sends no events ([section 12](#12-limits)).
 
 A listener can add tasks. This listener adds one task for each page from the `split` sample in section 5. Add it to that sample before `build.run()`:
 
@@ -498,8 +497,6 @@ Handle errors inside the listener. dapat reports listener errors in different wa
 
 - **A declared output of a task that succeeded.** The task that wrote the output fails.
 - **`ctx.produced`, a retraction, or a replay from `listen`.** dapat does not wait for the listener. The error becomes an unhandled promise rejection.
-
-`FileBuild` ([section 11](#11-rules-with-filebuild)) uses this mechanism.
 
 ## 10. Built-in artifacts
 
@@ -560,203 +557,9 @@ These classes take a `bun:sqlite` `Database`. Table and column names must match 
 
 An `UPDATE` does not change the `rowid`. If rows change in place, give an `orderColumn` that your code increases on each write, or use a persistent store so that the content check decides.
 
-## 11. Rules with `FileBuild`
+## 11. Recipes
 
-A `Task` names exact artifacts. Many builds instead need a rule such as "for each `src/<name>.txt`, write `out/<name>.txt`". `FileBuild` does this. You write rules with path templates. `FileBuild` finds the matching files, and it adds one task to a `Build` for each set of template values.
-
-```ts
-import { Build } from "dapat"
-import { FileBuild, FilePattern, JsonStore } from "dapat/contrib"
-
-const build = new Build({ store: new JsonStore(".dapat/state.json") })
-const files = new FileBuild(build, { root: "." })
-
-files.rule({
-  name: "upper",
-  inputs: { src: new FilePattern("src/<name>.txt") },
-  outputs: { mid: new FilePattern("mid/<name>.txt") },
-  run: async (ctx) => {
-    const text = new TextDecoder().decode(await ctx.file("src").read())
-    await Bun.write(ctx.outputFile("mid").path, text.toUpperCase())
-  },
-})
-
-files.rule({
-  name: "wrap",
-  inputs: { mid: new FilePattern("mid/<name>.txt") },
-  outputs: { out: new FilePattern("out/<name>.txt") },
-  run: async (ctx) => {
-    const text = new TextDecoder().decode(await ctx.file("mid").read())
-    await Bun.write(ctx.outputFile("out").path, `[${text}]`)
-  },
-})
-
-const result = await files.run()
-```
-
-When `src/hello.txt` exists, `files.run()` creates the task `upper:name=hello`. That task writes `mid/hello.txt`. `FileBuild` then matches the new file against the `wrap` rule, and it creates `wrap:name=hello`. The `mid/` directory does not have to exist before the build.
-
-`files.run()` scans the files under each input pattern, creates the tasks, and calls `build.run()`. It returns the same `Result`.
-
-### 11.1 Template syntax
-
-A template is a list of segments separated by `/`:
-
-| Segment | Matches | Example |
-| --- | --- | --- |
-| text | the same text | `src` |
-| `<var>` in a segment | one or more characters, and saves them as `var` | `<name>.txt`, `page-<n>` |
-| `*` in a segment | any characters in one segment, including none | `*.md` |
-| `**` | zero or more segments | `turns/<sid>/**` |
-
-When a var appears more than one time in a template, all of its matches must be the same.
-
-A var match is greedy. For the segment `x-y-z`, the template `<a>-<b>` saves `a = "x-y"` and `b = "z"`.
-
-A relative template starts at the `root` of the `FileBuild`. A template that starts with `/` is absolute.
-
-Start each input template with a literal directory. `scan` walks every file under the literal start of the template. A template such as `<name>.txt` has no literal start, so `scan` walks all of `root`, including `node_modules` and `.git`.
-
-### 11.2 Input kinds
-
-| Kind | How to declare | Value in `ctx` |
-| --- | --- | --- |
-| single | `new FilePattern("src/<name>.txt")` | `ctx.file("src")`. Exactly one file must match for each set of vars. |
-| list | a template with `*` or `**`, or `{ list: true }` | `ctx.files("posts")`, sorted by path. It can be empty. |
-| optional | `{ optional: true }` | `ctx.inputs.meta` is `undefined` when no file matches |
-
-### 11.3 How `FileBuild` makes tasks
-
-A rule creates one task for each combination of var values that all required inputs share. The required inputs are the single inputs and the list inputs that contain a var. A list input with a var needs at least one match. A list input without a var does not change the combinations. It gets every match. An optional input adds its file when a match exists. It does not remove combinations.
-
-This rule creates one index for each topic. It adds a metadata file when one exists:
-
-```ts
-import path from "node:path"
-
-files.rule({
-  name: "index",
-  inputs: {
-    posts: new FilePattern("posts/<topic>/*.md"),
-    meta: new FilePattern("meta/<topic>.txt", { optional: true }),
-  },
-  outputs: { out: new FilePattern("index/<topic>.txt") },
-  run: async (ctx) => {
-    const names = ctx.files("posts").map((f) => path.basename(f.path))
-    const meta = ctx.inputs.meta ? "meta" : "nometa"
-    await Bun.write(ctx.outputFile("out").path, `${names.join(",")} ${meta}`)
-  },
-})
-```
-
-The start state is `posts/a/1.md`, `posts/a/2.md`, `posts/b/1.md`, and `meta/a.txt`. These runs use one `JsonStore`:
-
-1. **First run.** `index:topic=a` and `index:topic=b` execute. `index/a.txt` contains `1.md,2.md meta`.
-2. **No change.** Both tasks skip.
-3. **Add `posts/b/2.md`.** `index:topic=b` executes, because its list of inputs changed. `index:topic=a` skips.
-4. **Delete `posts/a/2.md`.** `index:topic=a` executes, and `index/a.txt` now contains `1.md meta`. `index:topic=b` skips.
-
-The default task id is `<name>:<var>=<value>,...`, with the vars sorted by name. Give `id: (vars) => string` in the rule to set a different id.
-
-If a single input matches more than one file for one set of vars, `FileBuild` throws `rule '<name>' input '<input>' matched <n> items for <vars>`. During `scan`, this error rejects `files.run()`. During the build, the error comes from a listener, so the rules for listener errors in [section 9](#9-listen-to-produced-artifacts) apply.
-
-### 11.4 Outputs
-
-- A **single** output, such as `index/<topic>.txt`, must use only vars that the inputs bind. If an output uses a var that no input binds, `FileBuild` creates no task and gives no error. `FileBuild` creates the parent directory before the task runs. Get the path with `ctx.outputFile(name).path`.
-- A **list** output, such as `pages/<doc>/*.txt`, becomes a plain prefix output. The prefix stops at the first glob. For a `FilePattern`, `FileBuild` creates the directory. The task must call `ctx.produced(new FileArtifact(path))` for each file that it writes. Other rules can then match those files in the same build.
-
-### 11.5 How `FileBuild` finds new files
-
-```text
-files.run()
-├─ scan()
-│   ├─ for each rule, for each input pattern: walk the files under the literal start of the template
-│   ├─ match each file id against every input pattern and keep the vars
-│   └─ for each rule: combine the vars → make tasks → build.add(task)
-└─ build.run()
-    └─ a task writes a file and announces it (declared output or ctx.produced)
-        └─ FileBuild listener (listens under the literal start of every input and output template)
-            ├─ match the id against every input pattern
-            └─ combine the vars again
-                ├─ build.add(task) for each new set of vars
-                ├─ build.add(task) again for each task whose input was announced again
-                └─ build.remove(id) for each set of vars that no longer exists
-```
-
-This loop lets one rule feed another rule. It also lets a rule feed itself, as in `examples/agent-loop.ts`. Each turn writes `turns/<sid>/<n+1>/prompt.txt`, and that file matches the first rule of the next turn.
-
-A task that skips sends no events. `FileBuild` still finds the outputs of skipped tasks, because `scan` finds existing files before the build runs.
-
-### 11.6 The rule context
-
-`run(ctx)` gets a `FileContext`:
-
-| Member | Returns |
-| --- | --- |
-| `ctx.vars` | The var values of this task, for example `{ name: "hello" }` |
-| `ctx.file(name)` | The single input `name` as a `FileArtifact`. It throws if the input is a list, missing, or not a file. |
-| `ctx.files(name)` | The input `name` as a `FileArtifact[]` |
-| `ctx.item(name)` | The single input `name` as an `Item`. Use it for S3 inputs. |
-| `ctx.items(name)` | The input `name` as an `Item[]` |
-| `ctx.inputs` | Every input by name, as `Item`, `Item[]`, or `undefined` |
-| `ctx.outputFile(name)` | The single output `name` as a `FileArtifact` |
-| `ctx.outputObject(name)` | The single output `name` as an `S3ObjectArtifact` |
-| `ctx.outputPrefix(name)` | The prefix of the list output `name` |
-| `ctx.outputs` | Every single output by name |
-| `ctx.produced(item)` | Announces a file or object under a list output |
-| `ctx.signal` | The task's `AbortSignal` |
-
-An `Item` is an `Artifact<Uint8Array>`: a file or an S3 object.
-
-### 11.7 S3 rules
-
-`S3Pattern` has the same template syntax and options for S3 keys. Give the bucket in the template, as `s3://docs/...`, or in the options, as `{ client, bucket: "docs" }`. You can use file patterns and S3 patterns in the same rule:
-
-```ts
-import { FilePattern, MemoryS3, S3ObjectArtifact, S3Pattern } from "dapat/contrib"
-
-const s3 = new MemoryS3()
-
-files.rule({
-  name: "paginate",
-  inputs: { src: new S3Pattern("s3://docs/inbox/<doc>.txt", { client: s3 }) },
-  outputs: { pages: new S3Pattern("s3://docs/pages/<doc>/*.txt", { client: s3 }) },
-  run: async (ctx) => {
-    const lines = new TextDecoder().decode(await ctx.item("src").read()).split("\n")
-    for (let i = 0; i < lines.length; i++) {
-      const key = `pages/${ctx.vars.doc}/${i + 1}.txt`
-      await s3.put("docs", key, new TextEncoder().encode(lines[i]!))
-      ctx.produced(new S3ObjectArtifact(s3, "docs", key))
-    }
-  },
-})
-
-files.rule({
-  name: "shot",
-  inputs: { page: new S3Pattern("s3://docs/pages/<doc>/<page>.txt", { client: s3 }) },
-  outputs: { shot: new FilePattern("shots/<doc>/<page>.png") },
-  run: async (ctx) => {
-    await Bun.write(ctx.outputFile("shot").path, await ctx.item("page").read())
-  },
-})
-```
-
-For S3 inputs, use `ctx.item(name)` and `ctx.items(name)`. For S3 outputs, use `ctx.outputObject(name)`. `S3Pattern` scans with `client.list`.
-
-### 11.8 More examples
-
-The repo has these examples. Run them with `bun run examples/<name>.ts`:
-
-- `first-build.ts` shows the two tasks from section 3. Run it from a directory that contains `in.txt`.
-- `file-pipeline.ts` shows two rules in a chain.
-- `s3-pages-screenshots.ts` shows an S3 list output, and one file for each page.
-- `agent-loop.ts` shows an agent with more than one turn. Each turn writes the prompt for the next turn, and a rule matches the new prompt. The code has no `while` loop.
-
-The last three examples run in a temporary directory. They import from `../src` and `../contrib`. In your project, import from `dapat` and `dapat/contrib`.
-
-## 12. Recipes
-
-### 12.1 Force tasks to run again
+### 11.1 Force tasks to run again
 
 To run every task again, clear the store before the build:
 
@@ -768,7 +571,7 @@ const build = new Build({ store })
 
 To run one task again, delete its record with `await store.delete(taskId)`. If the outputs of that task are newer than its inputs, the task still skips by order. Delete one of its outputs as well to make sure that it runs.
 
-### 12.2 Limit parallel work
+### 11.2 Limit parallel work
 
 dapat starts every ready task at the same time. To limit how many tasks do heavy work at the same time, share a gate between the tasks:
 
@@ -813,7 +616,7 @@ build.add(
 
 When a task finishes, the gate gives its place directly to the next waiting task. So no more than `max` tasks do work at the same time.
 
-### 12.3 Run in CI
+### 11.3 Run in CI
 
 A new checkout sets the modification time of each file to the time of the checkout. The order check therefore does not give useful results in CI. To skip unchanged tasks in CI, keep these items in the CI cache between runs:
 
@@ -822,13 +625,13 @@ A new checkout sets the modification time of each file to the time of the checko
 
 dapat then uses the content check, which does not depend on modification times. If the cache is empty, every task runs.
 
-## 13. Limits
+## 12. Limits
 
-- **A task that skips sends no events.** This applies to its prefix outputs and to its declared outputs. A `build.listen()` handler sees nothing from that task on the next build. `FileBuild` does not have this problem, because it scans for existing files before it runs.
+- **A task that skips sends no events.** This applies to its prefix outputs and to its declared outputs. A `build.listen()` handler sees nothing from that task on the next build.
 - **Order stamps have different units.** dapat compares the order stamps of all artifacts in one task as plain integers. `FileArtifact` and `DirectoryArtifact` use nanoseconds. `S3ObjectArtifact` uses milliseconds. `SqliteRowArtifact` uses `rowid` or your `orderColumn`. If one task has artifacts of two kinds, the order check gives wrong results. For example, an S3 input and a file output always look current. The content check comes first, so a persistent store decides correctly after the first successful run. On the first run, and each time the task has no store record, the order check decides.
 - **A prefix artifact input does not wait for a plain prefix output in a subfolder.** See [section 5](#how-dapat-finds-dependencies).
 - **`FileArtifact` stamp methods return `null` for all errors.** For example, a permission error on a file looks like a missing file. The task then runs again and does not fail. Check file permissions when a task always runs.
-- **No timeout and no concurrency limit.** All ready tasks start at the same time. Add limits and timeouts in your task code ([section 12.2](#122-limit-parallel-work)), and use `ctx.signal` to stop work.
+- **No timeout and no concurrency limit.** All ready tasks start at the same time. Add limits and timeouts in your task code ([section 11.2](#112-limit-parallel-work)), and use `ctx.signal` to stop work.
 - **`build.remove(id)` does not wait for the store.** Do not depend on the record being deleted when `build.run()` returns.
 - **Bun only.** The adapters use Bun APIs.
 
@@ -1151,101 +954,3 @@ Creates the table `dapat_task_state (task_id TEXT PRIMARY KEY, payload TEXT)` if
 ### `MemoryStore`
 
 The same class as the core `MemoryStore`.
-
-## FileBuild (`dapat/contrib`)
-
-### `class FileBuild`
-
-```ts
-new FileBuild(build: Build, opts?: { root?: string })
-```
-
-`root` is the directory for relative templates. The default is `process.cwd()`.
-
-| Member | Description |
-| --- | --- |
-| `rule(spec: FileRule): void` | Adds a rule and listens under the literal start of each input and output template. Call it before `scan` or `run`. |
-| `scan(): Promise<void>` | Finds existing files and objects for every input pattern and adds the matching tasks to the build. |
-| `run(): Promise<Result>` | Calls `scan()`, then `build.run()`. |
-
-### `interface FileRule`
-
-```ts
-interface FileRule {
-  name: string
-  inputs: Record<string, ItemPattern>
-  outputs: Record<string, ItemPattern>
-  id?: (vars: Vars) => string        // default: `${name}:${k=v,...}`
-  run: (ctx: FileContext) => Promise<void>
-}
-```
-
-### `interface FileContext`
-
-See [section 11.6](#116-the-rule-context).
-
-### `class FilePattern implements ItemPattern`
-
-```ts
-new FilePattern(template: string, opts?: FilePatternOpts)
-
-type FilePatternOpts = { optional?: boolean; list?: boolean }
-```
-
-| Member | Description |
-| --- | --- |
-| `template`, `optional`, `list`, `varNames` | The template, the options, and the var names in template order. `list` is `true` if you set it or if the template has a glob. |
-| `staticPrefix(root): string` | Absolute path of the literal start, ending with `/`. |
-| `match(absPath, root): Vars \| null` | Vars bound by the path, or `null` if it does not match. |
-| `render(vars, root): string` | The absolute path for the vars. Throws if a var is missing or the template has a glob. |
-
-### `class S3Pattern implements ItemPattern`
-
-```ts
-new S3Pattern(template: string, opts: S3PatternOpts)
-
-type S3PatternOpts = {
-  client: S3Client
-  bucket?: string
-  optional?: boolean
-  list?: boolean
-}
-```
-
-`template` is `s3://<bucket>/<key template>`, or a key template when you give `bucket`. The constructor throws if it cannot find a bucket, or if the two buckets are different.
-
-| Member | Description |
-| --- | --- |
-| `template`, `bucket`, `client`, `optional`, `list`, `varNames` | As for `FilePattern` |
-| `keyPrefix(): string` | The literal start of the key, ending with `/`, or `""` |
-| `match(key): Vars \| null` | Vars bound by the key |
-| `render(vars): string` | The key for the vars |
-
-### `interface ItemPattern`
-
-The interface that `FileBuild` uses for patterns. `FilePattern` and `S3Pattern` implement it. Implement it to match a different type of storage.
-
-```ts
-interface ItemPattern {
-  readonly optional: boolean
-  readonly list: boolean
-  readonly varNames: readonly string[]
-  listenPrefix(root: string): Prefix                 // prefix for the literal start of the template
-  boundPrefix(vars: Vars, root: string): Prefix      // prefix up to the first glob or unbound var
-  matchId(id: string, root: string): Vars | null     // bind an artifact id, or null
-  renderId(vars: Vars, root: string): string         // artifact id for the vars
-  artifact(id: string, root: string): Item           // make the artifact for an id
-  scan(root: string): Promise<string[]>              // ids of existing items under the literal start
-  prepareOutput(artifact: Item): Promise<void>       // called before run for each single output
-  sortKey(artifact: Item): string                    // sort key for list inputs
-}
-```
-
-### Types
-
-```ts
-type Vars = Record<string, string>
-type Item = Artifact<Uint8Array>
-type ItemInput = Item | Item[] | undefined
-type FileInput = ItemInput
-```
