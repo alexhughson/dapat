@@ -258,7 +258,7 @@ build.run()
 │  └─ on success
 │      ├─ send a produced event for each declared artifact output that the task did not report
 │      └─ store.set(task.id, stamps of inputs and outputs)
-└─ waits until no task is running and no task is ready → returns Result
+└─ waits until every started task has finished → returns Result
 ```
 
 ### How dapat finds dependencies
@@ -333,7 +333,7 @@ The `ctx` argument of `run` has these members:
 - `ctx.remove(id)` removes a task from the build.
 - `ctx.produced(artifact)` tells dapat that the task wrote `artifact`.
 
-You can also call `build.add()` and `build.remove()` from outside a task while `build.run()` is running. `build.run()` returns when no task is running and no task is ready. Subscribers ([section 9](#9-subscribe-to-artifact-events)) run synchronously, so the build does not wait for them separately.
+You can also call `build.add()` and `build.remove()` from outside a task while `build.run()` is running. `build.run()` returns when every task that it started has finished. Subscribers ([section 9](#9-subscribe-to-artifact-events)) run synchronously, so the build does not wait for them separately.
 
 ## 6. When a task skips
 
@@ -471,7 +471,7 @@ dapat sends a `produced` event at these times:
 
 dapat sends a `retracted` event when it replaces or removes a task that produced the artifact ([section 8](#8-failure-cancellation-and-replacement)).
 
-Delivery is synchronous. dapat calls each subscriber in the order that it subscribed, and it waits for each call to return. Thus, when `ctx.produced` returns, each task that a subscriber added is already in the build. A subscriber must not return a promise: dapat does not wait for it.
+Delivery is synchronous. dapat calls each subscriber in the order that it subscribed, and it waits for each call to return. Thus, when `ctx.produced` returns, each task that a subscriber added is already in the build. A subscriber must not return a promise. If it returns one, dapat does not wait for it: the send throws `subscriber returned a promise; subscribers must be synchronous`, and dapat reports that error as below.
 
 `subscribe` does not replay earlier events. Subscribe before `build.run()` to get all events. A subscriber that you add during a send gets the next event, not the current one.
 
@@ -504,10 +504,14 @@ const result = await build.run()
 
 ### Subscriber errors
 
-A subscriber that throws stops the send. The later subscribers do not get that event. dapat reports the error in one of these ways:
+A subscriber that throws stops that event: the later subscribers do not get it. dapat still sends the other events of the same call. For example, `build.remove(id)` sends a `retracted` event for each artifact of the task, even when the first one throws. dapat changes its own state before it sends, so a throw never leaves a task half removed or half replaced.
 
-- **The send comes from a running task.** This applies to `ctx.produced`, `ctx.add`, `ctx.remove`, and the events for the declared outputs after the task returns. The task fails, and the error goes into `result.failed`. In `ctx.produced`, `ctx.add`, and `ctx.remove`, the call throws the error, so the task can catch it and continue.
-- **No running task caused the send.** For example, you call `build.remove(id)` or replace a finished task with `build.add(task)` from outside a task, and a subscriber throws on the `retracted` event. `build.remove` and `build.add` do not throw. The error goes into `result.errors`, and `result.success` is `false`.
+dapat reports each error one time, in one of these ways:
+
+- **A running task caused the send.** This applies to `ctx.produced`, `ctx.add`, `ctx.remove`, and the events for the declared outputs after the task returns. It also applies to a `build.add` or `build.remove` that a subscriber calls during one of these sends. The task fails with the first error, and the error goes into `result.failed`. The task fails even if it catches the error. `ctx.produced`, `ctx.add`, and `ctx.remove` throw the first error after they send all events. If one call gets more than one error, the other errors go into `result.errors`.
+- **No running task caused the send.** For example, you call `build.remove(id)` from outside a task, or you replace a finished task with `build.add(task)`, and a subscriber throws on the `retracted` event. Then `build.remove` and `build.add` do not throw. The error goes into `result.errors`, and `result.success` is `false`. This also applies to a `ctx` call from a task that already finished, and to the retractions of a task that was replaced or removed while it ran.
+
+`result.errors` holds every such error of the build so far. An error that occurs after `build.run()` returns appears in the result of the next `build.run()` on the same build.
 
 dapat does not ignore a subscriber error.
 
@@ -667,7 +671,7 @@ new Build(opts?: { store?: Store })
 | `add(task: Task): void` | Adds a task. If a task with the same id exists, replaces it (see [section 8](#replacement)). If `run()` has started, the task starts at once. Throws if another task already declares one of its exact outputs, or if the task declares one output twice. |
 | `remove(id: string): void` | Removes a task. Aborts it if it is running and retracts its produced artifacts. Starts to delete its store record, but does not wait for the delete. Does nothing if the id is not known. |
 | `subscribe(listener: (event: ArtifactEvent) => void): void` | From `Emitter`. Calls `listener` synchronously for each artifact event. Does not replay earlier events. See [section 9](#9-subscribe-to-artifact-events). |
-| `run(): Promise<Result>` | Starts every task and resolves when no task is running and no task is ready. Does not reject when a task fails. |
+| `run(): Promise<Result>` | Starts every task and resolves when every started task has finished. Does not reject when a task fails. |
 
 ### `class Task`
 
@@ -704,7 +708,7 @@ The object that the build passes to `task.run`.
 | `signal: AbortSignal` | Aborted when the task is replaced or removed. |
 | `add(task: Task): void` | Same as `build.add`. |
 | `remove(id: string): void` | Same as `build.remove`. |
-| `produced(artifact: Artifact): void` | Sends a `produced` event to each subscriber before it returns. Throws if no output of the task covers it, or if a subscriber throws. Does nothing if the task was replaced. |
+| `produced(artifact: Artifact): void` | Sends a `produced` event to each subscriber before it returns. Throws if no output of the task covers it. Also throws if a subscriber throws, and then the task fails ([section 9](#subscriber-errors)). Does nothing if the task was replaced or removed. |
 
 ### `type Ref`
 
@@ -785,7 +789,7 @@ Keeps records in a `Map`. The records are lost when the process ends. `MemorySto
 | `skipped` | `readonly Task[]` | Tasks that the skip rules skipped. |
 | `failed` | `ReadonlyMap<Task, Error>` | Tasks that threw, whose producer failed, or that were in a deadlock. |
 | `cancelled` | `readonly Task[]` | Tasks that were replaced or removed before they completed. |
-| `errors` | `readonly Error[]` | Subscriber errors that no task owns, for example from a retraction that `build.remove` sent. |
+| `errors` | `readonly Error[]` | Subscriber errors that no task owns, for example from a retraction that `build.remove` sent from outside a task. It keeps the errors of earlier runs of the same build. |
 
 `Result` does not give the reason for a skip. The build keeps an `Outcome` for each task, but no public member returns it. See [section 6.1](#61-why-did-a-task-run-or-skip).
 
@@ -804,7 +808,7 @@ type Outcome =
 | Member | Description |
 | --- | --- |
 | `subscribe(listener: (event: E) => void): void` | Adds a listener. Listeners get events in the order that they subscribed. |
-| `protected send(event: E): void` | Calls each listener synchronously, in order. If a listener throws, `send` stops and throws that error to its caller. |
+| `protected send(event: E): void` | Calls each listener synchronously, in order. If a listener throws, `send` stops and throws that error to its caller. If a listener returns a promise, `send` throws an error. |
 
 `Build` extends `Emitter<ArtifactEvent>`.
 

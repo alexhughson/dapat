@@ -20,6 +20,8 @@ class Slot {
   abort: AbortController | null = null
   produced: Artifact[] = []
   outcome: Outcome | null = null
+  // The first listener error from a send that this task caused. The task fails with it.
+  listenerError: Error | null = null
 
   constructor(public task: Task) {}
 }
@@ -36,9 +38,10 @@ export class Build extends Emitter<ArtifactEvent> {
   private started = false
   private runningCount = 0
   private workCount = 0
-  // Above 0 while a running task is inside ctx.add, ctx.remove, ctx.produced,
-  // or the send of its declared outputs. A listener error then goes to that task.
-  private taskCalls = 0
+  // The running task that is inside ctx.add, ctx.remove, ctx.produced, or the
+  // send of its declared outputs. A listener error then goes to that task.
+  // When it is null, a listener error goes to `errors`.
+  private caller: Slot | null = null
   private waiters: Array<() => void> = []
   private idleWaiters: Array<() => void> = []
 
@@ -51,6 +54,7 @@ export class Build extends Emitter<ArtifactEvent> {
     const existing = this.slots.get(task.id)
     this.assertAddable(task, existing ? task.id : null)
 
+    let retractions: ArtifactEvent[] = []
     if (existing) {
       existing.generation += 1
       this.unindex(existing.task)
@@ -59,7 +63,7 @@ export class Build extends Emitter<ArtifactEvent> {
       } else if (existing.phase === "pending") {
         this.finish(existing, { type: "cancelled", reason: "replaced" })
       } else if (existing.phase === "completed") {
-        this.retractLost(existing, task)
+        retractions = this.retractLost(existing, task)
       }
     }
 
@@ -71,17 +75,20 @@ export class Build extends Emitter<ArtifactEvent> {
       this.kick(slot)
     }
     this.wake()
+    this.sendAll(retractions)
   }
 
   remove(id: string): void {
     const slot = this.slots.get(id)
     if (!slot) return
 
+    // A running task sees the new generation, so its later ctx.produced does nothing.
+    slot.generation += 1
     this.unindex(slot.task)
     if (slot.phase === "running" && slot.abort) {
       slot.abort.abort()
     }
-    this.retractAll(slot)
+    const retractions = this.retractAll(slot)
     this.slots.delete(id)
     if (this.store) {
       void this.store.delete(id)
@@ -90,6 +97,7 @@ export class Build extends Emitter<ArtifactEvent> {
       this.finish(slot, { type: "cancelled", reason: "removed" })
     }
     this.wake()
+    this.sendAll(retractions)
   }
 
   async run(): Promise<Result> {
@@ -268,26 +276,52 @@ export class Build extends Emitter<ArtifactEvent> {
     const ctx = this.contextFor(slot, generation)
     try {
       await slot.task.run(ctx)
-      if (generation !== slot.generation || abort.signal.aborted) {
-        this.retractAll(slot)
-        this.finish(slot, { type: "cancelled", reason: "replaced" })
+      if (this.endIfStopped(slot, generation, abort)) return
+      if (slot.listenerError === null) {
+        await this.recordSuccess(slot)
+      }
+      if (slot.listenerError !== null) {
+        this.finish(slot, { type: "failed", error: slot.listenerError })
         return
       }
-      await this.recordSuccess(slot)
       this.finish(slot, { type: "executed" })
     } catch (error) {
-      if (abort.signal.aborted || generation !== slot.generation) {
-        this.retractAll(slot)
-        this.finish(slot, { type: "cancelled", reason: "replaced" })
-        return
+      if (this.endIfStopped(slot, generation, abort)) return
+      // A listener error fails the task even if the task caught it and threw something else.
+      let err = toError(error)
+      if (slot.listenerError !== null) {
+        err = slot.listenerError
       }
-      const err = error instanceof Error ? error : new Error(String(error))
       this.finish(slot, { type: "failed", error: err })
     } finally {
       if (slot.phase === "running") {
         this.runningCount -= 1
       }
     }
+  }
+
+  /**
+   * Ends a task whose run returned after `remove` or a replacement.
+   * Returns false when the task is still current.
+   */
+  private endIfStopped(slot: Slot, generation: number, abort: AbortController): boolean {
+    if (slot.phase === "completed") {
+      // `remove` already finished it and sent its retractions.
+      this.keepStrayError(slot)
+      return true
+    }
+    if (generation === slot.generation && !abort.signal.aborted) return false
+    const retractions = this.retractAll(slot)
+    this.finish(slot, { type: "cancelled", reason: "replaced" })
+    this.keepStrayError(slot)
+    this.sendAll(retractions)
+    return true
+  }
+
+  /** A cancelled task does not own its listener error, so the error goes to `errors`. */
+  private keepStrayError(slot: Slot): void {
+    if (slot.listenerError === null) return
+    this.addError(slot.listenerError)
   }
 
   private async waitForInputs(slot: Slot, generation: number): Promise<WaitResult> {
@@ -318,14 +352,14 @@ export class Build extends Emitter<ArtifactEvent> {
     return {
       signal: slot.abort!.signal,
       add: (task: Task) => {
-        this.asTask(() => this.add(task))
+        this.asTask(slot, () => this.add(task))
       },
       remove: (id: string) => {
-        this.asTask(() => this.remove(id))
+        this.asTask(slot, () => this.remove(id))
       },
       produced: (artifact: Artifact) => {
         if (generation !== slot.generation) return
-        this.asTask(() => this.announce(slot, artifact))
+        this.asTask(slot, () => this.announce(slot, artifact))
       },
     }
   }
@@ -338,7 +372,7 @@ export class Build extends Emitter<ArtifactEvent> {
     }
     this.provisions.set(artifact.id, { artifact, taskId: slot.task.id })
     slot.produced.push(artifact)
-    this.send({ kind: "produced", artifact, taskId: slot.task.id })
+    this.sendAll([{ kind: "produced", artifact, taskId: slot.task.id }])
   }
 
   private outputCovers(task: Task, artifact: Artifact): boolean {
@@ -350,15 +384,16 @@ export class Build extends Emitter<ArtifactEvent> {
   }
 
   private async recordSuccess(slot: Slot): Promise<void> {
+    const events: ArtifactEvent[] = []
     for (const output of slot.task.outputs) {
       if (!isArtifact(output)) continue
       const already = slot.produced.some((a) => a.id === output.id)
       if (already) continue
       this.provisions.set(output.id, { artifact: output, taskId: slot.task.id })
       slot.produced.push(output)
-      const event: ArtifactEvent = { kind: "produced", artifact: output, taskId: slot.task.id }
-      this.asTask(() => this.send(event))
+      events.push({ kind: "produced", artifact: output, taskId: slot.task.id })
     }
+    this.asTask(slot, () => this.sendAll(events))
 
     if (!this.store) return
     const inputStamps = await this.stampMap(this.artifactRefs(slot.task.inputs))
@@ -367,57 +402,94 @@ export class Build extends Emitter<ArtifactEvent> {
     await this.store.set(slot.task.id, state)
   }
 
-  private asTask(call: () => void): void {
-    this.taskCalls += 1
+  private asTask(slot: Slot, call: () => void): void {
+    const previous = this.caller
+    // A task that already completed owns no error; its listener errors go to `errors`.
+    if (slot.phase === "running") {
+      this.caller = slot
+    } else {
+      this.caller = null
+    }
     try {
       call()
     } finally {
-      this.taskCalls -= 1
+      this.caller = previous
     }
   }
 
   /**
-   * A retraction comes from add, remove, or a cancelled task. When a running
-   * task caused it, a listener error goes back to that task. Otherwise no
-   * task owns the error, so the build keeps it for `result.errors`.
+   * Sends every event, even after a listener throws. With a caller task,
+   * each error goes to that task, and the first one is thrown after the loop.
+   * Without one, each error goes to `errors`.
    */
-  private sendRetraction(event: ArtifactEvent): void {
-    if (this.taskCalls > 0) {
-      this.send(event)
-      return
+  private sendAll(events: readonly ArtifactEvent[]): void {
+    const slot = this.caller
+    let first: Error | null = null
+    for (const event of events) {
+      try {
+        this.send(event)
+      } catch (error) {
+        const err = toError(error)
+        if (slot === null) {
+          this.addError(err)
+          continue
+        }
+        if (first === null) {
+          first = err
+        }
+        this.blame(slot, err)
+      }
     }
-    try {
-      this.send(event)
-    } catch (error) {
-      const err = error instanceof Error ? error : new Error(String(error))
-      this.errors.push(err)
+    if (first !== null) {
+      throw first
     }
   }
 
-  private retractLost(oldSlot: Slot, next: Task): void {
+  private blame(slot: Slot, error: Error): void {
+    if (slot.listenerError === null) {
+      slot.listenerError = error
+      return
+    }
+    // A nested send already reported this error, and it came back up through a listener.
+    if (slot.listenerError === error) return
+    this.addError(error)
+  }
+
+  private addError(error: Error): void {
+    if (this.errors.includes(error)) return
+    this.errors.push(error)
+  }
+
+  /** Clears the provisions of the artifacts that `next` no longer declares. */
+  private retractLost(oldSlot: Slot, next: Task): ArtifactEvent[] {
     const kept = new Set<string>()
     for (const output of next.outputs) {
       if (isArtifact(output)) kept.add(output.id)
     }
+    const events: ArtifactEvent[] = []
     for (const artifact of oldSlot.produced) {
       if (kept.has(artifact.id)) continue
-      this.retractOne(oldSlot.task.id, artifact)
+      events.push(this.retractOne(oldSlot.task.id, artifact))
     }
+    return events
   }
 
-  private retractAll(slot: Slot): void {
+  private retractAll(slot: Slot): ArtifactEvent[] {
+    const events: ArtifactEvent[] = []
     for (const artifact of slot.produced) {
-      this.retractOne(slot.task.id, artifact)
+      events.push(this.retractOne(slot.task.id, artifact))
     }
     slot.produced = []
+    return events
   }
 
-  private retractOne(taskId: string, artifact: Artifact): void {
+  /** Clears the provision and returns the event. The caller sends it after its state changes. */
+  private retractOne(taskId: string, artifact: Artifact): ArtifactEvent {
     const current = this.provisions.get(artifact.id)
     if (current && current.taskId === taskId) {
       this.provisions.delete(artifact.id)
     }
-    this.sendRetraction({ kind: "retracted", artifact, taskId })
+    return { kind: "retracted", artifact, taskId }
   }
 
   private async decideSkip(task: Task): Promise<"content" | "order" | null> {
@@ -579,4 +651,9 @@ function ordersFresh(
   if (minOutput === null) return false
   if (maxInput === null) return true
   return maxInput <= minOutput
+}
+
+function toError(value: unknown): Error {
+  if (value instanceof Error) return value
+  return new Error(String(value))
 }
