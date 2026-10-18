@@ -945,6 +945,158 @@ describe("Build", () => {
     expect(result.failed.size).toBe(1)
   })
 
+  test("a replaced running task does not retract the artifact the replacement owns", async () => {
+    const a = new Mem("mem:a")
+    const events: string[] = []
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    let started!: () => void
+    const reached = new Promise<void>((resolve) => {
+      started = resolve
+    })
+    const build = new Build()
+    build.subscribe((event) => {
+      events.push(`${event.kind} ${event.artifact.id}`)
+    })
+    build.add(
+      new Task({
+        id: "t",
+        outputs: [a],
+        run: async (ctx) => {
+          ctx.produced(a)
+          started()
+          await gate
+        },
+      }),
+    )
+
+    const running = build.run()
+    await reached
+    build.add(new Task({ id: "t", outputs: [a], run: async () => {} }))
+    // Let the replacement finish before the old run returns.
+    await new Promise<void>((resolve) => setTimeout(resolve, 5))
+    release()
+    const result = await running
+
+    expect(result.success).toBe(true)
+    expect(result.cancelled.length).toBe(1)
+    expect(events).toEqual(["produced mem:a", "produced mem:a"])
+    build.remove("t")
+    expect(events).toEqual(["produced mem:a", "produced mem:a", "retracted mem:a"])
+  })
+
+  test("a task that catches a listener error and throws its own fails with the listener error", async () => {
+    const out = new Mem("mem:out/a")
+    const build = new Build()
+    build.subscribe(() => {
+      throw new Error("listener broke")
+    })
+    build.add(
+      new Task({
+        id: "t",
+        outputs: [new IdPrefix("mem:out/")],
+        run: async (ctx) => {
+          try {
+            ctx.produced(out)
+          } catch {
+            throw new Error("task gave up")
+          }
+        },
+      }),
+    )
+
+    const result = await build.run()
+    expect(result.success).toBe(false)
+    for (const error of result.failed.values()) {
+      expect(error.message).toBe("listener broke")
+    }
+    expect(result.failed.size).toBe(1)
+    expect(result.errors.map((error) => error.message)).toEqual(["task gave up"])
+  })
+
+  test("a subscriber that removes the writer on its declared output stops its record", async () => {
+    const out = new Mem("mem:out")
+    const store = new MemoryStore()
+    const build = new Build({ store })
+    build.subscribe((event) => {
+      if (event.kind === "produced" && event.taskId === "t") build.remove("t")
+    })
+    build.add(
+      new Task({
+        id: "t",
+        outputs: [out],
+        run: async () => {
+          out.write("v", 1n, "v")
+        },
+      }),
+    )
+
+    const result = await build.run()
+    // Let the store delete that remove started finish.
+    await new Promise<void>((resolve) => setTimeout(resolve, 1))
+    expect(result.executed).toEqual([])
+    expect(result.cancelled.map((task) => task.id)).toEqual(["t"])
+    expect(await store.get("t")).toBeNull()
+  })
+
+  test("an artifact reported twice is retracted once", async () => {
+    const a = new Mem("mem:p/a")
+    const events: string[] = []
+    const build = new Build()
+    build.subscribe((event) => {
+      events.push(`${event.kind} ${event.artifact.id}`)
+    })
+    build.add(
+      new Task({
+        id: "t",
+        outputs: [new IdPrefix("mem:p/")],
+        run: async (ctx) => {
+          ctx.produced(a)
+          ctx.produced(a)
+        },
+      }),
+    )
+
+    await build.run()
+    build.remove("t")
+    expect(events).toEqual(["produced mem:p/a", "produced mem:p/a", "retracted mem:p/a"])
+  })
+
+  test("a replacement owns the artifacts it declares, even if it is removed before it runs", async () => {
+    const a = new Mem("mem:a")
+    const events: string[] = []
+    const build = new Build()
+    build.subscribe((event) => {
+      events.push(`${event.kind} ${event.artifact.id}`)
+    })
+    build.add(new Task({ id: "t", outputs: [a], run: async () => {} }))
+    await build.run()
+
+    build.add(new Task({ id: "t", outputs: [a], run: async () => {} }))
+    expect(events).toEqual(["produced mem:a"])
+    build.remove("t")
+    expect(events).toEqual(["produced mem:a", "retracted mem:a"])
+  })
+
+  test("the rejection of an async subscriber goes to result.errors", async () => {
+    const out = new Mem("mem:out")
+    const build = new Build()
+    build.subscribe(async () => {
+      throw new Error("async subscriber broke")
+    })
+    build.add(new Task({ id: "t", outputs: [out], run: async () => {} }))
+
+    const result = await build.run()
+    expect(result.success).toBe(false)
+    for (const error of result.failed.values()) {
+      expect(error.message).toBe("subscriber returned a promise; subscribers must be synchronous")
+    }
+    expect(result.failed.size).toBe(1)
+    expect(result.errors.map((error) => error.message)).toEqual(["async subscriber broke"])
+  })
+
   test("task can add another task during run", async () => {
     const done = new Mem("mem:done")
     const childOut = new Mem("mem:child")

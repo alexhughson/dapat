@@ -433,8 +433,8 @@ use-a: dependency of 'use-a' failed
 Call `build.add()` with a task id that is already in the build. The new task replaces the old task. What dapat does depends on the state of the old task:
 
 - **The old task is waiting.** dapat marks the old task `cancelled` with the reason `"replaced"`, and does not run it.
-- **The old task is running.** dapat aborts `ctx.signal` of the old task. The old run ends as `cancelled`, even if it finishes without an error. dapat retracts the artifacts that the old run produced.
-- **The old task is finished.** dapat retracts the artifacts that the old task produced and that the new task does not declare.
+- **The old task is running.** dapat aborts `ctx.signal` of the old task. The old run ends as `cancelled`, even if it finishes without an error. A later `ctx.produced` call from the old run does nothing.
+- **The old task is running or finished.** In `build.add`, dapat retracts the artifacts that the old task produced and that the new task does not declare. The new task takes over the artifacts that it declares, and it retracts them if you remove it later.
 
 In each case, the new task then waits, skips, or runs in the usual way.
 
@@ -471,7 +471,7 @@ dapat sends a `produced` event at these times:
 
 dapat sends a `retracted` event when it replaces or removes a task that produced the artifact ([section 8](#8-failure-cancellation-and-replacement)).
 
-Delivery is synchronous. dapat calls each subscriber in the order that it subscribed, and it waits for each call to return. Thus, when `ctx.produced` returns, each task that a subscriber added is already in the build. A subscriber must not return a promise. If it returns one, dapat does not wait for it: the send throws `subscriber returned a promise; subscribers must be synchronous`, and dapat reports that error as below.
+Delivery is synchronous. dapat calls each subscriber in the order that it subscribed, and it waits for each call to return. Thus, when `ctx.produced` returns, each task that a subscriber added is already in the build. A subscriber must not return a promise. If it returns one, dapat does not wait for it: the send throws `subscriber returned a promise; subscribers must be synchronous`, and dapat reports that error as below. If the promise rejects, its error goes into `result.errors`.
 
 `subscribe` does not replay earlier events. Subscribe before `build.run()` to get all events. A subscriber that you add during a send gets the next event, not the current one.
 
@@ -504,12 +504,12 @@ const result = await build.run()
 
 ### Subscriber errors
 
-A subscriber that throws stops that event: the later subscribers do not get it. dapat still sends the other events of the same call. For example, `build.remove(id)` sends a `retracted` event for each artifact of the task, even when the first one throws. dapat changes its own state before it sends, so a throw never leaves a task half removed or half replaced.
+A subscriber that throws stops that event: the later subscribers do not get it. dapat still sends the other events of the same call. For example, `build.remove(id)` sends a `retracted` event for each artifact of the task, even when the first one throws. dapat sends one `retracted` event for each artifact, even if the task reported the artifact two times. dapat changes its own state before it sends, so a throw never leaves a task half removed or half replaced.
 
 dapat reports each error one time, in one of these ways:
 
-- **A running task caused the send.** This applies to `ctx.produced`, `ctx.add`, `ctx.remove`, and the events for the declared outputs after the task returns. It also applies to a `build.add` or `build.remove` that a subscriber calls during one of these sends. The task fails with the first error, and the error goes into `result.failed`. The task fails even if it catches the error. `ctx.produced`, `ctx.add`, and `ctx.remove` throw the first error after they send all events. If one call gets more than one error, the other errors go into `result.errors`.
-- **No running task caused the send.** For example, you call `build.remove(id)` from outside a task, or you replace a finished task with `build.add(task)`, and a subscriber throws on the `retracted` event. Then `build.remove` and `build.add` do not throw. The error goes into `result.errors`, and `result.success` is `false`. This also applies to a `ctx` call from a task that already finished, and to the retractions of a task that was replaced or removed while it ran.
+- **A running task caused the send.** This applies to `ctx.produced`, `ctx.add`, `ctx.remove`, and the events for the declared outputs after the task returns. It also applies to a `build.add` or `build.remove` that a subscriber calls during one of these sends. The task fails with the first error, and the error goes into `result.failed`. The task fails even if it catches the error. If the task then throws its own error, its own error goes into `result.errors`. `ctx.produced`, `ctx.add`, and `ctx.remove` throw the first error after they send all events. If one call gets more than one error, the other errors go into `result.errors`. If a subscriber removes or replaces the task during these sends, the task ends as `cancelled`, dapat writes no store record for it, and its error goes into `result.errors`.
+- **No running task caused the send.** For example, you call `build.remove(id)` from outside a task, or you replace a task with `build.add(task)`, and a subscriber throws on the `retracted` event. Then `build.remove` and `build.add` do not throw. The error goes into `result.errors`, and `result.success` is `false`. This also applies to a `ctx` call from a task that already finished. When a running task calls `ctx.add` or `ctx.remove`, the retractions go to that task, as in the first case.
 
 `result.errors` holds every such error of the build so far. An error that occurs after `build.run()` returns appears in the result of the next `build.run()` on the same build.
 

@@ -18,13 +18,22 @@ export class Emitter<E> {
     for (const listener of listeners) {
       const returned: unknown = listener(event)
       if (isThenable(returned)) {
+        returned.then(undefined, (reason: unknown) => this.rejected(reason))
         throw new Error("subscriber returned a promise; subscribers must be synchronous")
       }
     }
   }
+
+  /**
+   * Gets the rejection of a promise that a subscriber returned. The default
+   * throws it again, so it stays an unhandled rejection. Override it to keep it.
+   */
+  protected rejected(reason: unknown): void {
+    throw reason
+  }
 }
 
-function isThenable(value: unknown): boolean {
+function isThenable(value: unknown): value is PromiseLike<unknown> {
   if (typeof value !== "object" && typeof value !== "function") return false
   if (value === null) return false
   return typeof (value as { then?: unknown }).then === "function"
