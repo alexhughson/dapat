@@ -232,18 +232,19 @@ describe("Build", () => {
     expect(executed).toEqual(["write", "zip"])
   })
 
-  test("listen inserts a task for a produced child", async () => {
+  test("a subscriber adds a task for a produced child", async () => {
     const foo = new Mem("mem:logs/1.json")
     const report = new Mem("mem:reports/1.json")
     const executed: string[] = []
 
     const build = new Build()
-    build.listen(new IdPrefix("mem:logs/"), (event) => {
-      if (event.type !== "produced") return
+    build.subscribe((event) => {
+      if (event.kind !== "produced") return
+      if (!event.artifact.id.startsWith("mem:logs/")) return
       build.add(
         new Task({
-          id: `report:${event.id}`,
-          inputs: [foo],
+          id: `report:${event.artifact.id}`,
+          inputs: [event.artifact],
           outputs: [report],
           run: async () => {
             executed.push("report")
@@ -268,6 +269,202 @@ describe("Build", () => {
     expect(result.success).toBe(true)
     expect(executed).toEqual(["write-log", "report"])
   })
+
+  test("a subscriber gets each produced artifact in order and at once", async () => {
+    const first = new Mem("mem:out/1")
+    const second = new Mem("mem:out/2")
+    const declared = new Mem("mem:declared")
+    const report = new Mem("mem:report")
+    const log: string[] = []
+
+    const build = new Build()
+    build.subscribe((event) => {
+      log.push(`${event.kind} ${event.artifact.id} by ${event.taskId}`)
+      if (event.artifact === first) {
+        build.add(
+          new Task({
+            id: "report",
+            inputs: [first],
+            outputs: [report],
+            run: async () => {
+              report.write("r", 3n, "r")
+            },
+          }),
+        )
+      }
+    })
+    build.add(
+      new Task({
+        id: "write",
+        outputs: [new IdPrefix("mem:out/"), declared],
+        run: async (ctx) => {
+          first.write("1", 1n, "1")
+          ctx.produced(first)
+          log.push("produced returned")
+          // The listener added "report" before ctx.produced returned,
+          // so a second task with the same output is a duplicate.
+          const duplicate = new Task({ id: "other", outputs: [report], run: async () => {} })
+          expect(() => ctx.add(duplicate)).toThrow(/duplicate output 'mem:report'/)
+          second.write("2", 1n, "2")
+          ctx.produced(second)
+          declared.write("d", 1n, "d")
+        },
+      }),
+    )
+
+    const result = await build.run()
+    expect(result.success).toBe(true)
+    expect(log).toEqual([
+      "produced mem:out/1 by write",
+      "produced returned",
+      "produced mem:out/2 by write",
+      "produced mem:declared by write",
+      "produced mem:report by report",
+    ])
+  })
+
+  test("a listener error in ctx.produced fails that task", async () => {
+    const foo = new Mem("mem:out/foo")
+    const caught = new Mem("mem:caught/foo")
+    let caughtMessage = ""
+    const build = new Build()
+    build.subscribe((event) => {
+      if (event.kind === "produced") {
+        throw new Error(`listener broke on ${event.artifact.id}`)
+      }
+    })
+    build.add(
+      new Task({
+        id: "write",
+        outputs: [new IdPrefix("mem:out/")],
+        run: async (ctx) => {
+          foo.write("x", 1n, "x")
+          ctx.produced(foo)
+        },
+      }),
+    )
+    build.add(
+      new Task({
+        id: "catches",
+        outputs: [new IdPrefix("mem:caught/")],
+        run: async (ctx) => {
+          caught.write("x", 1n, "x")
+          try {
+            ctx.produced(caught)
+          } catch (error) {
+            caughtMessage = String(error)
+          }
+        },
+      }),
+    )
+
+    const result = await build.run()
+    expect(result.success).toBe(false)
+    expect(result.errors).toEqual([])
+    const failedIds: string[] = []
+    for (const [task, error] of result.failed) {
+      failedIds.push(task.id)
+      expect(error.message).toBe("listener broke on mem:out/foo")
+    }
+    expect(failedIds).toEqual(["write"])
+    const executedIds = result.executed.map((task) => task.id)
+    expect(executedIds).toEqual(["catches"])
+    expect(caughtMessage).toBe("Error: listener broke on mem:caught/foo")
+  })
+
+  test("a listener error on a declared output fails that task", async () => {
+    const out = new Mem("mem:out")
+    const store = new MemoryStore()
+    const build = new Build({ store })
+    build.subscribe(() => {
+      throw new Error("listener broke")
+    })
+    build.add(
+      new Task({
+        id: "write",
+        outputs: [out],
+        run: async () => {
+          out.write("x", 1n, "x")
+        },
+      }),
+    )
+
+    const result = await build.run()
+    expect(result.success).toBe(false)
+    expect(result.executed).toEqual([])
+    expect(result.failed.size).toBe(1)
+    for (const error of result.failed.values()) {
+      expect(error.message).toBe("listener broke")
+    }
+    expect(await store.get("write")).toBeNull()
+  })
+
+  for (const how of ["remove", "replace"]) {
+    test(`a listener error on a retraction from build.${how} goes to result.errors`, async () => {
+      const out = new Mem("mem:out")
+      const other = new Mem("mem:other")
+      const retracted: string[] = []
+      let release!: () => void
+      const gate = new Promise<void>((resolve) => {
+        release = resolve
+      })
+      let waiting!: () => void
+      const reached = new Promise<void>((resolve) => {
+        waiting = resolve
+      })
+
+      const build = new Build()
+      build.subscribe((event) => {
+        if (event.kind !== "retracted") return
+        retracted.push(event.artifact.id)
+        throw new Error("listener broke")
+      })
+      build.add(
+        new Task({
+          id: "write",
+          outputs: [out],
+          run: async () => {
+            out.write("x", 1n, "x")
+          },
+        }),
+      )
+      // Starts only after "write" completes, and holds the run open.
+      build.add(
+        new Task({
+          id: "hold",
+          inputs: [out],
+          run: async () => {
+            waiting()
+            await gate
+          },
+        }),
+      )
+
+      const running = build.run()
+      await reached
+      if (how === "remove") {
+        build.remove("write")
+      } else {
+        build.add(
+          new Task({
+            id: "write",
+            outputs: [other],
+            run: async () => {
+              other.write("y", 1n, "y")
+            },
+          }),
+        )
+      }
+      release()
+      const result = await running
+
+      expect(retracted).toEqual(["mem:out"])
+      expect(result.failed.size).toBe(0)
+      expect(result.success).toBe(false)
+      expect(result.errors.length).toBe(1)
+      expect(result.errors[0]!.message).toBe("listener broke")
+    })
+  }
 
   test("produced throws when no output covers the child", async () => {
     const foo = new Mem("mem:other/foo")

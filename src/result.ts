@@ -12,8 +12,10 @@ export class Result {
   readonly skipped: readonly Task[]
   readonly failed: ReadonlyMap<Task, Error>
   readonly cancelled: readonly Task[]
+  /** Listener errors that no task owns, for example from `build.remove`. */
+  readonly errors: readonly Error[]
 
-  constructor(outcomes: ReadonlyMap<Task, Outcome>) {
+  constructor(outcomes: ReadonlyMap<Task, Outcome>, errors: readonly Error[]) {
     const executed: Task[] = []
     const skipped: Task[] = []
     const failed = new Map<Task, Error>()
@@ -35,6 +37,7 @@ export class Result {
     this.skipped = skipped
     this.failed = failed
     this.cancelled = cancelled
-    this.success = failed.size === 0
+    this.errors = [...errors]
+    this.success = failed.size === 0 && errors.length === 0
   }
 }

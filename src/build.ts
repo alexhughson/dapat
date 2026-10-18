@@ -1,16 +1,13 @@
 import type { Artifact } from "./artifact"
+import { Emitter } from "./emitter"
 import type { Prefix } from "./prefix"
 import { Task, isArtifact, isPrefix, type Context, type Ref } from "./task"
 import type { Stamp, Store, TaskState } from "./store"
 import { Outcome, Result } from "./result"
 
-export type ArtifactEvent = {
-  type: "produced" | "retracted"
-  id: string
-  taskId: string
-}
-
-export type ArtifactListener = (event: ArtifactEvent) => void | Promise<void>
+export type ArtifactEvent =
+  | { kind: "produced"; artifact: Artifact; taskId: string }
+  | { kind: "retracted"; artifact: Artifact; taskId: string }
 
 type Phase = "pending" | "running" | "completed"
 
@@ -27,23 +24,26 @@ class Slot {
   constructor(public task: Task) {}
 }
 
-export class Build {
+export class Build extends Emitter<ArtifactEvent> {
   private readonly store: Store | undefined
   private readonly slots = new Map<string, Slot>()
   private readonly exactOutputs = new Map<string, { artifact: Artifact; taskId: string }>()
   private readonly prefixOutputs: { prefix: Prefix; taskId: string }[] = []
   private readonly provisions = new Map<string, { artifact: Artifact; taskId: string }>()
-  private readonly listeners: { prefix: Prefix; fn: ArtifactListener }[] = []
   private readonly outcomes = new Map<Task, Outcome>()
+  private readonly errors: Error[] = []
 
   private started = false
   private runningCount = 0
   private workCount = 0
-  private listenerCount = 0
+  // Above 0 while a running task is inside ctx.add, ctx.remove, ctx.produced,
+  // or the send of its declared outputs. A listener error then goes to that task.
+  private taskCalls = 0
   private waiters: Array<() => void> = []
   private idleWaiters: Array<() => void> = []
 
   constructor(opts?: { store?: Store }) {
+    super()
     this.store = opts?.store
   }
 
@@ -92,38 +92,13 @@ export class Build {
     this.wake()
   }
 
-  listen(prefix: Prefix, fn: ArtifactListener): () => void {
-    for (const provision of this.provisions.values()) {
-      if (prefix.covers(provision.artifact)) {
-        this.fire(
-          {
-            type: "produced",
-            id: provision.artifact.id,
-            taskId: provision.taskId,
-          },
-          provision.artifact,
-          fn,
-        )
-      }
-    }
-
-    const entry = { prefix, fn }
-    this.listeners.push(entry)
-    return () => {
-      const index = this.listeners.indexOf(entry)
-      if (index >= 0) {
-        this.listeners.splice(index, 1)
-      }
-    }
-  }
-
   async run(): Promise<Result> {
     this.started = true
     for (const slot of this.slots.values()) {
       this.kick(slot)
     }
     await this.idle()
-    return new Result(this.outcomes)
+    return new Result(this.outcomes, this.errors)
   }
 
   private assertAddable(task: Task, replacingId: string | null): void {
@@ -343,14 +318,14 @@ export class Build {
     return {
       signal: slot.abort!.signal,
       add: (task: Task) => {
-        this.add(task)
+        this.asTask(() => this.add(task))
       },
       remove: (id: string) => {
-        this.remove(id)
+        this.asTask(() => this.remove(id))
       },
       produced: (artifact: Artifact) => {
         if (generation !== slot.generation) return
-        this.announce(slot, artifact)
+        this.asTask(() => this.announce(slot, artifact))
       },
     }
   }
@@ -363,7 +338,7 @@ export class Build {
     }
     this.provisions.set(artifact.id, { artifact, taskId: slot.task.id })
     slot.produced.push(artifact)
-    this.fire({ type: "produced", id: artifact.id, taskId: slot.task.id }, artifact)
+    this.send({ kind: "produced", artifact, taskId: slot.task.id })
   }
 
   private outputCovers(task: Task, artifact: Artifact): boolean {
@@ -381,10 +356,8 @@ export class Build {
       if (already) continue
       this.provisions.set(output.id, { artifact: output, taskId: slot.task.id })
       slot.produced.push(output)
-      await this.emitAll(
-        { type: "produced", id: output.id, taskId: slot.task.id },
-        output,
-      )
+      const event: ArtifactEvent = { kind: "produced", artifact: output, taskId: slot.task.id }
+      this.asTask(() => this.send(event))
     }
 
     if (!this.store) return
@@ -394,30 +367,30 @@ export class Build {
     await this.store.set(slot.task.id, state)
   }
 
-  private fire(
-    event: ArtifactEvent,
-    artifact: Artifact,
-    only?: ArtifactListener,
-  ): void {
-    this.listenerCount += 1
-    void this.emitAll(event, artifact, only).finally(() => {
-      this.listenerCount -= 1
-      this.maybeIdle()
-    })
+  private asTask(call: () => void): void {
+    this.taskCalls += 1
+    try {
+      call()
+    } finally {
+      this.taskCalls -= 1
+    }
   }
 
-  private async emitAll(
-    event: ArtifactEvent,
-    artifact: Artifact,
-    only?: ArtifactListener,
-  ): Promise<void> {
-    if (only) {
-      await only(event)
+  /**
+   * A retraction comes from add, remove, or a cancelled task. When a running
+   * task caused it, a listener error goes back to that task. Otherwise no
+   * task owns the error, so the build keeps it for `result.errors`.
+   */
+  private sendRetraction(event: ArtifactEvent): void {
+    if (this.taskCalls > 0) {
+      this.send(event)
       return
     }
-    for (const listener of this.listeners) {
-      if (!listener.prefix.covers(artifact)) continue
-      await listener.fn(event)
+    try {
+      this.send(event)
+    } catch (error) {
+      const err = error instanceof Error ? error : new Error(String(error))
+      this.errors.push(err)
     }
   }
 
@@ -444,7 +417,7 @@ export class Build {
     if (current && current.taskId === taskId) {
       this.provisions.delete(artifact.id)
     }
-    this.fire({ type: "retracted", id: artifact.id, taskId }, artifact)
+    this.sendRetraction({ kind: "retracted", artifact, taskId })
   }
 
   private async decideSkip(task: Task): Promise<"content" | "order" | null> {
@@ -529,7 +502,7 @@ export class Build {
   }
 
   private idle(): Promise<void> {
-    if (this.workCount === 0 && this.listenerCount === 0) {
+    if (this.workCount === 0) {
       return Promise.resolve()
     }
     return new Promise((resolve) => {
@@ -538,7 +511,7 @@ export class Build {
   }
 
   private maybeIdle(): void {
-    if (this.workCount !== 0 || this.listenerCount !== 0) return
+    if (this.workCount !== 0) return
     const waiters = this.idleWaiters
     this.idleWaiters = []
     for (const waiter of waiters) {

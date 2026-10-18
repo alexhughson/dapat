@@ -89,6 +89,9 @@ if (!result.success) {
   for (const [task, error] of result.failed) {
     console.error(`${task.id}: ${error.message}`)
   }
+  for (const error of result.errors) {
+    console.error(error.message)
+  }
   process.exit(1)
 }
 console.log("executed:", result.executed.map((task) => task.id))
@@ -112,11 +115,12 @@ The repo has this build in `examples/first-build.ts`. Run it with `bun run examp
 
 `build.run()` returns a `Result`:
 
-- `success` is `true` when no task failed.
+- `success` is `true` when no task failed and `errors` is empty.
 - `executed` lists the tasks that ran and did not fail.
 - `skipped` lists the tasks that dapat did not run, because their outputs were current.
 - `failed` is a `Map<Task, Error>`.
 - `cancelled` lists the tasks that were replaced or removed before they finished ([section 8](#8-failure-cancellation-and-replacement)).
+- `errors` lists the subscriber errors that no task owns ([section 9](#9-subscribe-to-artifact-events)).
 
 A failed task does not stop the build. The other tasks continue. `build.run()` does not throw when a task fails, so always check `result.success`.
 
@@ -250,11 +254,11 @@ build.run()
 │  │   ├─ compare with the store record     → skipped, reason "content"
 │  │   └─ compare order stamps              → skipped, reason "order"
 │  ├─ task.run(ctx)
-│  │   └─ ctx.produced(artifact)            → calls each listener whose prefix covers the artifact
+│  │   └─ ctx.produced(artifact)            → calls each subscriber before it returns
 │  └─ on success
-│      ├─ announce each declared artifact output to the listeners
+│      ├─ send a produced event for each declared artifact output that the task did not report
 │      └─ store.set(task.id, stamps of inputs and outputs)
-└─ waits until no task and no listener is in progress → returns Result
+└─ waits until no task is running and no task is ready → returns Result
 ```
 
 ### How dapat finds dependencies
@@ -329,7 +333,7 @@ The `ctx` argument of `run` has these members:
 - `ctx.remove(id)` removes a task from the build.
 - `ctx.produced(artifact)` tells dapat that the task wrote `artifact`.
 
-You can also call `build.add()` and `build.remove()` from outside a task while `build.run()` is running. `build.run()` returns only when no task is running and no `build.listen()` handler ([section 9](#9-listen-to-produced-artifacts)) is running.
+You can also call `build.add()` and `build.remove()` from outside a task while `build.run()` is running. `build.run()` returns when no task is running and no task is ready. Subscribers ([section 9](#9-subscribe-to-artifact-events)) run synchronously, so the build does not wait for them separately.
 
 ## 6. When a task skips
 
@@ -411,6 +415,9 @@ if (!result.success) {
   for (const [task, error] of result.failed) {
     console.error(`${task.id}: ${error.message}`)
   }
+  for (const error of result.errors) {
+    console.error(error.message)
+  }
 }
 ```
 
@@ -441,40 +448,42 @@ Your task code must stop work when `ctx.signal` aborts. dapat does not stop a ru
 
 `build.remove(id)` also starts to delete the store record for the task, but it does not wait for the delete. `build.run()` can return before the delete is done, and a delete error is not reported.
 
-dapat does not delete files or objects. Retraction only sends events ([section 9](#9-listen-to-produced-artifacts)).
+dapat does not delete files or objects. Retraction only sends events ([section 9](#9-subscribe-to-artifact-events)).
 
-## 9. Listen to produced artifacts
+## 9. Subscribe to artifact events
 
-A listener gets an event each time a task produces or retracts an artifact under a prefix:
+`Build` is an `Emitter<ArtifactEvent>`. A subscriber gets an event each time a task produces an artifact, and each time the build retracts one:
 
 ```ts
-type ArtifactEvent = {
-  type: "produced" | "retracted"
-  id: string      // the artifact id
-  taskId: string  // the task that produced the artifact
-}
+type ArtifactEvent =
+  | { kind: "produced"; artifact: Artifact; taskId: string }
+  | { kind: "retracted"; artifact: Artifact; taskId: string }
 
-const stop = build.listen(prefix, (event) => { ... })
-stop() // unsubscribe
+build.subscribe((event) => { ... })
 ```
 
-The event does not contain the artifact object. Make a new artifact from `event.id` if you need one.
+`taskId` is the task that produced the artifact. The subscriber gets every event. To use only some artifacts, check `event.artifact.id` in the subscriber.
 
 dapat sends a `produced` event at these times:
 
 - when a task calls `ctx.produced(artifact)`.
-- when a task runs with no error, for each declared artifact output. dapat sends this event before the task counts as finished. Thus a listener can add a task that reads the output, and that new task waits for the writer.
+- when a task runs with no error, for each declared artifact output that the task did not report with `ctx.produced`. dapat sends this event before the task counts as finished. Thus a subscriber can add a task that reads the output, and that new task waits for the writer.
 
-When you call `listen()`, dapat first replays the artifacts that were already produced in this build and that are in the folder of the prefix.
+dapat sends a `retracted` event when it replaces or removes a task that produced the artifact ([section 8](#8-failure-cancellation-and-replacement)).
+
+Delivery is synchronous. dapat calls each subscriber in the order that it subscribed, and it waits for each call to return. Thus, when `ctx.produced` returns, each task that a subscriber added is already in the build. A subscriber must not return a promise: dapat does not wait for it.
+
+`subscribe` does not replay earlier events. Subscribe before `build.run()` to get all events. A subscriber that you add during a send gets the next event, not the current one.
 
 A task that skips sends no events ([section 12](#12-limits)).
 
-A listener can add tasks. This listener adds one task for each page from the `split` sample in section 5. Add it to that sample before `build.run()`:
+A subscriber can add tasks. This subscriber adds one task for each page from the `split` sample in section 5. Add it to that sample before `build.run()`:
 
 ```ts
-build.listen(new IdPrefix("map:pages/"), (event) => {
-  if (event.type !== "produced") return
-  const key = event.id.slice("map:".length)
+build.subscribe((event) => {
+  if (event.kind !== "produced") return
+  if (!event.artifact.id.startsWith("map:pages/")) return
+  const key = event.artifact.id.slice("map:".length)
   const page = new MapEntry(map, key)
   const shot = new MapEntry(map, key.replace("pages/", "shots/"))
   build.add(
@@ -493,10 +502,14 @@ const result = await build.run()
 // executed: split, shot:pages/1, shot:pages/2
 ```
 
-Handle errors inside the listener. dapat reports listener errors in different ways for different events:
+### Subscriber errors
 
-- **A declared output of a task that succeeded.** The task that wrote the output fails.
-- **`ctx.produced`, a retraction, or a replay from `listen`.** dapat does not wait for the listener. The error becomes an unhandled promise rejection.
+A subscriber that throws stops the send. The later subscribers do not get that event. dapat reports the error in one of these ways:
+
+- **The send comes from a running task.** This applies to `ctx.produced`, `ctx.add`, `ctx.remove`, and the events for the declared outputs after the task returns. The task fails, and the error goes into `result.failed`. In `ctx.produced`, `ctx.add`, and `ctx.remove`, the call throws the error, so the task can catch it and continue.
+- **No running task caused the send.** For example, you call `build.remove(id)` or replace a finished task with `build.add(task)` from outside a task, and a subscriber throws on the `retracted` event. `build.remove` and `build.add` do not throw. The error goes into `result.errors`, and `result.success` is `false`.
+
+dapat does not ignore a subscriber error.
 
 ## 10. Built-in artifacts
 
@@ -627,7 +640,7 @@ dapat then uses the content check, which does not depend on modification times. 
 
 ## 12. Limits
 
-- **A task that skips sends no events.** This applies to its prefix outputs and to its declared outputs. A `build.listen()` handler sees nothing from that task on the next build.
+- **A task that skips sends no events.** This applies to its prefix outputs and to its declared outputs. A subscriber sees nothing from that task on the next build.
 - **Order stamps have different units.** dapat compares the order stamps of all artifacts in one task as plain integers. `FileArtifact` and `DirectoryArtifact` use nanoseconds. `S3ObjectArtifact` uses milliseconds. `SqliteRowArtifact` uses `rowid` or your `orderColumn`. If one task has artifacts of two kinds, the order check gives wrong results. For example, an S3 input and a file output always look current. The content check comes first, so a persistent store decides correctly after the first successful run. On the first run, and each time the task has no store record, the order check decides.
 - **A prefix artifact input does not wait for a plain prefix output in a subfolder.** See [section 5](#how-dapat-finds-dependencies).
 - **`FileArtifact` stamp methods return `null` for all errors.** For example, a permission error on a file looks like a missing file. The task then runs again and does not fail. Check file permissions when a task always runs.
@@ -652,9 +665,9 @@ new Build(opts?: { store?: Store })
 | Member | Description |
 | --- | --- |
 | `add(task: Task): void` | Adds a task. If a task with the same id exists, replaces it (see [section 8](#replacement)). If `run()` has started, the task starts at once. Throws if another task already declares one of its exact outputs, or if the task declares one output twice. |
-| `remove(id: string): void` | Removes a task. Aborts it if it is running and retracts its announced artifacts. Starts to delete its store record, but does not wait for the delete. Does nothing if the id is not known. |
-| `listen(prefix: Prefix, fn: ArtifactListener): () => void` | Calls `fn` for each announced artifact that `prefix` covers. It first replays the artifacts that were already announced. Returns a function that removes the listener. |
-| `run(): Promise<Result>` | Starts every task and resolves when no task and no listener is in progress. Does not reject when a task fails. |
+| `remove(id: string): void` | Removes a task. Aborts it if it is running and retracts its produced artifacts. Starts to delete its store record, but does not wait for the delete. Does nothing if the id is not known. |
+| `subscribe(listener: (event: ArtifactEvent) => void): void` | From `Emitter`. Calls `listener` synchronously for each artifact event. Does not replay earlier events. See [section 9](#9-subscribe-to-artifact-events). |
+| `run(): Promise<Result>` | Starts every task and resolves when no task is running and no task is ready. Does not reject when a task fails. |
 
 ### `class Task`
 
@@ -691,7 +704,7 @@ The object that the build passes to `task.run`.
 | `signal: AbortSignal` | Aborted when the task is replaced or removed. |
 | `add(task: Task): void` | Same as `build.add`. |
 | `remove(id: string): void` | Same as `build.remove`. |
-| `produced(artifact: Artifact): void` | Announces an artifact to the listeners. Throws if no output of the task covers it. Does nothing if the task was replaced. |
+| `produced(artifact: Artifact): void` | Sends a `produced` event to each subscriber before it returns. Throws if no output of the task covers it, or if a subscriber throws. Does nothing if the task was replaced. |
 
 ### `type Ref`
 
@@ -767,11 +780,12 @@ Keeps records in a `Map`. The records are lost when the process ends. `MemorySto
 
 | Field | Type | Description |
 | --- | --- | --- |
-| `success` | `boolean` | `true` when no task failed. Cancelled tasks do not make it `false`. |
+| `success` | `boolean` | `true` when no task failed and `errors` is empty. Cancelled tasks do not make it `false`. |
 | `executed` | `readonly Task[]` | Tasks whose `run` completed. |
 | `skipped` | `readonly Task[]` | Tasks that the skip rules skipped. |
 | `failed` | `ReadonlyMap<Task, Error>` | Tasks that threw, whose producer failed, or that were in a deadlock. |
 | `cancelled` | `readonly Task[]` | Tasks that were replaced or removed before they completed. |
+| `errors` | `readonly Error[]` | Subscriber errors that no task owns, for example from a retraction that `build.remove` sent. |
 
 `Result` does not give the reason for a skip. The build keeps an `Outcome` for each task, but no public member returns it. See [section 6.1](#61-why-did-a-task-run-or-skip).
 
@@ -785,17 +799,24 @@ type Outcome =
   | { type: "cancelled"; reason: "replaced" | "removed" }
 ```
 
-### `type ArtifactEvent` and `type ArtifactListener`
+### `class Emitter<E>`
+
+| Member | Description |
+| --- | --- |
+| `subscribe(listener: (event: E) => void): void` | Adds a listener. Listeners get events in the order that they subscribed. |
+| `protected send(event: E): void` | Calls each listener synchronously, in order. If a listener throws, `send` stops and throws that error to its caller. |
+
+`Build` extends `Emitter<ArtifactEvent>`.
+
+### `type ArtifactEvent`
 
 ```ts
-type ArtifactEvent = {
-  type: "produced" | "retracted"
-  id: string      // artifact id
-  taskId: string  // task that announced or retracted it
-}
-
-type ArtifactListener = (event: ArtifactEvent) => void | Promise<void>
+type ArtifactEvent =
+  | { kind: "produced"; artifact: Artifact; taskId: string }
+  | { kind: "retracted"; artifact: Artifact; taskId: string }
 ```
+
+`taskId` is the task that produced the artifact.
 
 ## Filesystem (`dapat/contrib`)
 
