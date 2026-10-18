@@ -1,14 +1,20 @@
-import { hasAllVars, type Vars } from "./vars"
+// Not exported from index.ts yet. A file matcher will build on this.
 
-export type Part = { kind: "lit"; value: string } | { kind: "var"; name: string } | { kind: "star" }
+export type Vars = Record<string, string>
 
-export type Segment =
+type Part = { kind: "lit"; value: string } | { kind: "var"; name: string } | { kind: "star" }
+
+type Segment =
   | { kind: "lit"; value: string }
   | { kind: "star" }
   | { kind: "rest" }
   | { kind: "mix"; parts: Part[] }
 
-/** `/`-separated key template. Files add a filesystem root on top. */
+/**
+ * A `/`-separated template such as `content/<lang>/<slug>.md` or `notes/<topic>/*.md`.
+ * `<name>` binds a var, `*` matches within one segment, and `**` matches any number of segments.
+ * Keys are relative: a leading `/` is ignored, so a caller strips its root before it matches a key.
+ */
 export class KeyPattern {
   readonly template: string
   readonly varNames: readonly string[]
@@ -23,6 +29,7 @@ export class KeyPattern {
     this.hasGlob = meta.hasGlob
   }
 
+  /** Literal key up to the first var or glob. Always ends with `/` when non-empty. */
   staticPrefix(): string {
     const lit: string[] = []
     for (const segment of this.segments) {
@@ -34,7 +41,7 @@ export class KeyPattern {
   }
 
   match(key: string): Vars | null {
-    return matchSegments(this.segments, splitKey(key))
+    return matchSegments(this.segments, splitTemplate(key))
   }
 
   render(vars: Vars): string {
@@ -63,7 +70,7 @@ export class KeyPattern {
   }
 }
 
-export function splitTemplate(template: string): string[] {
+function splitTemplate(template: string): string[] {
   const parts = template.split("/")
   const out: string[] = []
   for (const part of parts) {
@@ -72,11 +79,7 @@ export function splitTemplate(template: string): string[] {
   return out
 }
 
-export function splitKey(key: string): string[] {
-  return splitTemplate(key)
-}
-
-export function parseSegment(raw: string): Segment {
+function parseSegment(raw: string): Segment {
   if (raw === "**") return { kind: "rest" }
   if (raw === "*") return { kind: "star" }
   const parts: Part[] = []
@@ -104,7 +107,7 @@ export function parseSegment(raw: string): Segment {
   return { kind: "mix", parts }
 }
 
-export function collectMeta(segments: Segment[]): {
+function collectMeta(segments: Segment[]): {
   varNames: string[]
   hasGlob: boolean
 } {
@@ -124,7 +127,7 @@ export function collectMeta(segments: Segment[]): {
   return { varNames: names, hasGlob: glob }
 }
 
-export function matchSegments(pat: Segment[], pathSegs: string[]): Vars | null {
+function matchSegments(pat: Segment[], pathSegs: string[]): Vars | null {
   return walk(0, 0, {})
 
   function walk(pi: number, sj: number, vars: Vars): Vars | null {
@@ -152,7 +155,7 @@ export function matchSegments(pat: Segment[], pathSegs: string[]): Vars | null {
   }
 }
 
-export function matchMix(parts: Part[], value: string, vars: Vars): Vars | null {
+function matchMix(parts: Part[], value: string, vars: Vars): Vars | null {
   let source = "^"
   const names: string[] = []
   for (const part of parts) {
@@ -181,7 +184,7 @@ export function matchMix(parts: Part[], value: string, vars: Vars): Vars | null 
   return out
 }
 
-export function boundPrefixSegments(segments: Segment[], vars: Vars): string[] {
+function boundPrefixSegments(segments: Segment[], vars: Vars): string[] {
   const lit: string[] = []
   for (const segment of segments) {
     if (segment.kind === "lit") {
@@ -206,7 +209,7 @@ export function boundPrefixSegments(segments: Segment[], vars: Vars): string[] {
   return lit
 }
 
-export function renderMix(parts: Part[], vars: Vars): string {
+function renderMix(parts: Part[], vars: Vars): string {
   let out = ""
   for (const part of parts) {
     if (part.kind === "lit") {
@@ -218,6 +221,13 @@ export function renderMix(parts: Part[], vars: Vars): string {
     }
   }
   return out
+}
+
+function hasAllVars(names: readonly string[], vars: Vars): boolean {
+  for (const name of names) {
+    if (vars[name] === undefined) return false
+  }
+  return true
 }
 
 function escapeRe(value: string): string {

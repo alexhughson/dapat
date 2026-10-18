@@ -10,15 +10,3 @@ export {
   sqliteTablePrefix,
 } from "./sqlite"
 export { MemoryStore, JsonStore, SqliteStore } from "./store"
-export { FileBuild, FilePattern, S3Pattern } from "./filebuild"
-export type {
-  FileContext,
-  FileInput,
-  FilePatternOpts,
-  FileRule,
-  Item,
-  ItemInput,
-  ItemPattern,
-  S3PatternOpts,
-  Vars,
-} from "./filebuild"
