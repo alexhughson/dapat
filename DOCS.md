@@ -361,7 +361,7 @@ Some results of these rules:
 - The task has inputs and no artifact outputs, and the store has matching content. The task skips by content. Without a matching record, it runs each time.
 - A list of inputs gains or loses an artifact. The task runs, because the set of ids changed.
 - You delete an output. The task runs.
-- A task deletes one of its declared artifact outputs and calls `ctx.deleted`. That output is then missing, so the task runs on each build. To delete an artifact and still skip, declare its folder as a prefix output.
+- A task deletes one of its declared artifact outputs and calls `ctx.deleted`. That output is then missing, so the task runs on each build. To delete an artifact and still skip, declare its folder as a prefix output. Call `ctx.deleted` on each run, also when the artifact is already gone. If you do not, dapat sends a `produced` event for the missing output after the task returns.
 
 After a task runs with no error, dapat stamps its artifact inputs and outputs again, and it writes those stamps to the store. It does not write stamps for a failed task, so a failed task runs again on the next build.
 
@@ -482,7 +482,7 @@ dapat sends a `promised` event for each declared output, an artifact or a prefix
 - at the start of the first `build.run()`, for each task that you added before it. dapat sends these events before any task starts. Thus a subscriber that you add after `build.add` and before `build.run()` gets them.
 - when you add a task after `build.run()` started, with `build.add`, `ctx.add`, or from a subscriber. dapat sends the events before `add` returns.
 
-A `promised` event means that the output will exist when the task finishes. Thus a subscriber knows about an output before any task runs.
+A `promised` event means that the output will exist when the task finishes, unless the task reports it with `ctx.deleted`. Thus a subscriber knows about an output before any task runs.
 
 dapat sends a `produced` event at these times:
 

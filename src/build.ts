@@ -62,7 +62,7 @@ export class Build extends Emitter<ArtifactEvent> {
 
     const slot = new Slot(task)
     if (existing) {
-      // A running task sees the new generation, so its later ctx.produced does nothing.
+      // A running task sees the new generation, so its later ctx.produced and ctx.deleted do nothing.
       existing.generation += 1
       this.unindex(existing.task)
       if (existing.phase === "pending") {
@@ -88,7 +88,7 @@ export class Build extends Emitter<ArtifactEvent> {
     const slot = this.slots.get(id)
     if (!slot) return
 
-    // A running task sees the new generation, so its later ctx.produced does nothing.
+    // A running task sees the new generation, so its later ctx.produced and ctx.deleted do nothing.
     slot.generation += 1
     this.unindex(slot.task)
     const wasRunning = slot.phase === "running"
