@@ -1,6 +1,6 @@
 import { Prefix } from "../../src/prefix"
 import type { S3Client } from "./client"
-import { sha256Hex } from "./hash"
+import { hashLines } from "../hash"
 
 export class S3Prefix extends Prefix {
   readonly id: string
@@ -19,20 +19,16 @@ export class S3Prefix extends Prefix {
   }
 
   /**
-   * The SHA-256 of the sorted lines `<key>=<etag>` for every key under the prefix.
-   * It lists the keys, then calls `head` for each key. An empty prefix has the stamp of an empty list.
+   * The SHA-256 of the sorted lines `<key>=<etag>` for every key under the prefix,
+   * from one `list` call. An empty prefix has the stamp of an empty list.
    */
   async stamp(): Promise<string | null> {
-    const keys = await this.client.list(this.bucket, this.listPrefix)
+    const entries = await this.client.list(this.bucket, this.listPrefix)
     const lines: string[] = []
-    for (const key of keys) {
-      const head = await this.client.head(this.bucket, key)
-      // A key that went away after the list is not under the prefix now.
-      if (head === null) continue
-      lines.push(`${key}=${head.etag}`)
+    for (const entry of entries) {
+      lines.push(`${entry.key}=${entry.etag}`)
     }
-    lines.sort()
-    return sha256Hex(new TextEncoder().encode(lines.join("\n")))
+    return hashLines(lines)
   }
 }
 

@@ -193,6 +193,8 @@ describe("sqlite row artifacts", () => {
     const root = await tempDir()
     const dbPath = path.join(root, "notes.sqlite")
     const db = openNotes(dbPath)
+    // The copy goes to its own table. A prefix output must not cover the output of another task.
+    db.run(`CREATE TABLE copies (id TEXT PRIMARY KEY, body TEXT NOT NULL, rev INTEGER NOT NULL)`)
     const executed: string[] = []
 
     const row = new SqliteRowArtifact({
@@ -210,7 +212,7 @@ describe("sqlite row artifacts", () => {
         outputs: [
           new SqliteRowArtifact({
             db,
-            table: "notes",
+            table: "copies",
             pkColumn: "id",
             pk: "copy",
           }),
@@ -218,7 +220,7 @@ describe("sqlite row artifacts", () => {
         run: async () => {
           executed.push("consume")
           const src = await row.read()
-          db.run(`INSERT INTO notes (id, body, rev) VALUES ('copy', ?, 1)`, [
+          db.run(`INSERT INTO copies (id, body, rev) VALUES ('copy', ?, 1)`, [
             String(src.body),
           ])
         },

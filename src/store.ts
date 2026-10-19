@@ -1,14 +1,11 @@
 /**
- * The stamps of the last successful run of a task. The artifact maps are keyed by
- * artifact id, and null means the artifact did not exist. The prefix maps are keyed
- * by prefix id, and null means the prefix could not tell what was under it.
- * Separate maps keep a prefix and an artifact with the same id apart.
+ * The stamps of the last successful run of a task. Each key is "artifact <id>" or
+ * "prefix <id>", so a prefix and an artifact with the same id cannot collide.
+ * For an artifact, null means it did not exist. A prefix with a null stamp is left out.
  */
 export interface TaskState {
   inputStamps: Record<string, string | null>
   outputStamps: Record<string, string | null>
-  inputPrefixStamps: Record<string, string | null>
-  outputPrefixStamps: Record<string, string | null>
 }
 
 export interface Store {

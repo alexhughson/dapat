@@ -103,7 +103,11 @@ describe("S3 artifacts", () => {
           outputs: [index],
           run: async () => {
             runs += 1
-            const keys = await s3.list("bucket", "pages/")
+            const entries = await s3.list("bucket", "pages/")
+            const keys: string[] = []
+            for (const entry of entries) {
+              keys.push(entry.key)
+            }
             await s3.put("bucket", "index.html", encode(keys.join(",")))
           },
         }),

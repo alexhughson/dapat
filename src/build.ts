@@ -317,6 +317,48 @@ export class Build extends Emitter<ArtifactEvent> {
           )
         }
       }
+      assertInputsApart(task)
+    }
+    this.assertPrefixOutputsApart(owner, tasks)
+  }
+
+  /**
+   * Throws if a prefix output in `tasks` covers or overlaps an output of another task.
+   * Each writer records a stamp of the whole prefix, so each run of one writer would
+   * change the record of the other, and both would run on every build.
+   */
+  private assertPrefixOutputsApart(owner: string, tasks: readonly Task[]): void {
+    const given: OutputEntry[] = []
+    for (const task of tasks) {
+      for (const output of task.outputs) {
+        given.push({ output, taskId: task.id })
+      }
+    }
+    // The tasks of this owner are all replaced or removed, so only other owners count.
+    const otherPrefixes: OutputEntry[] = []
+    for (const entry of this.prefixOutputs) {
+      if (this.slots.get(entry.taskId)!.owner === owner) continue
+      otherPrefixes.push({ output: entry.prefix, taskId: entry.taskId })
+    }
+    const otherExact: OutputEntry[] = []
+    for (const entry of this.exactOutputs.values()) {
+      if (this.slots.get(entry.taskId)!.owner === owner) continue
+      otherExact.push({ output: entry.artifact, taskId: entry.taskId })
+    }
+
+    for (let i = 0; i < given.length; i++) {
+      const entry = given[i]!
+      for (let j = i + 1; j < given.length; j++) {
+        assertOutputsApart(entry, given[j]!)
+      }
+      for (const other of otherPrefixes) {
+        assertOutputsApart(entry, other)
+      }
+      // Two exact outputs cannot clash here; the duplicate check above handles them.
+      if (!isPrefix(entry.output)) continue
+      for (const other of otherExact) {
+        assertOutputsApart(entry, other)
+      }
     }
   }
 
@@ -462,7 +504,7 @@ export class Build extends Emitter<ArtifactEvent> {
     // The input stamps from before the run. The record keeps these, so an input
     // that changes during the run makes the next build run the task again.
     // The wait above already gave the producers under each prefix input time to finish.
-    let inputStamps: RefStamps | null = null
+    let inputStamps: StampMap | null = null
     let skip = false
     try {
       if (this.store) {
@@ -589,7 +631,7 @@ export class Build extends Emitter<ArtifactEvent> {
   private async recordSuccess(
     slot: Slot,
     generation: number,
-    inputStamps: RefStamps | null,
+    inputStamps: StampMap | null,
   ): Promise<void> {
     for (const output of slot.task.outputs) {
       // A subscriber can remove or replace this task. Then it sends no more events.
@@ -611,12 +653,7 @@ export class Build extends Emitter<ArtifactEvent> {
     if (generation !== slot.generation) return
     // A fatal error can come during the stamp reads above.
     if (this.fatal !== null) return
-    const state: TaskState = {
-      inputStamps: inputStamps.artifacts,
-      outputStamps: outputStamps.artifacts,
-      inputPrefixStamps: inputStamps.prefixes,
-      outputPrefixStamps: outputStamps.prefixes,
-    }
+    const state: TaskState = { inputStamps, outputStamps }
     await this.store.set(slot.task.id, state)
   }
 
@@ -627,53 +664,50 @@ export class Build extends Emitter<ArtifactEvent> {
   protected override rejected(): void {}
 
   /**
-   * True when the task has an input or output, the store has a record with the same ids,
-   * no output and no prefix has a null stamp, and every stamp equals the record.
-   * `inputStamps` are the current input stamps.
+   * True when the task has an input, every prefix has a stamp, every output exists,
+   * and the stamps and ids equal the record. `inputStamps` are the current input stamps.
    */
-  private async canSkip(store: Store, task: Task, inputStamps: RefStamps): Promise<boolean> {
-    // With no refs, a record cannot show that the task is current.
-    if (task.inputs.length === 0 && task.outputs.length === 0) return false
-    // A prefix with a null stamp cannot tell what is under it, so it cannot show that the task is current.
-    if (hasNull(inputStamps.prefixes)) return false
+  private async canSkip(store: Store, task: Task, inputStamps: StampMap): Promise<boolean> {
+    // With no input, nothing can show that the result is still current.
+    if (task.inputs.length === 0) return false
+    // stampRefs leaves out a prefix with a null stamp. That prefix cannot tell what is under it.
+    for (const input of task.inputs) {
+      if (!Object.hasOwn(inputStamps, refKey(input))) return false
+    }
     const record = await store.get(task.id)
     if (!record) return false
-    // A record from an older version of dapat has a different shape, or no prefix stamps.
-    // It counts as no record.
+    // A record from an older version of dapat has a different shape. It counts as no record.
     if (!isStampMap(record.inputStamps)) return false
     if (!isStampMap(record.outputStamps)) return false
-    if (!isStampMap(record.inputPrefixStamps)) return false
-    if (!isStampMap(record.outputPrefixStamps)) return false
-    if (!sameStamps(record.inputStamps, inputStamps.artifacts)) return false
-    if (!sameStamps(record.inputPrefixStamps, inputStamps.prefixes)) return false
+    if (!sameStamps(record.inputStamps, inputStamps)) return false
 
-    const outputArtifacts: Ref[] = []
-    const outputPrefixes: Ref[] = []
+    const outputStamps = newStampMap()
     for (const output of task.outputs) {
-      if (isArtifact(output)) {
-        outputArtifacts.push(output)
-      } else {
-        outputPrefixes.push(output)
-      }
+      const stamp = await output.stamp()
+      if (stamp === null) return false
+      const key = refKey(output)
+      if (!Object.hasOwn(record.outputStamps, key)) return false
+      if (record.outputStamps[key] !== stamp) return false
+      outputStamps[key] = stamp
     }
-    if (!(await outputsMatch(outputArtifacts, record.outputStamps))) return false
-    if (!(await outputsMatch(outputPrefixes, record.outputPrefixStamps))) return false
+    const recordedCount = Object.keys(record.outputStamps).length
+    const currentCount = Object.keys(outputStamps).length
+    if (recordedCount !== currentCount) return false
     return true
   }
 
-  /** The stamps of `refs`, with the artifact stamps and the prefix stamps in separate maps. */
-  private async stampRefs(refs: readonly Ref[]): Promise<RefStamps> {
-    const artifacts = newStampMap()
-    const prefixes = newStampMap()
+  /**
+   * The stamps of `refs`, keyed by refKey. A prefix with a null stamp is left out:
+   * the record never holds it, and the task always runs.
+   */
+  private async stampRefs(refs: readonly Ref[]): Promise<StampMap> {
+    const result = newStampMap()
     for (const ref of refs) {
       const stamp = await ref.stamp()
-      if (isArtifact(ref)) {
-        artifacts[ref.id] = stamp
-      } else {
-        prefixes[ref.id] = stamp
-      }
+      if (stamp === null && isPrefix(ref)) continue
+      result[refKey(ref)] = stamp
     }
-    return { artifacts, prefixes }
+    return result
   }
 
   private finish(slot: Slot, outcome: Outcome): void {
@@ -727,11 +761,11 @@ export class Build extends Emitter<ArtifactEvent> {
   }
 }
 
-/** Stamps keyed by artifact id or by prefix id. */
+/** Stamps keyed by refKey, so a prefix and an artifact with the same id cannot collide. */
 type StampMap = Record<string, string | null>
 
-/** The stamps of a list of refs. Artifacts and prefixes are apart, so equal ids cannot collide. */
-type RefStamps = { artifacts: StampMap; prefixes: StampMap }
+/** An output and the task that declares it. */
+type OutputEntry = { output: Ref; taskId: string }
 
 /** An empty stamp map with no prototype, so that an id such as "__proto__" is a plain key. */
 function newStampMap(): StampMap {
@@ -750,31 +784,48 @@ function sameStamps(recorded: StampMap, current: StampMap): boolean {
   return true
 }
 
-/** True when any stamp in the map is null. */
-function hasNull(stamps: StampMap): boolean {
-  for (const stamp of Object.values(stamps)) {
-    if (stamp === null) return true
+/**
+ * Throws if a prefix input of `task` covers or overlaps an output of the same task.
+ * The task would change its own input, and run on every build.
+ */
+function assertInputsApart(task: Task): void {
+  for (const input of task.inputs) {
+    if (!isPrefix(input)) continue
+    for (const output of task.outputs) {
+      let clash = false
+      if (isPrefix(output)) {
+        clash = input.overlaps(output)
+      } else {
+        clash = input.covers(output)
+      }
+      if (!clash) continue
+      throw new Error(
+        `task '${task.id}' has the prefix input '${input.id}', which covers its own output ` +
+          `'${output.id}'; the task would change its own input and run on every build. ` +
+          `Put the output outside the input prefix, for example index.html next to pages/, not in it`,
+      )
+    }
   }
-  return false
 }
 
-/**
- * True when each output in `outputs` has a stamp that is not null and equals
- * its stamp in `recorded`, and `recorded` has no other ids.
- */
-async function outputsMatch(outputs: readonly Ref[], recorded: StampMap): Promise<boolean> {
-  const current = newStampMap()
-  for (const output of outputs) {
-    const stamp = await output.stamp()
-    if (stamp === null) return false
-    if (!Object.hasOwn(recorded, output.id)) return false
-    if (recorded[output.id] !== stamp) return false
-    current[output.id] = stamp
+/** Throws if `a` and `b` belong to different tasks, one is a prefix, and it covers or overlaps the other. */
+function assertOutputsApart(a: OutputEntry, b: OutputEntry): void {
+  if (a.taskId === b.taskId) return
+  let clash = false
+  if (isPrefix(a.output) && isPrefix(b.output)) {
+    clash = a.output.overlaps(b.output)
+  } else if (isPrefix(a.output) && isArtifact(b.output)) {
+    clash = a.output.covers(b.output)
+  } else if (isArtifact(a.output) && isPrefix(b.output)) {
+    clash = b.output.covers(a.output)
   }
-  const recordedCount = Object.keys(recorded).length
-  const currentCount = Object.keys(current).length
-  if (recordedCount !== currentCount) return false
-  return true
+  if (!clash) return
+  throw new Error(
+    `output '${a.output.id}' of task '${a.taskId}' overlaps output '${b.output.id}' of task ` +
+      `'${b.taskId}'; each writer of a prefix records a stamp of the whole prefix, so both ` +
+      `tasks would run on every build. Give each writer its own folder, for example out/pages/ ` +
+      `and out/index/, or put the file outside the prefix`,
+  )
 }
 
 /** True when each value is a string or null. A stamp map from an older record is not. */

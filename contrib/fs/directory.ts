@@ -23,7 +23,10 @@ export class DirectoryArtifact extends Artifact<string[]> {
     return other.id.startsWith(this.id)
   }
 
-  /** The SHA-256 of the sorted lines `<relative path>=<file stamp>`. null when the directory is missing. */
+  /**
+   * The SHA-256 of the sorted lines `<relative path>=<file stamp>`. null when the directory is missing.
+   * Throws when the path is a file, not a folder, and for every other error.
+   */
   async stamp(): Promise<string | null> {
     return stampTree(this.path, this.stampMode)
   }

@@ -107,10 +107,8 @@ describe("filesystem artifacts", () => {
     expect(first.executed.length).toBe(1)
     const written = await Bun.file(statePath).json()
     expect(written.tasks.copy).toEqual({
-      inputStamps: { [src.id]: await src.stamp() },
-      outputStamps: { [out.id]: await out.stamp() },
-      inputPrefixStamps: {},
-      outputPrefixStamps: {},
+      inputStamps: { [`artifact ${src.id}`]: await src.stamp() },
+      outputStamps: { [`artifact ${out.id}`]: await out.stamp() },
     })
 
     const second = await runOnce()
@@ -124,6 +122,9 @@ describe("filesystem artifacts", () => {
     const zipPath = path.join(root, "bundle.txt")
     await mkdir(outDir, { recursive: true })
 
+    // A task with no input always runs, so each writer reads a seed file.
+    const seedPath = path.join(root, "seed.txt")
+    await writeFile(seedPath, "seed")
     const store = new SqliteStore(path.join(root, "state.sqlite"))
     let writes = 0
     let zips = 0
@@ -137,6 +138,7 @@ describe("filesystem artifacts", () => {
       build.add(
         new Task({
           id: "write-foo",
+          inputs: [new FileArtifact(seedPath)],
           outputs: [foo],
           run: async () => {
             writes += 1
@@ -147,6 +149,7 @@ describe("filesystem artifacts", () => {
       build.add(
         new Task({
           id: "write-bar",
+          inputs: [new FileArtifact(seedPath)],
           outputs: [bar],
           run: async () => {
             writes += 1

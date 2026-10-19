@@ -1144,10 +1144,8 @@ describe("the skip rule", () => {
     const first = await runOnce(compile([src], out, runs), store)
     expect(first.executed).toEqual(["compile"])
     expect(await store.get("compile")).toEqual({
-      inputStamps: { "mem:src": "a" },
-      outputStamps: { "mem:out": "obj" },
-      inputPrefixStamps: {},
-      outputPrefixStamps: {},
+      inputStamps: { "artifact mem:src": "a" },
+      outputStamps: { "artifact mem:out": "obj" },
     })
   })
 
@@ -1225,10 +1223,8 @@ describe("the skip rule", () => {
 
     await runOnce(compile([optional], out, runs), store)
     expect(await store.get("compile")).toEqual({
-      inputStamps: { "mem:optional": null },
-      outputStamps: { "mem:out": "obj" },
-      inputPrefixStamps: {},
-      outputPrefixStamps: {},
+      inputStamps: { "artifact mem:optional": null },
+      outputStamps: { "artifact mem:out": "obj" },
     })
     const second = await runOnce(compile([optional], out, runs), store)
     expect(second.skipped).toEqual(["compile"])
@@ -1249,10 +1245,8 @@ describe("the skip rule", () => {
     const first = await runOnce(compile([src], out, runs), store)
     expect(first.executed).toEqual(["compile"])
     expect(await store.get("compile")).toEqual({
-      inputStamps: { "mem:src": "a" },
-      outputStamps: { "mem:out": "obj" },
-      inputPrefixStamps: {},
-      outputPrefixStamps: {},
+      inputStamps: { "artifact mem:src": "a" },
+      outputStamps: { "artifact mem:out": "obj" },
     })
     const second = await runOnce(compile([src], out, runs), store)
     expect(second.skipped).toEqual(["compile"])
@@ -1333,7 +1327,7 @@ describe("the skip rule", () => {
     await runOnce(make(), store)
     expect(out.value).toBe("compiled a")
     const record = await store.get("compile")
-    expect(record?.inputStamps["mem:src"]).toBe("a")
+    expect(record?.inputStamps["artifact mem:src"]).toBe("a")
 
     const second = await runOnce(make(), store)
     expect(second.executed).toEqual(["compile"])
@@ -1414,7 +1408,7 @@ describe("the skip rule", () => {
 
     await runOnce(compile([src], out, runs), store)
     const record = await store.get("compile")
-    expect(Object.keys(record?.inputStamps ?? {})).toEqual(["__proto__"])
+    expect(Object.keys(record?.inputStamps ?? {})).toEqual(["artifact __proto__"])
     const second = await runOnce(compile([src], out, runs), store)
     expect(second.skipped).toEqual(["compile"])
     src.write("b")
@@ -2269,10 +2263,8 @@ describe("deleted events", () => {
     expect(runs.toSorted()).toEqual(["clean-dir", "clean-out"])
     // The record keeps null for the deleted output.
     expect(await store.get("clean-out")).toEqual({
-      inputStamps: { "mem:src": "a" },
-      outputStamps: { "mem:out": null },
-      inputPrefixStamps: {},
-      outputPrefixStamps: {},
+      inputStamps: { "artifact mem:src": "a" },
+      outputStamps: { "artifact mem:out": null },
     })
 
     const second = new Build({ store })
