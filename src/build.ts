@@ -6,8 +6,9 @@ import type { Stamp, Store, TaskState } from "./store"
 import { Outcome, Result } from "./result"
 
 export type ArtifactEvent =
+  | { kind: "promised"; output: Ref; taskId: string }
   | { kind: "produced"; artifact: Artifact; taskId: string }
-  | { kind: "retracted"; artifact: Artifact; taskId: string }
+  | { kind: "withdrawn"; output: Ref; taskId: string }
 
 type Phase = "pending" | "running" | "completed"
 
@@ -18,8 +19,6 @@ class Slot {
   launched = 0
   phase: Phase = "pending"
   abort: AbortController | null = null
-  // The artifacts this task owns, by id. Remove and replace retract them.
-  produced = new Map<string, Artifact>()
   // The ids that this run reported with ctx.produced.
   reported = new Set<string>()
   outcome: Outcome | null = null
@@ -36,6 +35,10 @@ export class Build extends Emitter<ArtifactEvent> {
   private readonly prefixOutputs: { prefix: Prefix; taskId: string }[] = []
   private readonly outcomes = new Map<Task, Outcome>()
   private readonly errors: Error[] = []
+  // For each task id, the outputs that subscribers were last told about, by refKey.
+  // After a top-level add, remove, or run() returns, each entry equals the
+  // current outputs of that task id, or is gone when no task has that id.
+  private readonly told = new Map<string, Map<string, Ref>>()
 
   private started = false
   private runningCount = 0
@@ -57,12 +60,10 @@ export class Build extends Emitter<ArtifactEvent> {
     this.assertAddable(task, existing ? task.id : null)
 
     const slot = new Slot(task)
-    let retractions: ArtifactEvent[] = []
     if (existing) {
       // A running task sees the new generation, so its later ctx.produced does nothing.
       existing.generation += 1
       this.unindex(existing.task)
-      retractions = this.release(existing, slot)
       if (existing.phase === "pending") {
         this.finish(existing, { type: "cancelled", reason: "replaced" })
       }
@@ -79,7 +80,7 @@ export class Build extends Emitter<ArtifactEvent> {
       this.kick(slot)
     }
     this.wake()
-    this.sendAll(retractions)
+    this.tell(task.id)
   }
 
   remove(id: string): void {
@@ -90,7 +91,6 @@ export class Build extends Emitter<ArtifactEvent> {
     slot.generation += 1
     this.unindex(slot.task)
     const wasRunning = slot.phase === "running"
-    const retractions = this.release(slot, null)
     this.slots.delete(id)
     if (this.store) {
       void this.store.delete(id)
@@ -103,16 +103,76 @@ export class Build extends Emitter<ArtifactEvent> {
       slot.abort.abort()
     }
     this.wake()
-    this.sendAll(retractions)
+    this.tell(id)
   }
 
   async run(): Promise<Result> {
-    this.started = true
+    if (!this.started) {
+      this.started = true
+      // Tells subscribers about the tasks that were added before the first run().
+      const ids = [...this.slots.keys()]
+      for (const id of ids) {
+        this.tell(id)
+      }
+    }
     for (const slot of this.slots.values()) {
       this.kick(slot)
     }
     await this.idle()
     return new Result(this.outcomes, this.errors)
+  }
+
+  /**
+   * Sends withdrawn and promised events until the subscribers know the current
+   * outputs of task `id`. Before the first run(), it sends nothing.
+   */
+  private tell(id: string): void {
+    if (!this.started) return
+    this.sendAll(this.outputChanges(id))
+  }
+
+  /**
+   * Yields one event at a time. Each event comes from the state at the time
+   * that sendAll asks for it, so a subscriber that changes the task during a
+   * send never gets a stale event.
+   */
+  private *outputChanges(id: string): Generator<ArtifactEvent> {
+    while (true) {
+      const event = this.nextOutputChange(id)
+      if (event === null) return
+      yield event
+    }
+  }
+
+  /** Updates `told` by one output, and returns the event for it. Withdrawn comes first. */
+  private nextOutputChange(id: string): ArtifactEvent | null {
+    let told = this.told.get(id)
+    if (told === undefined) {
+      told = new Map<string, Ref>()
+      this.told.set(id, told)
+    }
+    const current = new Map<string, Ref>()
+    const slot = this.slots.get(id)
+    if (slot !== undefined) {
+      for (const output of slot.task.outputs) {
+        current.set(refKey(output), output)
+      }
+    }
+
+    for (const [key, output] of told) {
+      if (current.has(key)) continue
+      told.delete(key)
+      return { kind: "withdrawn", output, taskId: id }
+    }
+    for (const [key, output] of current) {
+      if (told.has(key)) continue
+      told.set(key, output)
+      return { kind: "promised", output, taskId: id }
+    }
+    if (told.size === 0) {
+      this.told.delete(id)
+    }
+    return null
   }
 
   private assertAddable(task: Task, replacingId: string | null): void {
@@ -313,7 +373,7 @@ export class Build extends Emitter<ArtifactEvent> {
 
   /**
    * Ends a task that `remove` or `add` stopped while it ran. They already sent
-   * its retractions. Returns false when the task is still current.
+   * its withdrawn events. Returns false when the task is still current.
    */
   private endIfStopped(slot: Slot, generation: number): boolean {
     if (generation === slot.generation) return false
@@ -374,7 +434,6 @@ export class Build extends Emitter<ArtifactEvent> {
       )
     }
     slot.reported.add(artifact.id)
-    slot.produced.set(artifact.id, artifact)
     this.sendAll([{ kind: "produced", artifact, taskId: slot.task.id }])
   }
 
@@ -388,11 +447,10 @@ export class Build extends Emitter<ArtifactEvent> {
 
   private async recordSuccess(slot: Slot, generation: number): Promise<void> {
     for (const output of slot.task.outputs) {
-      // A subscriber can remove or replace this task. Then it owns no more artifacts.
+      // A subscriber can remove or replace this task. Then it sends no more events.
       if (generation !== slot.generation) return
       if (!isArtifact(output)) continue
       if (slot.reported.has(output.id)) continue
-      slot.produced.set(output.id, output)
       const event: ArtifactEvent = { kind: "produced", artifact: output, taskId: slot.task.id }
       try {
         this.asTask(slot, () => this.sendAll([event]))
@@ -431,7 +489,7 @@ export class Build extends Emitter<ArtifactEvent> {
    * each error goes to that task, and the first one is thrown after the loop.
    * Without one, each error goes to `errors`.
    */
-  private sendAll(events: readonly ArtifactEvent[]): void {
+  private sendAll(events: Iterable<ArtifactEvent>): void {
     const slot = this.caller
     let first: Error | null = null
     for (const event of events) {
@@ -467,29 +525,6 @@ export class Build extends Emitter<ArtifactEvent> {
   private addError(error: Error): void {
     if (this.errors.includes(error)) return
     this.errors.push(error)
-  }
-
-  /**
-   * Empties `slot.produced` and returns a retraction for each artifact.
-   * An artifact that `keep` also declares moves to `keep`, so `keep` retracts it later.
-   */
-  private release(slot: Slot, keep: Slot | null): ArtifactEvent[] {
-    const declared = new Set<string>()
-    if (keep !== null) {
-      for (const output of keep.task.outputs) {
-        if (isArtifact(output)) declared.add(output.id)
-      }
-    }
-    const events: ArtifactEvent[] = []
-    for (const artifact of slot.produced.values()) {
-      if (keep !== null && declared.has(artifact.id)) {
-        keep.produced.set(artifact.id, artifact)
-      } else {
-        events.push({ kind: "retracted", artifact, taskId: slot.task.id })
-      }
-    }
-    slot.produced = new Map()
-    return events
   }
 
   /** Errors that reach the build after the send returned, such as an async subscriber's rejection. */
@@ -656,6 +691,12 @@ function ordersFresh(
   if (minOutput === null) return false
   if (maxInput === null) return true
   return maxInput <= minOutput
+}
+
+/** An artifact and a prefix with the same id are different outputs. */
+function refKey(ref: Ref): string {
+  if (isPrefix(ref)) return `prefix ${ref.id}`
+  return `artifact ${ref.id}`
 }
 
 function toError(value: unknown): Error {
