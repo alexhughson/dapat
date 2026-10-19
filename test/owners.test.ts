@@ -196,11 +196,85 @@ describe("task owners", () => {
     expect(log).toEqual(["withdrawn mem:a by t1", "promised mem:a by t1"])
   })
 
-  test("setTasks from a subscriber during ctx.produced fails the task that produced", async () => {
+  test("an output that moves from one task to another in one call is withdrawn before it is promised", async () => {
+    const o = new Mem("mem:o")
+    const log: string[] = []
+    const build = new OwnerBuild()
+    build.subscribe((event) => {
+      if (event.kind === "produced") return
+      log.push(line(event))
+    })
+    build.give("x", [writer("from", [o])])
+    const first = await build.run()
+    expect(ids(first.executed)).toEqual(["from"])
+    log.length = 0
+
+    // "to" comes first in the list, and still its promised event comes last.
+    build.give("x", [writer("to", [o]), writer("from", [])])
+    expect(log).toEqual(["withdrawn mem:o by from", "promised mem:o by to"])
+    // The output is gone, so "to" cannot skip.
+    o.value = null
+    const second = await build.run()
+    expect(ids(second.executed).sort()).toEqual(["from", "from", "to"])
+  })
+
+  test("two kept tasks that swap outputs get every withdrawn event first", async () => {
+    const a = new Mem("mem:a")
+    const b = new Mem("mem:b")
+    const log: string[] = []
+    const build = new OwnerBuild()
+    build.subscribe((event) => {
+      if (event.kind === "produced") return
+      log.push(line(event))
+    })
+    build.give("x", [writer("A", [a]), writer("B", [b])])
+    await build.run()
+    log.length = 0
+
+    build.give("x", [writer("A", [b]), writer("B", [a])])
+    expect(log).toEqual([
+      "withdrawn mem:a by A",
+      "withdrawn mem:b by B",
+      "promised mem:b by A",
+      "promised mem:a by B",
+    ])
+  })
+
+  test("an owner can hand an output to a new task, and a reader waits for the new task", async () => {
+    const o = new Mem("mem:o")
+    let seen = ""
+    const build = new OwnerBuild()
+    build.give("x", [writer("a", [o])])
+    build.give("x", [
+      new Task({
+        id: "b",
+        outputs: [o],
+        run: async () => {
+          await new Promise((resolve) => setTimeout(resolve, 10))
+          o.write("from b", 1n, "b")
+        },
+      }),
+    ])
+    build.add(
+      new Task({
+        id: "reader",
+        inputs: [o],
+        run: async () => {
+          seen = await o.read()
+        },
+      }),
+    )
+
+    const result = await build.run()
+    expect(result.success).toBe(true)
+    expect(seen).toBe("from b")
+    expect(ids(result.cancelled)).toEqual(["a"])
+  })
+
+  test("setTasks from a subscriber during ctx.produced adds tasks that run", async () => {
     const page = new Mem("mem:p/1")
     const shotA = new Mem("mem:shot/a")
     const shotB = new Mem("mem:shot/b")
-    let producedMessage = ""
     const build = new OwnerBuild()
     // This subscriber stands for a rule that makes tasks for each page.
     build.subscribe((event) => {
@@ -208,35 +282,18 @@ describe("task owners", () => {
       if (event.artifact.id !== "mem:p/1") return
       build.give("1:p/1", [writer("shot-a", [shotA]), writer("shot-b", [shotB])])
     })
-    build.subscribe((event) => {
-      if (event.kind !== "promised") return
-      if (!event.output.id.startsWith("mem:shot/")) return
-      throw new Error(`promise broke on ${event.output.id}`)
-    })
     build.add(
       new Task({
         id: "split",
         outputs: [new IdPrefix("mem:p/")],
         run: async (ctx) => {
-          try {
-            ctx.produced(page)
-          } catch (error) {
-            producedMessage = String(error)
-          }
+          ctx.produced(page)
         },
       }),
     )
 
     const result = await build.run()
-    expect(producedMessage).toBe("Error: promise broke on mem:shot/a")
-    const failed: Record<string, string> = {}
-    for (const [task, error] of result.failed) {
-      failed[task.id] = error.message
-    }
-    // The first error fails the task that caused the send. The second has no other owner.
-    expect(failed).toEqual({ split: "promise broke on mem:shot/a" })
-    expect(result.errors.map((error) => error.message)).toEqual(["promise broke on mem:shot/b"])
-    // The tasks are in the build even though a subscriber threw.
-    expect(ids(result.executed).sort()).toEqual(["shot-a", "shot-b"])
+    expect(result.success).toBe(true)
+    expect(ids(result.executed).sort()).toEqual(["shot-a", "shot-b", "split"])
   })
 })

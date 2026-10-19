@@ -99,7 +99,8 @@ export class Build extends Emitter<ArtifactEvent> {
    */
   private change(owner: string, tasks: readonly Task[], dropped: readonly Slot[]): void {
     const replaced: Slot[] = []
-    // A stopped task sees the new generation, so its later ctx.produced and ctx.deleted do nothing.
+    // In both loops below, a stopped task sees the new generation, so its later
+    // ctx.produced and ctx.deleted do nothing.
     for (const slot of dropped) {
       slot.generation += 1
       this.unindex(slot.task)
@@ -143,7 +144,8 @@ export class Build extends Emitter<ArtifactEvent> {
     }
     for (const slot of replaced) {
       if (slot.phase === "running") running.push(slot)
-      // A running task that is replaced ends as cancelled when its run returns (endIfStopped).
+      // A replaced running task ends as cancelled "replaced" when its run returns (endIfStopped).
+      // A dropped running task got cancelled "removed" at once, in the loop above.
       if (slot.phase === "pending") {
         this.finish(slot, { type: "cancelled", reason: "replaced" })
       }
@@ -191,17 +193,26 @@ export class Build extends Emitter<ArtifactEvent> {
    * send never gets a stale event.
    */
   private *outputChanges(ids: readonly string[]): Generator<ArtifactEvent> {
+    // The first pass sends only withdrawn events. Thus an output that moves from one
+    // task to another in one call is withdrawn before it is promised again.
     for (const id of ids) {
-      let event = this.nextOutputChange(id)
+      let event = this.nextOutputChange(id, true)
       while (event !== null) {
         yield event
-        event = this.nextOutputChange(id)
+        event = this.nextOutputChange(id, true)
+      }
+    }
+    for (const id of ids) {
+      let event = this.nextOutputChange(id, false)
+      while (event !== null) {
+        yield event
+        event = this.nextOutputChange(id, false)
       }
     }
   }
 
   /** Updates `told` by one output, and returns the event for it. Withdrawn comes first. */
-  private nextOutputChange(id: string): ArtifactEvent | null {
+  private nextOutputChange(id: string, withdrawnOnly: boolean): ArtifactEvent | null {
     let told = this.told.get(id)
     if (told === undefined) {
       told = new Map<string, Ref>()
@@ -220,6 +231,7 @@ export class Build extends Emitter<ArtifactEvent> {
       told.delete(key)
       return { kind: "withdrawn", output, taskId: id }
     }
+    if (withdrawnOnly) return null
     for (const [key, output] of current) {
       if (told.has(key)) continue
       told.set(key, output)
@@ -450,7 +462,7 @@ export class Build extends Emitter<ArtifactEvent> {
   }
 
   /**
-   * Ends a task that `remove` or `add` stopped while it ran. They already sent
+   * Ends a task that `setTasks`, `add`, or `remove` stopped while it ran. They already sent
    * its withdrawn events. Returns false when the task is still current.
    */
   private endIfStopped(slot: Slot, generation: number): boolean {
