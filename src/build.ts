@@ -64,7 +64,7 @@ export class Build extends Emitter<ArtifactEvent> {
     this.store = opts?.store
     const sendLimit = opts?.sendLimit ?? SEND_LIMIT
     if (!Number.isInteger(sendLimit) || sendLimit < 1) {
-      throw new Error(`sendLimit must be a positive integer, not ${sendLimit}`)
+      throw new Error(`sendLimit must be a positive integer, not ${JSON.stringify(sendLimit)}`)
     }
     this.sendLimit = sendLimit
   }
@@ -174,6 +174,7 @@ export class Build extends Emitter<ArtifactEvent> {
     for (const slot of running) {
       if (slot.abort) slot.abort.abort()
     }
+    this.wake()
     this.drain()
   }
 
@@ -225,8 +226,7 @@ export class Build extends Emitter<ArtifactEvent> {
   /**
    * Sends the queue, one event at a time to every subscriber, until it is empty.
    * A subscriber that changes tasks during a send only pushes events, and this drain
-   * sends them after the current event reached every subscriber. When the outermost
-   * drain ends, the build wakes the tasks, so new tasks start after the whole cascade.
+   * sends them after the current event reached every subscriber.
    */
   private drain(): void {
     if (this.draining) return
@@ -236,7 +236,6 @@ export class Build extends Emitter<ArtifactEvent> {
     } finally {
       this.draining = false
     }
-    this.wake()
   }
 
   private sendQueue(): void {

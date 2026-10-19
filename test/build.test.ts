@@ -1677,9 +1677,13 @@ describe("promised and withdrawn events", () => {
     })
 
     test("the constructor rejects a send limit that is not a positive integer", () => {
-      for (const sendLimit of [0, -1, Number.NaN, 1.5]) {
-        expect(() => new Build({ sendLimit })).toThrow(`sendLimit must be a positive integer, not ${sendLimit}`)
-      }
+      expect(() => new Build({ sendLimit: 0 })).toThrow("sendLimit must be a positive integer, not 0")
+      expect(() => new Build({ sendLimit: -1 })).toThrow("sendLimit must be a positive integer, not -1")
+      expect(() => new Build({ sendLimit: Number.NaN })).toThrow("sendLimit must be a positive integer, not null")
+      expect(() => new Build({ sendLimit: 1.5 })).toThrow("sendLimit must be a positive integer, not 1.5")
+      // A string from untyped code shows its quotes.
+      const fromConfig = JSON.parse('{"sendLimit": "10"}') as { sendLimit: number }
+      expect(() => new Build(fromConfig)).toThrow('sendLimit must be a positive integer, not "10"')
     })
 
     test("the events of an abort listener that changes tasks come after the events of the change that aborted it", async () => {

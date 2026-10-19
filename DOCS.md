@@ -124,7 +124,7 @@ The repo has this build in `examples/first-build.ts`. Run it with `bun run examp
 
 A failed task does not stop the build. The other tasks continue. `build.run()` does not throw when a task fails, so always check `result.success`. `build.run()` rejects in three cases only: a subscriber throws, a subscriber returns a promise, or subscribers reach the send limit ([section 9](#subscriber-errors)).
 
-Call `build.run()` one time for each `Build`. A second call does not run the completed tasks again. To run the pipeline again, make a new `Build` with the same store.
+You can call `build.run()` again on the same `Build`, for example after you add more tasks. A second call runs only the tasks that have not run yet. It does not run the completed tasks again. Its result also lists the tasks of the earlier calls. To run the whole pipeline again, make a new `Build` with the same store.
 
 ## 4. Artifacts
 
@@ -289,9 +289,15 @@ A waiting task finds its producers again each time a task is added, removed, or 
 - If the producer was replaced, the waiting task waits for the new task with the same id.
 - If the producer was removed, the waiting task goes on to the skip check. It does not fail.
 
-After `build.run()` starts, a new task looks for its producers after the code that added it returns. That code is the synchronous code that called `build.add` or `ctx.add`, and the whole cascade of subscribers that it causes ([The event queue](#the-event-queue)). Thus a consumer waits for a producer that the same code adds later, or that a subscriber adds when it hears about the consumer.
+After `build.run()` starts, a new task looks for its producers when the current synchronous code ends: at the next `await` or `return` of the code that added it. The subscriber calls that the add causes are part of that synchronous code ([The event queue](#the-event-queue)). A producer that you add after an `await` can come too late. Then the consumer waits for it only if the consumer is still waiting for other inputs. A consumer that has already started does not stop.
 
-If you add a producer after that, a consumer waits for it only if that consumer is still waiting for other inputs. A consumer that has already started does not stop.
+To make sure that a consumer waits for its producer, use one of these ways:
+
+- Add the producer first.
+- Give the producer and the consumer in one `setTasks` call.
+- Add the producer from a subscriber, when it gets the `promised` event of the consumer.
+
+Adding both in the same synchronous code also works:
 
 ```ts
 await build.run()
@@ -578,7 +584,7 @@ try {
 
 ### The event queue
 
-dapat keeps one queue of events for the build. A call that changes the state first changes the state, and then puts its events at the end of the queue. These calls are `add`, `remove`, `setTasks`, `ctx.produced`, `ctx.deleted`, the end of a task, and the start of the first `build.run()`. If no drain is in progress, the call then drains the queue: it sends one event at a time to every subscriber, until the queue is empty. When the drain ends, dapat starts the new tasks that can run. The call returns after that.
+dapat keeps one queue of events for the build. A call that changes the state first changes the state, and then puts its events at the end of the queue. These calls are `add`, `remove`, `setTasks`, `ctx.produced`, `ctx.deleted`, the end of a task, and the start of the first `build.run()`. If no drain is in progress, the call then drains the queue: it sends one event at a time to every subscriber, until the queue is empty. The call returns after the drain.
 
 A subscriber that changes tasks during a send does not start a new drain. Its events go at the end of the queue. The current event first reaches every subscriber, and then the new events follow. Thus every subscriber gets every event in the same order, and that order is the order of the state changes.
 
@@ -593,7 +599,9 @@ produced y by t
 
 Subscriber 2 gets `promised x by t` after `t` stopped declaring `x`, and then `withdrawn x by t`. A subscriber that applies every event in order ends with the true state. Do not act on one event in a way that a later event cannot undo.
 
-**The send limit.** During one drain, subscribers can cause at most 10,000 events (`SEND_LIMIT`). The limit counts only the events that subscribers cause during the drain. It does not count the events of the call that started the drain. Thus a `setTasks` call or a first `build.run()` with more than 10,000 outputs does not reach it. To change the limit, use `new Build({ sendLimit })`. The value must be a positive integer.
+**The send limit.** During one drain, subscribers can cause at most 10,000 events (`SEND_LIMIT`). The limit counts only the events that subscribers cause during the drain. It does not count the events of the call that started the drain. Thus a `setTasks` call or a first `build.run()` with more than 10,000 outputs does not reach it. To change the limit, use `new Build({ sendLimit })`. The value must be a positive integer. You cannot turn the limit off.
+
+The limit counts all events that subscribers cause in one drain, also correct ones. For example, a subscriber adds one task for each `promised` event. On a first `build.run()` with more than `sendLimit` outputs, the start of the run sends more than `sendLimit` `promised` events in one drain, and the subscriber causes one more `promised` event for each of them. That build reaches the limit. Set a higher `sendLimit` for such a build.
 
 The limit stops a subscriber that undoes each change that it sees. For example, a subscriber removes a task on `promised` and adds it again on `withdrawn`. Then the queue never becomes empty. At the limit, the drain stops with this error:
 
@@ -753,7 +761,7 @@ All paths in this section are relative to the repo root. `dapat` is `src/index.t
 new Build(opts?: { store?: Store; sendLimit?: number })
 ```
 
-`sendLimit` is the number of events that subscribers can cause during one drain of the event queue. The default is `SEND_LIMIT` (10,000), which `dapat` exports. The constructor throws if `sendLimit` is not a positive integer. See [The event queue](#the-event-queue).
+`sendLimit` is the number of events that subscribers can cause during one drain of the event queue. The default is `SEND_LIMIT` (10,000), which `dapat` exports. The constructor throws if `sendLimit` is not a positive integer. The limit cannot be turned off. See [The event queue](#the-event-queue).
 
 | Member | Description |
 | --- | --- |
