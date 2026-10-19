@@ -245,6 +245,7 @@ The task writes its outputs itself. dapat does not write, move, or delete files.
 
 ```text
 build.run()
+├─ the first time only: sends a promised event for each output of each task that you added before it
 ├─ starts every task at the same time; each task does these steps:
 │  ├─ wait for inputs
 │  │   ├─ a producer task failed           → this task fails: "dependency of '<id>' failed"
@@ -434,9 +435,15 @@ Call `build.add()` with a task id that is already in the build. The new task rep
 
 - **The old task is waiting.** dapat marks the old task `cancelled` with the reason `"replaced"`, and does not run it.
 - **The old task is running.** dapat aborts `ctx.signal` of the old task. The old run ends as `cancelled`, even if it finishes without an error. A later `ctx.produced` call from the old run does nothing. If the old run throws an `AbortError` (for example from `ctx.signal.throwIfAborted()`), dapat ignores it. Any other error from the old run goes into `result.errors`. The same applies to a task that `build.remove` stops.
-- **The old task is running or finished.** In `build.add`, dapat retracts the artifacts that the old task produced and that the new task does not declare. The new task takes over the artifacts that it declares, and it retracts them if you remove it later.
 
 In each case, the new task then waits, skips, or runs in the usual way.
+
+In `build.add`, dapat sends events only for the outputs that changed ([section 9](#9-subscribe-to-artifact-events)). It compares the outputs by `id`:
+
+1. A `withdrawn` event for each output of the old task that the new task does not declare.
+2. A `promised` event for each output of the new task that the old task did not declare.
+
+An output that both tasks declare gets no event. The new task now owns it, and dapat withdraws it when you remove the new task. Before the first `build.run()`, a replacement sends no events. `build.run()` then sends the `promised` events of the new task only.
 
 Your task code must stop work when `ctx.signal` aborts. dapat does not stop a running function.
 
@@ -444,38 +451,48 @@ Your task code must stop work when `ctx.signal` aborts. dapat does not stop a ru
 
 ### Removal
 
-`build.remove(id)` removes the task. It aborts the task if the task is running. It retracts the artifacts that the task produced. If the task had not finished, dapat marks it `cancelled` with the reason `"removed"`.
+`build.remove(id)` removes the task. It aborts the task if the task is running. It sends a `withdrawn` event for each output that the task declares. If the task had not finished, dapat marks it `cancelled` with the reason `"removed"`.
 
 `build.remove(id)` also starts to delete the store record for the task, but it does not wait for the delete. `build.run()` can return before the delete is done, and a delete error is not reported.
 
-dapat does not delete files or objects. Retraction only sends events ([section 9](#9-subscribe-to-artifact-events)).
+dapat does not delete files or objects. A `withdrawn` event only tells subscribers that the output will not come ([section 9](#9-subscribe-to-artifact-events)).
 
 ## 9. Subscribe to artifact events
 
-`Build` is an `Emitter<ArtifactEvent>`. A subscriber gets an event each time a task produces an artifact, and each time the build retracts one:
+`Build` is an `Emitter<ArtifactEvent>`. A subscriber gets an event when a task that declares an output enters the build, when a task produces an artifact, and when a task that declares an output leaves the build:
 
 ```ts
 type ArtifactEvent =
+  | { kind: "promised"; output: Ref; taskId: string }
   | { kind: "produced"; artifact: Artifact; taskId: string }
-  | { kind: "retracted"; artifact: Artifact; taskId: string }
+  | { kind: "withdrawn"; output: Ref; taskId: string }
 
 build.subscribe((event) => { ... })
 ```
 
-`taskId` is the task that produced the artifact. The subscriber gets every event. To use only some artifacts, check `event.artifact.id` in the subscriber.
+`taskId` is the task that declares the output or produced the artifact. The subscriber gets every event. To use only some artifacts, check `event.output.id` or `event.artifact.id` in the subscriber.
+
+dapat sends a `promised` event for each declared output, an artifact or a prefix:
+
+- at the start of the first `build.run()`, for each task that you added before it. dapat sends these events before any task starts. Thus a subscriber that you add after `build.add` and before `build.run()` gets them.
+- when you add a task after `build.run()` started, with `build.add`, `ctx.add`, or from a subscriber. dapat sends the events before `add` returns.
+
+A `promised` event means that the output will exist when the task finishes. Thus a subscriber knows about an output before any task runs.
 
 dapat sends a `produced` event at these times:
 
 - when a task calls `ctx.produced(artifact)`.
 - when a task runs with no error, for each declared artifact output that the task did not report with `ctx.produced`. dapat sends this event before the task counts as finished. Thus a subscriber can add a task that reads the output, and that new task waits for the writer.
 
-dapat sends a `retracted` event when it replaces or removes a task that produced the artifact ([section 8](#8-failure-cancellation-and-replacement)).
+dapat sends a `withdrawn` event for each declared output when it removes the task, and for each output that a replacement does not declare ([section 8](#8-failure-cancellation-and-replacement)). A withdrawn artifact will not come. A withdrawn prefix means that each artifact under it will not come, also the artifacts that the task reported with `ctx.produced`. dapat does not send one event for each of those artifacts.
+
+For one output of one task, a subscriber gets the events in this order: `promised`, then `produced` if the task produces it, then `withdrawn` if the task leaves the build. A subscriber gets no `produced` event before the `promised` event, and no event after the `withdrawn` event. A task that you remove before the first `build.run()` sends no events. To keep this order with more than one subscriber, see [Event order with more than one subscriber](#event-order-with-more-than-one-subscriber).
 
 Delivery is synchronous. dapat calls each subscriber in the order that it subscribed, and it waits for each call to return. Thus, when `ctx.produced` returns, each task that a subscriber added is already in the build. A subscriber must not return a promise. If it returns one, dapat does not wait for it: the send throws `subscriber returned a promise; subscribers must be synchronous`, and dapat reports that error as below. If the promise rejects, its error goes into `result.errors`.
 
-`subscribe` does not replay earlier events. Subscribe before `build.run()` to get all events. A subscriber that you add during a send gets the next event, not the current one.
+`subscribe` does not replay earlier events. Subscribe before the first `build.run()` to get all events. A subscriber that you add during a send gets the next event, not the current one.
 
-A task that skips sends no events ([section 12](#12-limits)).
+A task that skips sends no `produced` events ([section 12](#12-limits)).
 
 A subscriber can add tasks. This subscriber adds one task for each page from the `split` sample in section 5. Add it to that sample before `build.run()`:
 
@@ -504,7 +521,7 @@ const result = await build.run()
 
 ### Subscriber errors
 
-A subscriber that throws stops that event: the later subscribers do not get it. dapat still sends the other events of the same call. For example, `build.remove(id)` sends a `retracted` event for each artifact of the task, even when the first one throws. dapat sends one `retracted` event for each artifact, even if the task reported the artifact two times. dapat changes its own state before it sends, so a throw never leaves a task half removed or half replaced.
+A subscriber that throws stops that event: the later subscribers do not get it. dapat still sends the other events of the same call. For example, `build.remove(id)` sends a `withdrawn` event for each output of the task, even when the first one throws. dapat changes its own state before it sends, so a throw never leaves a task half added, half removed, or half replaced.
 
 dapat reports each error one time, in one of these ways:
 
@@ -513,9 +530,9 @@ dapat reports each error one time, in one of these ways:
   - The task fails even if it catches the error. If the task then throws its own error, its own error goes into `result.errors`.
   - `ctx.produced`, `ctx.add`, and `ctx.remove` throw the first error after they send all events.
   - If one call gets more than one error, the other errors go into `result.errors`.
-  - A subscriber error on one declared output does not stop the events for the other declared outputs. The task fails, and those artifacts stay produced until the task is removed or replaced.
+  - A subscriber error on one declared output does not stop the events for the other declared outputs. The task fails, and those artifacts stay produced until dapat withdraws them.
   - If a subscriber removes or replaces the task during these sends, the task ends as `cancelled`. dapat sends no more events for it, writes no store record for it, and puts its error into `result.errors`.
-- **No running task caused the send.** For example, you call `build.remove(id)` from outside a task, or you replace a task with `build.add(task)`, and a subscriber throws on the `retracted` event. Then `build.remove` and `build.add` do not throw. The error goes into `result.errors`, and `result.success` is `false`. This also applies to a `ctx` call from a task that already finished. When a running task calls `ctx.add` or `ctx.remove`, the retractions go to that task, as in the first case.
+- **No running task caused the send.** For example, you call `build.add(task)` or `build.remove(id)` from outside a task, and a subscriber throws on the `promised` or `withdrawn` event. Then `build.add` and `build.remove` do not throw. The error goes into `result.errors`, and `result.success` is `false`. This also applies to the `promised` events at the start of `build.run()`, and to a `ctx` call from a task that already finished. When a running task calls `ctx.add` or `ctx.remove`, the error goes to that task, as in the first case.
 
 `result.errors` holds every error of the build so far that no task owns. An error that occurs after `build.run()` returns appears in the result of the next `build.run()` on the same build.
 
@@ -525,7 +542,7 @@ A subscriber must not call the `ctx` of a task. Use `build.add` and `build.remov
 
 ### Event order with more than one subscriber
 
-A subscriber can change tasks during a send, and that change sends new events at once. A later subscriber then gets the new events before the event that caused them. For example, subscriber 1 removes the writer when it gets `produced x`. Subscriber 2 then gets `retracted x` before `produced x`.
+A subscriber can change tasks during a send, and that change sends new events at once. A later subscriber then gets the new events before the event that caused them. For example, subscriber 1 removes the writer when it gets `produced x`. Subscriber 2 then gets `withdrawn x` before `produced x`.
 
 So let only one subscriber change tasks in reaction to an event, or write subscribers that do not depend on the order of events for one artifact.
 
@@ -658,7 +675,7 @@ dapat then uses the content check, which does not depend on modification times. 
 
 ## 12. Limits
 
-- **A task that skips sends no events.** This applies to its prefix outputs and to its declared outputs. A subscriber sees nothing from that task on the next build.
+- **A task that skips sends no `produced` events.** This applies to its prefix outputs and to its declared outputs. A subscriber gets only the `promised` events of that task on the next build.
 - **Order stamps have different units.** dapat compares the order stamps of all artifacts in one task as plain integers. `FileArtifact` and `DirectoryArtifact` use nanoseconds. `S3ObjectArtifact` uses milliseconds. `SqliteRowArtifact` uses `rowid` or your `orderColumn`. If one task has artifacts of two kinds, the order check gives wrong results. For example, an S3 input and a file output always look current. The content check comes first, so a persistent store decides correctly after the first successful run. On the first run, and each time the task has no store record, the order check decides.
 - **A prefix artifact input does not wait for a plain prefix output in a subfolder.** See [section 5](#how-dapat-finds-dependencies).
 - **`FileArtifact` stamp methods return `null` for all errors.** For example, a permission error on a file looks like a missing file. The task then runs again and does not fail. Check file permissions when a task always runs.
@@ -682,10 +699,10 @@ new Build(opts?: { store?: Store })
 
 | Member | Description |
 | --- | --- |
-| `add(task: Task): void` | Adds a task. If a task with the same id exists, replaces it (see [section 8](#replacement)). If `run()` has started, the task starts at once. Throws if another task already declares one of its exact outputs, or if the task declares one output twice. |
-| `remove(id: string): void` | Removes a task. Aborts it if it is running and retracts its produced artifacts. Starts to delete its store record, but does not wait for the delete. Does nothing if the id is not known. |
+| `add(task: Task): void` | Adds a task. If a task with the same id exists, replaces it (see [section 8](#replacement)). If `run()` has started, sends a `promised` event for each declared output, and the task starts at once. Throws if another task already declares one of its exact outputs, or if the task declares one output twice. |
+| `remove(id: string): void` | Removes a task. Aborts it if it is running and sends a `withdrawn` event for each declared output. Starts to delete its store record, but does not wait for the delete. Does nothing if the id is not known. |
 | `subscribe(listener: (event: ArtifactEvent) => void): void` | From `Emitter`. Calls `listener` synchronously for each artifact event. Does not replay earlier events. See [section 9](#9-subscribe-to-artifact-events). |
-| `run(): Promise<Result>` | Starts every task and resolves when every started task has finished. Does not reject when a task fails. |
+| `run(): Promise<Result>` | The first time, sends a `promised` event for each output of each task that is in the build. Then starts every task and resolves when every started task has finished. Does not reject when a task fails. |
 
 ### `class Task`
 
@@ -831,11 +848,18 @@ type Outcome =
 
 ```ts
 type ArtifactEvent =
+  | { kind: "promised"; output: Ref; taskId: string }
   | { kind: "produced"; artifact: Artifact; taskId: string }
-  | { kind: "retracted"; artifact: Artifact; taskId: string }
+  | { kind: "withdrawn"; output: Ref; taskId: string }
 ```
 
-`taskId` is the task that produced the artifact.
+| Kind | dapat sends it when |
+| --- | --- |
+| `promised` | a task that declares `output` enters the build: at the start of the first `run()`, or at `add` after that. |
+| `produced` | the task wrote `artifact`: from `ctx.produced`, or for a declared artifact output after the task returns. |
+| `withdrawn` | the task that declared `output` leaves the build: `remove`, or a replacement that does not declare it. |
+
+`taskId` is the task that declares the output or produced the artifact. See [section 9](#9-subscribe-to-artifact-events).
 
 ## Filesystem (`dapat/contrib`)
 

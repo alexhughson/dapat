@@ -6,8 +6,9 @@ import type { Stamp, Store, TaskState } from "./store"
 import { Outcome, Result } from "./result"
 
 export type ArtifactEvent =
+  | { kind: "promised"; output: Ref; taskId: string }
   | { kind: "produced"; artifact: Artifact; taskId: string }
-  | { kind: "retracted"; artifact: Artifact; taskId: string }
+  | { kind: "withdrawn"; output: Ref; taskId: string }
 
 type Phase = "pending" | "running" | "completed"
 
@@ -18,8 +19,8 @@ class Slot {
   launched = 0
   phase: Phase = "pending"
   abort: AbortController | null = null
-  // The artifacts this task owns, by id. Remove and replace retract them.
-  produced = new Map<string, Artifact>()
+  // True when the build sent the promised events for this task's outputs.
+  promised = false
   // The ids that this run reported with ctx.produced.
   reported = new Set<string>()
   outcome: Outcome | null = null
@@ -57,12 +58,13 @@ export class Build extends Emitter<ArtifactEvent> {
     this.assertAddable(task, existing ? task.id : null)
 
     const slot = new Slot(task)
-    let retractions: ArtifactEvent[] = []
+    // Before the first run(), run() sends the promised events.
+    slot.promised = this.started
+    const events = outputEvents(task.id, promisedOutputs(existing), promisedOutputs(slot))
     if (existing) {
       // A running task sees the new generation, so its later ctx.produced does nothing.
       existing.generation += 1
       this.unindex(existing.task)
-      retractions = this.release(existing, slot)
       if (existing.phase === "pending") {
         this.finish(existing, { type: "cancelled", reason: "replaced" })
       }
@@ -79,7 +81,7 @@ export class Build extends Emitter<ArtifactEvent> {
       this.kick(slot)
     }
     this.wake()
-    this.sendAll(retractions)
+    this.sendAll(events)
   }
 
   remove(id: string): void {
@@ -90,7 +92,7 @@ export class Build extends Emitter<ArtifactEvent> {
     slot.generation += 1
     this.unindex(slot.task)
     const wasRunning = slot.phase === "running"
-    const retractions = this.release(slot, null)
+    const events = outputEvents(id, promisedOutputs(slot), [])
     this.slots.delete(id)
     if (this.store) {
       void this.store.delete(id)
@@ -103,16 +105,31 @@ export class Build extends Emitter<ArtifactEvent> {
       slot.abort.abort()
     }
     this.wake()
-    this.sendAll(retractions)
+    this.sendAll(events)
   }
 
   async run(): Promise<Result> {
-    this.started = true
+    if (!this.started) {
+      this.promiseWaitingTasks()
+    }
     for (const slot of this.slots.values()) {
       this.kick(slot)
     }
     await this.idle()
     return new Result(this.outcomes, this.errors)
+  }
+
+  /** Sends the promised events of the tasks that were added before the first run(). */
+  private promiseWaitingTasks(): void {
+    const waiting = [...this.slots.values()]
+    // From now on, add sends the promised events of a new task at once.
+    this.started = true
+    for (const slot of waiting) {
+      // A subscriber can remove or replace a task during these sends.
+      if (this.slots.get(slot.task.id) !== slot) continue
+      slot.promised = true
+      this.sendAll(outputEvents(slot.task.id, [], slot.task.outputs))
+    }
   }
 
   private assertAddable(task: Task, replacingId: string | null): void {
@@ -313,7 +330,7 @@ export class Build extends Emitter<ArtifactEvent> {
 
   /**
    * Ends a task that `remove` or `add` stopped while it ran. They already sent
-   * its retractions. Returns false when the task is still current.
+   * its withdrawn events. Returns false when the task is still current.
    */
   private endIfStopped(slot: Slot, generation: number): boolean {
     if (generation === slot.generation) return false
@@ -374,7 +391,6 @@ export class Build extends Emitter<ArtifactEvent> {
       )
     }
     slot.reported.add(artifact.id)
-    slot.produced.set(artifact.id, artifact)
     this.sendAll([{ kind: "produced", artifact, taskId: slot.task.id }])
   }
 
@@ -388,11 +404,10 @@ export class Build extends Emitter<ArtifactEvent> {
 
   private async recordSuccess(slot: Slot, generation: number): Promise<void> {
     for (const output of slot.task.outputs) {
-      // A subscriber can remove or replace this task. Then it owns no more artifacts.
+      // A subscriber can remove or replace this task. Then it sends no more events.
       if (generation !== slot.generation) return
       if (!isArtifact(output)) continue
       if (slot.reported.has(output.id)) continue
-      slot.produced.set(output.id, output)
       const event: ArtifactEvent = { kind: "produced", artifact: output, taskId: slot.task.id }
       try {
         this.asTask(slot, () => this.sendAll([event]))
@@ -467,29 +482,6 @@ export class Build extends Emitter<ArtifactEvent> {
   private addError(error: Error): void {
     if (this.errors.includes(error)) return
     this.errors.push(error)
-  }
-
-  /**
-   * Empties `slot.produced` and returns a retraction for each artifact.
-   * An artifact that `keep` also declares moves to `keep`, so `keep` retracts it later.
-   */
-  private release(slot: Slot, keep: Slot | null): ArtifactEvent[] {
-    const declared = new Set<string>()
-    if (keep !== null) {
-      for (const output of keep.task.outputs) {
-        if (isArtifact(output)) declared.add(output.id)
-      }
-    }
-    const events: ArtifactEvent[] = []
-    for (const artifact of slot.produced.values()) {
-      if (keep !== null && declared.has(artifact.id)) {
-        keep.produced.set(artifact.id, artifact)
-      } else {
-        events.push({ kind: "retracted", artifact, taskId: slot.task.id })
-      }
-    }
-    slot.produced = new Map()
-    return events
   }
 
   /** Errors that reach the build after the send returned, such as an async subscriber's rejection. */
@@ -656,6 +648,36 @@ function ordersFresh(
   if (minOutput === null) return false
   if (maxInput === null) return true
   return maxInput <= minOutput
+}
+
+/**
+ * The events that change the promised outputs of one task id from `before` to
+ * `after`: withdrawn for each output id that only `before` has, then promised
+ * for each output id that only `after` has.
+ */
+function outputEvents(
+  taskId: string,
+  before: readonly Ref[],
+  after: readonly Ref[],
+): ArtifactEvent[] {
+  const beforeIds = new Set(before.map((output) => output.id))
+  const afterIds = new Set(after.map((output) => output.id))
+  const events: ArtifactEvent[] = []
+  for (const output of before) {
+    if (afterIds.has(output.id)) continue
+    events.push({ kind: "withdrawn", output, taskId })
+  }
+  for (const output of after) {
+    if (beforeIds.has(output.id)) continue
+    events.push({ kind: "promised", output, taskId })
+  }
+  return events
+}
+
+/** The outputs that the build sent promised events for. */
+function promisedOutputs(slot: Slot | undefined): readonly Ref[] {
+  if (slot === undefined || !slot.promised) return []
+  return slot.task.outputs
 }
 
 function toError(value: unknown): Error {

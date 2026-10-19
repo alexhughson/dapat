@@ -10,7 +10,7 @@ When you run a build, dapat does these things:
 
 - **Order:** it starts a task only after the tasks that write its inputs have finished.
 - **Skip:** it skips a task when its inputs did not change since the last run and its outputs still exist. It compares content hashes, so an edit that restores the old bytes does not cause a rebuild.
-- **Grow:** it adds tasks during the build. A subscriber (`build.subscribe`) gets an event for each output that a task writes, and it can add the task that reads that output. dapat calls subscribers synchronously, so the new task exists before the writer continues. If a subscriber throws, the writer task fails, or the error goes into `result.errors` when no task caused the event.
+- **Grow:** it adds tasks during the build. A subscriber (`build.subscribe`) gets a `promised` event for each output that a task declares, a `produced` event for each output that a task writes, and a `withdrawn` event when the declaring task leaves the build. The subscriber can add the task that reads that output. dapat calls subscribers synchronously, so the new task exists before the writer continues. If a subscriber throws, the writer task fails, or the error goes into `result.errors` when no task caused the event.
 
 ```
 Use dapat for data pipelines, generated files, and agent loops, where a step is expensive and must run again only when its inputs change.
@@ -121,7 +121,7 @@ if (!result.success) {
 - how dapat finds dependencies
 - the exact rules for when a task skips, and how to find out why a task ran
 - failure, cancellation, and replacement of tasks
-- subscribers for artifacts that a task writes during the build, and their errors
+- subscribers for the outputs that tasks declare and write during the build, and their errors
 - recipes: force a rebuild, limit parallel work, run in CI
 - known limits
 - the full API reference
