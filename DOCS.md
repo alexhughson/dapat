@@ -120,9 +120,9 @@ The repo has this build in `examples/first-build.ts`. Run it with `bun run examp
 - `skipped` lists the tasks that dapat did not run, because their outputs were current.
 - `failed` is a `Map<Task, Error>`.
 - `cancelled` lists the tasks that were replaced or removed before they finished ([section 8](#8-failure-cancellation-and-replacement)).
-- `errors` lists the errors that no task owns ([section 9](#9-subscribe-to-artifact-events)). These are subscriber errors from sends that no running task caused, errors that a task throws after it was stopped or after a subscriber error failed it, and async subscriber rejections.
+- `errors` lists the errors that no task owns: a non-abort error that a task throws after it was replaced or removed ([section 8](#replacement)), and a store delete that rejects ([section 8](#removal)).
 
-A failed task does not stop the build. The other tasks continue. `build.run()` does not throw when a task fails, so always check `result.success`.
+A failed task does not stop the build. The other tasks continue. `build.run()` does not throw when a task fails, so always check `result.success`. `build.run()` rejects only when a subscriber throws ([section 9](#subscriber-errors)).
 
 Call `build.run()` one time for each `Build`. A second call does not run the completed tasks again. To run the pipeline again, make a new `Build` with the same store.
 
@@ -446,8 +446,8 @@ In each case, the new task then waits, skips, or runs in the usual way.
 
 In `build.add`, dapat sends events only for the outputs that changed ([section 9](#9-subscribe-to-artifact-events)). It compares the outputs by kind (artifact or prefix) and `id`:
 
-1. A `withdrawn` event for each output that subscribers know from the old task and that the new task does not declare.
-2. A `promised` event for each output of the new task that subscribers do not know yet.
+1. A `withdrawn` event for each output that the old task declares and the new task does not declare.
+2. A `promised` event for each output that the new task declares and the old task does not declare.
 
 An output that both tasks declare gets no event. The new task now owns it, and dapat withdraws it when you remove the new task. Before the first `build.run()`, a replacement sends no events. `build.run()` then sends the `promised` events of the new task only.
 
@@ -459,7 +459,7 @@ Your task code must stop work when `ctx.signal` aborts. dapat does not stop a ru
 
 `build.remove(id)` removes the task. It aborts the task if the task is running. It sends a `withdrawn` event for each output that the task declares. If the task had not finished, dapat marks it `cancelled` with the reason `"removed"`.
 
-`build.remove(id)` also starts to delete the store record for the task, but it does not wait for the delete. `build.run()` can return before the delete is done, and a delete error is not reported.
+`build.remove(id)` also starts to delete the store record for the task, but it does not wait for the delete. `build.run()` can return before the delete is done. A delete error goes into `result.errors` of the `build.run()` that is in progress, or of the next one.
 
 dapat does not delete files or objects. A `withdrawn` event only tells subscribers that the output will not come ([section 9](#9-subscribe-to-artifact-events)).
 
@@ -482,7 +482,7 @@ build.subscribe((event) => { ... })
 dapat sends a `promised` event for each declared output, an artifact or a prefix:
 
 - at the start of the first `build.run()`, for each task that you added before it. dapat sends these events before any task starts. Thus a subscriber that you add after `build.add` and before `build.run()` gets them.
-- when you add a task after `build.run()` started, with `build.add`, `ctx.add`, or from a subscriber. dapat sends the events before `add` returns.
+- when you add a task after `build.run()` started, with `build.add`, `ctx.add`, or from a subscriber. dapat sends the events before the outermost call returns ([The event queue](#the-event-queue)).
 
 A `promised` event means that the output will exist when the task finishes, unless the task reports it with `ctx.deleted`. Thus a subscriber knows about an output before any task runs.
 
@@ -497,9 +497,9 @@ dapat sends a `withdrawn` event for each declared output when it removes the tas
 
 For one output of one task, a subscriber gets the events in this order: `promised`, then `produced` or `deleted` for each report of the task, then `withdrawn` if the task leaves the build. A subscriber gets no `produced` or `deleted` event before the `promised` event, and no event after the `withdrawn` event. A task that you remove before the first `build.run()` sends no events.
 
-dapat keeps, for each task id, the outputs that it told subscribers about. Each `add`, `remove`, and `setTasks` sends one event at a time, until those outputs equal the outputs of the current task with each changed id. One call sends all its `withdrawn` events before any `promised` event. Thus an output that moves from one task to another in one call is withdrawn before it is promised again. dapat works out each event just before it sends it. Thus a subscriber can add, replace, or remove the same task id during an event, and no subscriber gets an old event after that change. Each output is promised one time, even if a task declares it two times. To keep this order with more than one subscriber, see [Event order with more than one subscriber](#event-order-with-more-than-one-subscriber).
+Each `add`, `remove`, and `setTasks` compares the old and the new outputs of each task id that it changes. One call puts all its `withdrawn` events on the queue before any `promised` event. Thus an output that moves from one task to another in one call is withdrawn before it is promised again. Each output is promised one time, even if a task declares it two times. For the order across calls, see [The event queue](#the-event-queue).
 
-Delivery is synchronous. dapat calls each subscriber in the order that it subscribed, and it waits for each call to return. Thus, when `ctx.produced` returns, each task that a subscriber added is already in the build. A subscriber must not return a promise. If it returns one, dapat does not wait for it: the send throws `subscriber returned a promise; subscribers must be synchronous`, and dapat reports that error as below. If the promise rejects, its error goes into `result.errors`.
+Delivery is synchronous. dapat calls each subscriber in the order that it subscribed, and it waits for each call to return. Thus, when `ctx.produced` returns, each task that a subscriber added is already in the build. A subscriber must not return a promise. If it returns one, dapat does not wait for it: the send fails with `subscriber returned a promise; subscribers must be synchronous`, and `build.run()` rejects with that error ([Subscriber errors](#subscriber-errors)). If the promise then rejects, dapat drops that rejection, because it keeps only the first error.
 
 `subscribe` does not replay earlier events. Subscribe before the first `build.run()` to get all events. A subscriber that you add during a send gets the next event, not the current one.
 
@@ -532,32 +532,65 @@ const result = await build.run()
 
 ### Subscriber errors
 
-A subscriber that throws stops that event: the later subscribers do not get it. dapat still sends the other events of the same call. For example, `build.remove(id)` sends a `withdrawn` event for each output of the task, even when the first one throws. dapat changes its own state before it sends, so a throw never leaves a task half added, half removed, or half replaced.
+A subscriber is part of your program, like the code that adds tasks. A throw in a subscriber is a bug in the program, not a failure of one task. So dapat has two rules:
 
-dapat reports each error one time, in one of these ways:
+- A task's own error goes into `result.failed`. The other tasks continue ([section 8](#failure)).
+- Every other error makes `build.run()` reject. These errors are a subscriber that throws, a subscriber that returns a promise, and the send limit ([The event queue](#the-event-queue)).
 
-- **A running task caused the send.** This applies to `ctx.produced`, `ctx.deleted`, `ctx.add`, `ctx.remove`, and the events for the declared outputs after the task returns. It also applies to a `build.add` or `build.remove` that a subscriber calls during one of these sends.
-  - The task fails with the first error, and the error goes into `result.failed`.
-  - The task fails even if it catches the error. If the task then throws its own error, its own error goes into `result.errors`.
-  - `ctx.produced`, `ctx.deleted`, `ctx.add`, and `ctx.remove` throw the first error after they send all events.
-  - If one call gets more than one error, the other errors go into `result.errors`.
-  - A subscriber error on one declared output does not stop the events for the other declared outputs. The task fails, and those artifacts stay produced until dapat withdraws them.
-  - If a subscriber removes or replaces the task during these sends, the task ends as `cancelled`. dapat sends no more events for it, writes no store record for it, and puts its error into `result.errors`.
-- **No running task caused the send.** For example, you call `build.add(task)` or `build.remove(id)` from outside a task, and a subscriber throws on the `promised` or `withdrawn` event. Then `build.add` and `build.remove` do not throw. The error goes into `result.errors`, and `result.success` is `false`. This also applies to the `promised` events at the start of `build.run()`, and to a `ctx` call from a task that already finished. When a running task calls `ctx.add` or `ctx.remove`, the error goes to that task, as in the first case.
+When a subscriber throws, dapat does these steps:
 
-`result.errors` holds every error of the build so far that no task owns. An error that occurs after `build.run()` returns appears in the result of the next `build.run()` on the same build.
+1. The throw stops that event. The later subscribers do not get it.
+2. dapat keeps the error as the fatal error of the build, and clears the queue. dapat does not send the other events in the queue.
+3. dapat aborts `ctx.signal` of each running task. It starts no more tasks, sends no more events, and writes no more store records.
+4. `build.run()` rejects with the error, after each running task returned.
 
-dapat does not ignore a subscriber error.
+The call that caused the send does not throw. This applies to `build.add`, `build.remove`, `ctx.add`, `ctx.remove`, `ctx.produced`, and `ctx.deleted`. dapat changes its own state before it sends, so the call still adds, removes, or replaces the task.
 
-A subscriber must not call the `ctx` of a task. Use `build.add` and `build.remove`. A `ctx` that a subscriber calls can report one error for two tasks.
+dapat keeps only the first error. It clears the queue and sends no more events, so no later subscriber error can occur.
 
-### Event order with more than one subscriber
+An error outside `build.run()` waits for the next run. For example, a subscriber throws on the `promised` event of a `build.add` after `build.run()` returned. Then `build.add` returns normally, and the next `build.run()` rejects with the error at once and runs no task. Each later `build.run()` on the same build rejects with the same error. To run again, make a new `Build`.
 
-A subscriber can change tasks during a send, and that change sends new events at once. A later subscriber then gets the new events before the event that caused them. For example, subscriber 1 removes the writer when it gets `produced x`. Subscriber 2 then gets `withdrawn x` before `produced x`.
+This subscriber throws on each produced artifact:
 
-So let only one subscriber change tasks in reaction to an event, or write subscribers that do not depend on the order of events for one artifact.
+```ts
+build.subscribe((event) => {
+  if (event.kind === "produced") throw new Error("index is full")
+})
+build.add(new Task({ id: "write", outputs: [out], run: async () => {} }))
 
-A subscriber that undoes each change it sees never settles. For example, it removes a task on `promised` and adds it again on `withdrawn`. The calls nest until the stack overflows, and `result.errors` holds the overflow errors.
+try {
+  await build.run()
+} catch (error) {
+  console.error(error) // Error: index is full
+}
+```
+
+`write` runs, and dapat sends `produced` for `out` after `write` returns. The subscriber throws, and `build.run()` rejects with `index is full`. dapat writes no store record for `write`.
+
+### The event queue
+
+dapat keeps one queue of events for the build. A call that changes the state first changes the state, and then puts its events at the end of the queue. These calls are `add`, `remove`, `setTasks`, `ctx.produced`, `ctx.deleted`, the end of a task, and the start of the first `build.run()`. If no drain is in progress, the call then drains the queue: it sends one event at a time to every subscriber, until the queue is empty. The call returns after the drain.
+
+A subscriber that changes tasks during a send does not start a new drain. Its events go at the end of the queue. The current event first reaches every subscriber, and then the new events follow. Thus every subscriber gets every event in the same order, and that order is the order of the state changes.
+
+An event can be stale when it arrives. Then its correction always comes later in the queue. For example, task `t` declares `x`. Subscriber 1 replaces `t` with a task that declares `y` when it gets `promised x by t`. Both subscribers get these events, in this order:
+
+```text
+promised x by t     (subscriber 1 replaces t during this event)
+withdrawn x by t
+promised y by t
+produced y by t
+```
+
+Subscriber 2 gets `promised x by t` after `t` stopped declaring `x`, and then `withdrawn x by t`. A subscriber that applies every event in order ends with the true state. Do not act on one event in a way that a later event cannot undo.
+
+**The send limit.** One drain sends at most 10,000 events (`SEND_LIMIT`). To change the limit, use `new Build({ sendLimit })`. The limit stops a subscriber that undoes each change that it sees. For example, a subscriber removes a task on `promised` and adds it again on `withdrawn`. Then the queue never becomes empty. At the limit, the drain stops with this error:
+
+```text
+send limit: one drain sent 10000 events, and more wait; the last was 'withdrawn x by t'
+```
+
+dapat handles this error as a subscriber error: `build.run()` rejects with it.
 
 ## 10. Built-in artifacts
 
@@ -707,16 +740,18 @@ All paths in this section are relative to the repo root. `dapat` is `src/index.t
 ### `class Build`
 
 ```ts
-new Build(opts?: { store?: Store })
+new Build(opts?: { store?: Store; sendLimit?: number })
 ```
+
+`sendLimit` is the number of events that one drain of the event queue can send. The default is `SEND_LIMIT` (10,000), which `dapat` exports. See [The event queue](#the-event-queue).
 
 | Member | Description |
 | --- | --- |
-| `add(task: Task): void` | Adds a task. If a task with the same id exists, replaces it (see [section 8](#replacement)). If `run()` has started, sends a `promised` event for each declared output, and the task starts at once. Throws if another task already declares one of its exact outputs, if the task declares one output twice, or if another owner holds that id ([section 5](#5-tasks-and-dependencies)). |
-| `remove(id: string): void` | Removes a task. Aborts it if it is running and sends a `withdrawn` event for each declared output. Starts to delete its store record, but does not wait for the delete. Does nothing if the id is not known. The other tasks of the same owner stay. |
-| `subscribe(listener: (event: ArtifactEvent) => void): void` | From `Emitter`. Calls `listener` synchronously for each artifact event. Does not replay earlier events. See [section 9](#9-subscribe-to-artifact-events). |
-| `protected setTasks(owner: string, tasks: readonly Task[]): void` | Makes `tasks` the tasks of `owner` ([section 5](#5-tasks-and-dependencies)). Adds each new id, replaces each known id, and removes each id that `owner` gave before and does not give now. Changes all state first, then sends the events: all `withdrawn` events of the call first, then the `promised` events, by id in list order. A dropped task ends as `cancelled` with the reason `"removed"` if it had not finished. Throws and changes nothing if another owner has one of the ids, if `tasks` has one id two times, or if two tasks declare one exact output. `add(task)` calls `setTasks("add:" + task.id, [task])`. Rules will call it; your code does not. |
-| `run(): Promise<Result>` | The first time, sends a `promised` event for each output of each task that is in the build. Then starts every task and resolves when every started task has finished. Does not reject when a task fails. |
+| `add(task: Task): void` | Adds a task. If a task with the same id exists, replaces it (see [section 8](#replacement)). If `run()` has started, sends a `promised` event for each declared output, and the task starts at once. Does not throw when a subscriber throws ([section 9](#subscriber-errors)). Throws if another task already declares one of its exact outputs, if the task declares one output twice, or if another owner holds that id ([section 5](#5-tasks-and-dependencies)). |
+| `remove(id: string): void` | Removes a task. Aborts it if it is running and sends a `withdrawn` event for each declared output. Does not throw when a subscriber throws. Starts to delete its store record, but does not wait for the delete. A delete error goes into `result.errors`. Does nothing if the id is not known. The other tasks of the same owner stay. |
+| `subscribe(listener: (event: ArtifactEvent) => void): void` | From `Emitter`. Calls `listener` synchronously for each artifact event, in the order of the event queue. Does not replay earlier events. See [section 9](#9-subscribe-to-artifact-events). |
+| `protected setTasks(owner: string, tasks: readonly Task[]): void` | Makes `tasks` the tasks of `owner` ([section 5](#5-tasks-and-dependencies)). Adds each new id, replaces each known id, and removes each id that `owner` gave before and does not give now. Changes all state first, then puts the events on the queue: all `withdrawn` events of the call first, then the `promised` events, by id in list order. A dropped task ends as `cancelled` with the reason `"removed"` if it had not finished. Throws and changes nothing if another owner has one of the ids, if `tasks` has one id two times, or if two tasks declare one exact output. `add(task)` calls `setTasks("add:" + task.id, [task])`. Rules will call it; your code does not. |
+| `run(): Promise<Result>` | The first time, sends a `promised` event for each output of each task that is in the build. Then starts every task and resolves when every started task has finished. Does not reject when a task fails. Rejects with the first subscriber error or send-limit error of the build, at once if that error happened before the call ([section 9](#subscriber-errors)). |
 
 ### `class Task`
 
@@ -753,8 +788,8 @@ The object that the build passes to `task.run`.
 | `signal: AbortSignal` | Aborted when the task is replaced or removed. |
 | `add(task: Task): void` | Same as `build.add`. |
 | `remove(id: string): void` | Same as `build.remove`. |
-| `produced(artifact: Artifact): void` | Sends a `produced` event to each subscriber before it returns. Throws if no output of the task covers it. Also throws if a subscriber throws, and then the task fails ([section 9](#subscriber-errors)). Does nothing if the task was replaced or removed. |
-| `deleted(artifact: Artifact): void` | Call it after the task deleted `artifact`. Sends a `deleted` event to each subscriber before it returns. A declared output that the task last reported as deleted gets no `produced` event after the task returns. Throws, fails the task, and does nothing in the same cases as `produced`. |
+| `produced(artifact: Artifact): void` | Sends a `produced` event to each subscriber before it returns. Throws if no output of the task covers it. Does not throw when a subscriber throws: `build.run()` rejects instead ([section 9](#subscriber-errors)). Does nothing if the task was replaced or removed. |
+| `deleted(artifact: Artifact): void` | Call it after the task deleted `artifact`. Sends a `deleted` event to each subscriber before it returns. A declared output that the task last reported as deleted gets no `produced` event after the task returns. Throws and does nothing in the same cases as `produced`. |
 
 ### `type Ref`
 
@@ -835,7 +870,7 @@ Keeps records in a `Map`. The records are lost when the process ends. `MemorySto
 | `skipped` | `readonly Task[]` | Tasks that the skip rules skipped. |
 | `failed` | `ReadonlyMap<Task, Error>` | Tasks that threw, whose producer failed, or that were in a deadlock. |
 | `cancelled` | `readonly Task[]` | Tasks that were replaced or removed before they completed. |
-| `errors` | `readonly Error[]` | Errors that no task owns: subscriber errors from sends that no running task caused, errors that a task throws after it was stopped or after a subscriber error failed it, and async subscriber rejections. It keeps the errors of earlier runs of the same build. |
+| `errors` | `readonly Error[]` | Errors that no task owns: a non-abort error that a task throws after it was replaced or removed, and a store delete that rejects. It keeps the errors of earlier runs of the same build. A subscriber error is not here: `run()` rejects with it. |
 
 `Result` does not give the reason for a skip. The build keeps an `Outcome` for each task, but no public member returns it. See [section 6.1](#61-why-did-a-task-run-or-skip).
 
@@ -855,7 +890,7 @@ type Outcome =
 | --- | --- |
 | `subscribe(listener: (event: E) => void): void` | Adds a listener. Listeners get events in the order that they subscribed. |
 | `protected send(event: E): void` | Calls each listener synchronously, in order. If a listener throws, `send` stops and throws that error to its caller. If a listener returns a promise, `send` throws an error. |
-| `protected rejected(reason: unknown): void` | Called when a listener's returned promise rejects. The default throws `reason` again, so the rejection stays unhandled. `Build` overrides it and puts the error in `result.errors`. |
+| `protected rejected(reason: unknown): void` | Called when a listener's returned promise rejects. The default throws `reason` again, so the rejection stays unhandled. `Build` overrides it and keeps the error only if it is the first fatal error of the build ([section 9](#subscriber-errors)). |
 
 `Build` extends `Emitter<ArtifactEvent>`.
 
@@ -871,7 +906,7 @@ type ArtifactEvent =
 
 | Kind | dapat sends it when |
 | --- | --- |
-| `promised` | a task that declares `output` enters the build: at the start of the first `run()`, or at `add` after that. |
+| `promised` | a task that declares `output` enters the build: at the start of the first `run()`, or at `add` after that. The event can be stale; then a `withdrawn` event follows ([The event queue](#the-event-queue)). |
 | `produced` | the task wrote `artifact`: from `ctx.produced`, or for a declared artifact output after the task returns. |
 | `deleted` | the task deleted `artifact`: from `ctx.deleted`. |
 | `withdrawn` | the task that declared `output` leaves the build: `remove`, or a replacement that does not declare it. |

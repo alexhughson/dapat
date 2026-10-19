@@ -12,7 +12,7 @@ export class Result {
   readonly skipped: readonly Task[]
   readonly failed: ReadonlyMap<Task, Error>
   readonly cancelled: readonly Task[]
-  /** Errors that no task owns: subscriber errors from sends that no running task caused, errors that a task throws after it was stopped or after a subscriber error failed it, and async subscriber rejections. */
+  /** Errors that no task owns: a non-abort error that a task throws after it was replaced or removed, and a rejected store delete. */
   readonly errors: readonly Error[]
 
   constructor(outcomes: ReadonlyMap<Task, Outcome>, errors: readonly Error[]) {
