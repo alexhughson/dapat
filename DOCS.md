@@ -438,10 +438,10 @@ Call `build.add()` with a task id that is already in the build. The new task rep
 
 In each case, the new task then waits, skips, or runs in the usual way.
 
-In `build.add`, dapat sends events only for the outputs that changed ([section 9](#9-subscribe-to-artifact-events)). It compares the outputs by `id`:
+In `build.add`, dapat sends events only for the outputs that changed ([section 9](#9-subscribe-to-artifact-events)). It compares the outputs by kind (artifact or prefix) and `id`:
 
-1. A `withdrawn` event for each output of the old task that the new task does not declare.
-2. A `promised` event for each output of the new task that the old task did not declare.
+1. A `withdrawn` event for each output that subscribers know from the old task and that the new task does not declare.
+2. A `promised` event for each output of the new task that subscribers do not know yet.
 
 An output that both tasks declare gets no event. The new task now owns it, and dapat withdraws it when you remove the new task. Before the first `build.run()`, a replacement sends no events. `build.run()` then sends the `promised` events of the new task only.
 
@@ -484,9 +484,11 @@ dapat sends a `produced` event at these times:
 - when a task calls `ctx.produced(artifact)`.
 - when a task runs with no error, for each declared artifact output that the task did not report with `ctx.produced`. dapat sends this event before the task counts as finished. Thus a subscriber can add a task that reads the output, and that new task waits for the writer.
 
-dapat sends a `withdrawn` event for each declared output when it removes the task, and for each output that a replacement does not declare ([section 8](#8-failure-cancellation-and-replacement)). A withdrawn artifact will not come. A withdrawn prefix means that each artifact under it will not come, also the artifacts that the task reported with `ctx.produced`. dapat does not send one event for each of those artifacts.
+dapat sends a `withdrawn` event for each declared output when it removes the task, and for each output that a replacement does not declare ([section 8](#8-failure-cancellation-and-replacement)). A withdrawn artifact will not come. A withdrawn prefix means that each artifact under it that this task would write will not come, also the artifacts that the task reported with `ctx.produced`. dapat does not send one event for each of those artifacts. Another task can still declare or write an artifact under that prefix.
 
-For one output of one task, a subscriber gets the events in this order: `promised`, then `produced` if the task produces it, then `withdrawn` if the task leaves the build. A subscriber gets no `produced` event before the `promised` event, and no event after the `withdrawn` event. A task that you remove before the first `build.run()` sends no events. To keep this order with more than one subscriber, see [Event order with more than one subscriber](#event-order-with-more-than-one-subscriber).
+For one output of one task, a subscriber gets the events in this order: `promised`, then `produced` if the task produces it, then `withdrawn` if the task leaves the build. A subscriber gets no `produced` event before the `promised` event, and no event after the `withdrawn` event. A task that you remove before the first `build.run()` sends no events.
+
+dapat keeps, for each task id, the outputs that it told subscribers about. Each `add` and `remove` sends one event at a time, until those outputs equal the outputs of the current task with that id. dapat works out each event just before it sends it. Thus a subscriber can add, replace, or remove the same task id during an event, and no subscriber gets an old event after that change. Each output is promised one time, even if a task declares it two times. To keep this order with more than one subscriber, see [Event order with more than one subscriber](#event-order-with-more-than-one-subscriber).
 
 Delivery is synchronous. dapat calls each subscriber in the order that it subscribed, and it waits for each call to return. Thus, when `ctx.produced` returns, each task that a subscriber added is already in the build. A subscriber must not return a promise. If it returns one, dapat does not wait for it: the send throws `subscriber returned a promise; subscribers must be synchronous`, and dapat reports that error as below. If the promise rejects, its error goes into `result.errors`.
 

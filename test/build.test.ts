@@ -1537,6 +1537,161 @@ describe("promised and withdrawn events", () => {
       "produced mem:out/1b by use:1",
     ])
   })
+
+  describe("a subscriber that changes the same task id during its events gets no stale event", () => {
+    test("a replacement during the withdrawn events of a replacement", async () => {
+      const log: string[] = []
+      let done = false
+      const build = new Build()
+      build.subscribe((event) => {
+        log.push(`${describeEvent(event)} by ${event.taskId}`)
+      })
+      build.subscribe((event) => {
+        if (done || event.kind !== "withdrawn" || event.output.id !== "mem:a") return
+        done = true
+        build.add(new Task({ id: "x", outputs: [new Mem("mem:a")], run: async () => {} }))
+      })
+      build.add(new Task({ id: "x", outputs: [new Mem("mem:a")], run: async () => {} }))
+      const running = build.run()
+      build.add(new Task({ id: "x", outputs: [new Mem("mem:b")], run: async () => {} }))
+      await running
+
+      // The nested add promised mem:a again, so the outer add must not promise mem:b.
+      expect(log).toEqual([
+        "promised mem:a by x",
+        "withdrawn mem:a by x",
+        "promised mem:a by x",
+        "produced mem:a by x",
+      ])
+    })
+
+    test("a remove during the promised events at the start of run()", async () => {
+      const log: string[] = []
+      const build = new Build()
+      build.subscribe((event) => {
+        log.push(`${describeEvent(event)} by ${event.taskId}`)
+      })
+      build.subscribe((event) => {
+        if (event.kind === "promised" && event.output.id === "mem:a1") build.remove("a")
+      })
+      build.add(
+        new Task({ id: "a", outputs: [new Mem("mem:a1"), new Mem("mem:a2")], run: async () => {} }),
+      )
+      const result = await build.run()
+
+      expect(log).toEqual(["promised mem:a1 by a", "withdrawn mem:a1 by a"])
+      expect(result.cancelled.map((task) => task.id)).toEqual(["a"])
+    })
+
+    test("a replacement during the promised events at the start of run()", async () => {
+      const log: string[] = []
+      let done = false
+      const build = new Build()
+      build.subscribe((event) => {
+        log.push(`${describeEvent(event)} by ${event.taskId}`)
+      })
+      build.subscribe((event) => {
+        if (done || event.kind !== "promised" || event.output.id !== "mem:a1") return
+        done = true
+        build.add(new Task({ id: "a", outputs: [new Mem("mem:z")], run: async () => {} }))
+      })
+      build.add(
+        new Task({ id: "a", outputs: [new Mem("mem:a1"), new Mem("mem:a2")], run: async () => {} }),
+      )
+      await build.run()
+
+      expect(log).toEqual([
+        "promised mem:a1 by a",
+        "withdrawn mem:a1 by a",
+        "promised mem:z by a",
+        "produced mem:z by a",
+      ])
+    })
+
+    test("a remove during the promised events of an add after run() started", async () => {
+      const log: string[] = []
+      const build = new Build()
+      build.subscribe((event) => {
+        log.push(`${describeEvent(event)} by ${event.taskId}`)
+      })
+      build.subscribe((event) => {
+        if (event.kind === "promised" && event.output.id === "mem:x1") build.remove("x")
+      })
+      const running = build.run()
+      build.add(
+        new Task({ id: "x", outputs: [new Mem("mem:x1"), new Mem("mem:x2")], run: async () => {} }),
+      )
+      await running
+
+      expect(log).toEqual(["promised mem:x1 by x", "withdrawn mem:x1 by x"])
+    })
+
+    test("an add of the same id during the withdrawn events of a remove", async () => {
+      const log: string[] = []
+      let done = false
+      const build = new Build()
+      build.subscribe((event) => {
+        log.push(`${describeEvent(event)} by ${event.taskId}`)
+      })
+      build.subscribe((event) => {
+        if (done || event.kind !== "withdrawn" || event.output.id !== "mem:x1") return
+        done = true
+        build.add(
+          new Task({ id: "x", outputs: [new Mem("mem:x1"), new Mem("mem:x2")], run: async () => {} }),
+        )
+      })
+      build.add(
+        new Task({ id: "x", outputs: [new Mem("mem:x1"), new Mem("mem:x2")], run: async () => {} }),
+      )
+      const running = build.run()
+      build.remove("x")
+      await running
+
+      // mem:x2 was never withdrawn, so the new task does not promise it again.
+      expect(log).toEqual([
+        "promised mem:x1 by x",
+        "promised mem:x2 by x",
+        "withdrawn mem:x1 by x",
+        "promised mem:x1 by x",
+        "produced mem:x1 by x",
+        "produced mem:x2 by x",
+      ])
+    })
+  })
+
+  test("an artifact and a prefix with the same id are different outputs", async () => {
+    const log: string[] = []
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const build = new Build()
+    build.subscribe((event) => {
+      if (event.kind === "produced") return
+      const kind = isPrefix(event.output) ? "prefix" : "artifact"
+      log.push(`${event.kind} ${kind} ${event.output.id}`)
+    })
+    const running = build.run()
+    build.add(new Task({ id: "t", outputs: [new MemDir("mem:out/", [])], run: () => gate }))
+    build.add(new Task({ id: "t", outputs: [new IdPrefix("mem:out/")], run: async () => {} }))
+    release()
+    await running
+    // A prefix that a task declares two times gets one event.
+    build.add(
+      new Task({
+        id: "twice",
+        outputs: [new IdPrefix("mem:two/"), new IdPrefix("mem:two/")],
+        run: async () => {},
+      }),
+    )
+
+    expect(log).toEqual([
+      "promised artifact mem:out/",
+      "withdrawn artifact mem:out/",
+      "promised prefix mem:out/",
+      "promised prefix mem:two/",
+    ])
+  })
 })
 
 function findOutput(outputs: readonly Ref[], id: string): Ref | null {
