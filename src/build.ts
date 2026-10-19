@@ -44,8 +44,8 @@ export class Build extends Emitter<ArtifactEvent> {
   // For each owner, the ids of the tasks that it gave. Slot.owner is the reverse.
   private readonly owners = new Map<string, Set<string>>()
   private readonly exactOutputs = new Map<string, { artifact: Artifact; taskId: string }>()
-  // The outputs that are regions: prefixes, and artifacts that cover others, such as directories.
-  private readonly regionOutputs: OutputEntry[] = []
+  // The prefix outputs of all tasks. The producer lookup scans them; exact outputs are in exactOutputs.
+  private readonly prefixOutputs: PrefixOutput[] = []
   private readonly outcomes = new Map<Task, Outcome>()
   private readonly errors: Error[] = []
   // The events that wait to go to the subscribers, oldest first.
@@ -326,8 +326,8 @@ export class Build extends Emitter<ArtifactEvent> {
       if (isArtifact(output)) {
         this.exactOutputs.set(output.id, { artifact: output, taskId: task.id })
       }
-      if (isRegion(output)) {
-        this.regionOutputs.push({ output, taskId: task.id })
+      if (isPrefix(output)) {
+        this.prefixOutputs.push({ output, taskId: task.id })
       }
     }
   }
@@ -341,10 +341,10 @@ export class Build extends Emitter<ArtifactEvent> {
         }
       }
     }
-    for (let i = this.regionOutputs.length - 1; i >= 0; i--) {
-      const entry = this.regionOutputs[i]
+    for (let i = this.prefixOutputs.length - 1; i >= 0; i--) {
+      const entry = this.prefixOutputs[i]
       if (entry && entry.taskId === task.id) {
-        this.regionOutputs.splice(i, 1)
+        this.prefixOutputs.splice(i, 1)
       }
     }
   }
@@ -378,8 +378,8 @@ export class Build extends Emitter<ArtifactEvent> {
         ids.add(entry.taskId)
       }
     }
-    for (const entry of this.regionOutputs) {
-      if (isPrefix(entry.output) && input.overlaps(entry.output)) {
+    for (const entry of this.prefixOutputs) {
+      if (input.overlaps(entry.output)) {
         ids.add(entry.taskId)
       }
     }
@@ -390,8 +390,8 @@ export class Build extends Emitter<ArtifactEvent> {
     if (exact) {
       ids.add(exact.taskId)
     }
-    for (const entry of this.regionOutputs) {
-      if (isPrefix(entry.output) && entry.output.covers(input)) {
+    for (const entry of this.prefixOutputs) {
+      if (entry.output.covers(input)) {
         ids.add(entry.taskId)
       }
     }
@@ -727,7 +727,7 @@ export class Build extends Emitter<ArtifactEvent> {
 type StampMap = Record<string, string | null>
 
 /** An output and the task that declares it. */
-type OutputEntry = { output: Ref; taskId: string }
+type PrefixOutput = { output: Prefix; taskId: string }
 
 /** An empty stamp map with no prototype, so that an id such as "__proto__" is a plain key. */
 function newStampMap(): StampMap {
@@ -744,12 +744,6 @@ function sameStamps(recorded: StampMap, current: StampMap): boolean {
     if (recorded[id] !== current[id]) return false
   }
   return true
-}
-
-/** True when `ref` stands for a region of ids: a prefix, or an artifact such as a directory. */
-function isRegion(ref: Ref): boolean {
-  if (isPrefix(ref)) return true
-  return ref.coversOthers
 }
 
 /** True when each value is a string or null. A stamp map from an older record is not. */

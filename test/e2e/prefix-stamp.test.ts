@@ -274,7 +274,9 @@ describe("prefix layouts that overlap", () => {
             runs += 1
             const names = await readdir(pagesDir)
             names.sort()
-            await writeFile(indexPath, names.join(","))
+            // One more "#" on each run, so the size changes even inside one clock tick.
+            const marks = "#".repeat(runs)
+            await writeFile(indexPath, `${names.join(",")} ${marks}`)
           },
         }),
       )
@@ -285,13 +287,13 @@ describe("prefix layouts that overlap", () => {
     expect(first.success).toBe(true)
     expect(ids(first.executed)).toEqual(["index"])
     expect(runs).toBe(1)
-    expect(await readFile(indexPath, "utf8")).toBe("a.md")
+    expect(await readFile(indexPath, "utf8")).toBe("a.md #")
 
     // No edits. The last run wrote index.html into pages/, so the input stamp changed.
     const second = await runOnce()
     expect(ids(second.executed)).toEqual(["index"])
     expect(runs).toBe(2)
-    expect(await readFile(indexPath, "utf8")).toBe("a.md,index.html")
+    expect(await readFile(indexPath, "utf8")).toBe("a.md,index.html ##")
     const third = await runOnce()
     expect(ids(third.executed)).toEqual(["index"])
     expect(runs).toBe(3)
@@ -304,6 +306,7 @@ describe("prefix layouts that overlap", () => {
     await mkdir(pagesDir)
     await writeFile(path.join(pagesDir, "a.md"), "A")
     const store = new JsonStore(path.join(root, "state.json"))
+    let runs = 0
 
     const runOnce = async () => {
       const pages = directory(pagesDir)
@@ -314,8 +317,11 @@ describe("prefix layouts that overlap", () => {
           inputs: [pages],
           outputs: [file(indexPath)],
           run: async () => {
+            runs += 1
             const files = await pages.read()
-            await writeFile(indexPath, String(files.length))
+            // One more "#" on each run, so the size changes even inside one clock tick.
+            const marks = "#".repeat(runs)
+            await writeFile(indexPath, `${files.length} ${marks}`)
           },
         }),
       )
@@ -338,9 +344,13 @@ describe("prefix layouts that overlap", () => {
     await writeFile(path.join(root, "book.txt"), "one")
     const store = new JsonStore(path.join(root, ".dapat", "state.json"))
     let runs: string[] = []
+    let buildCount = 0
 
     const runOnce = async () => {
       runs = []
+      buildCount += 1
+      // One more "#" in each build, so each write changes the size even inside one clock tick.
+      const marks = "#".repeat(buildCount)
       const build = new Build({ store })
       // split owns the whole folder. index writes one file in it, and reads the page that split wrote.
       build.add(
@@ -351,7 +361,7 @@ describe("prefix layouts that overlap", () => {
           run: async () => {
             runs.push("split")
             await mkdir(outDir, { recursive: true })
-            await writeFile(pagePath, "one")
+            await writeFile(pagePath, `one ${marks}`)
           },
         }),
       )
@@ -362,7 +372,7 @@ describe("prefix layouts that overlap", () => {
           outputs: [file(indexPath)],
           run: async () => {
             runs.push("index")
-            await writeFile(indexPath, "page.html")
+            await writeFile(indexPath, `page.html ${marks}`)
           },
         }),
       )
