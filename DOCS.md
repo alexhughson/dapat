@@ -117,7 +117,7 @@ The repo has this build in `examples/first-build.ts`. Run it with `bun run examp
 
 - `success` is `true` when no task failed and `errors` is empty.
 - `executed` lists the tasks that ran and did not fail.
-- `skipped` lists the tasks that dapat did not run, because their outputs were current.
+- `skipped` lists the tasks that dapat did not run, because every stamp equalled the record ([section 6](#6-when-a-task-skips)).
 - `failed` is a `Map<Task, Error>`.
 - `cancelled` lists the tasks that were replaced or removed before they finished ([section 8](#8-failure-cancellation-and-replacement)).
 - `errors` lists the errors that no task owns: a non-abort error that a task throws after it was replaced or removed ([section 8](#replacement)), and a store delete that rejects ([section 8](#removal)).
@@ -250,16 +250,18 @@ build.run()
 │  │   ├─ a producer task failed           → this task fails: "dependency of '<id>' failed"
 │  │   └─ no task can make progress        → this task fails: "deadlock waiting for inputs of '<id>'"
 │  ├─ decide if the task can skip
+│  │   ├─ stamp every artifact input
 │  │   ├─ read the store record of the task
-│  │   ├─ stamp every artifact input and output
-│  │   └─ all stamps equal the record       → skipped
+│  │   ├─ stamp every artifact output
+│  │   ├─ all stamps equal the record       → skipped
+│  │   └─ store.get or stamp() throws       → this task fails
 │  ├─ task.run(ctx)
 │  │   ├─ ctx.produced(artifact)            → calls each subscriber before it returns
 │  │   └─ ctx.deleted(artifact)             → calls each subscriber before it returns
 │  └─ on success
 │      ├─ send a produced event for each declared artifact output that the task did not report
 │      │  with ctx.produced or ctx.deleted
-│      └─ store.set(task.id, stamps of inputs and outputs)
+│      └─ store.set(task.id, input stamps from before the run, output stamps from after it)
 └─ waits until every started task has finished → returns Result
 ```
 
@@ -359,12 +361,13 @@ dapat makes the decision for each task after the tasks that write its inputs fin
 
 dapat **skips** the task when all of these are true:
 
+- The task has at least one artifact input or artifact output. dapat ignores plain prefixes.
 - The build has a store, and the store has a record for the task id.
-- The record has the same input ids and the same output ids as the task. dapat counts artifact inputs and outputs only. It ignores plain prefixes.
+- The record has the same input ids and the same output ids as the task.
 - Each artifact output exists. Its stamp is not `null`.
 - The current stamp of each artifact input and output is equal to the stamp in the record.
 
-In all other cases, dapat **runs** the task. With no store, or with no record for the task, the task always runs.
+In all other cases, dapat **runs** the task. With no store, with no record for the task, or with no artifact input or output to compare, the task always runs.
 
 The examples below use a task `compile` with the input `src.txt` and the output `out.txt`. The build has a store.
 
@@ -379,14 +382,16 @@ Some more results of the rule:
 - You edit an output by hand. Its stamp is different from the record, so the task runs and writes the output again.
 - You touch an input, but its bytes do not change. `FileArtifact` uses a hash of the bytes as its stamp, so the stamp does not change. The task skips.
 - An input is missing on two builds in a row. Its stamp is `null` both times. The stamps are equal, so this input does not make the task run.
-- The task has no artifact inputs and no artifact outputs, for example only prefix outputs. After the first successful run, the task skips while its record exists.
+- The task has no artifact inputs and no artifact outputs. Examples are a task with only prefix outputs, a deploy task with no inputs and no outputs, and a task with only a plain prefix input. dapat has nothing to compare, so the task runs on each build.
 - A task deletes one of its declared artifact outputs and calls `ctx.deleted`. That output is then missing, so the task runs on each build. To delete an artifact and still skip, declare its folder as a prefix output. Call `ctx.deleted` on each run, also when the artifact is already gone. If you do not, dapat sends a `produced` event for the missing output after the task returns.
 
 dapat does not compare modification times. Older versions of dapat skipped a task when its outputs were newer than its inputs, as `make` does. That check is gone. Without a store record, a task runs.
 
-After a task runs with no error, dapat stamps its artifact inputs and outputs again, and it writes those stamps to the store. It does not write stamps for a failed task, so a failed task runs again on the next build.
+dapat stamps the artifact inputs before the task runs. After the task runs with no error, dapat stamps the artifact outputs. Then it writes the input stamps from before the run and the output stamps from after the run to the store. If an input changes while the task runs, the record keeps the old stamp, so the next build runs the task again. dapat does not write stamps for a failed task, so a failed task runs again on the next build.
 
-The `stamp()` methods do real I/O. For example, `FileArtifact.stamp()` reads and hashes the full file, and `DirectoryArtifact.stamp()` reads every file under the directory. dapat calls `stamp()` only when the build has a store. Before a task runs, it calls `stamp()` only when the store has a record for the task.
+The `stamp()` methods do real I/O. For example, `FileArtifact.stamp()` reads and hashes the full file, and `DirectoryArtifact.stamp()` reads every file under the directory. dapat calls `stamp()` only when the build has a store. Before a task runs, it always stamps the inputs. It stamps the outputs only when the store has a record for the task.
+
+If `store.get()` or a `stamp()` method throws during this check, the task fails with that error. It does not run. The tasks that read its outputs fail too, as for any failed task.
 
 ### 6.1 Why did a task run or skip?
 
@@ -403,7 +408,7 @@ The store keeps the stamps from the last successful run of each task. The store 
 | Store | Use it for |
 | --- | --- |
 | `MemoryStore` | Tests, and builds that repeat in one process |
-| `JsonStore(path)` | Small builds on one machine, in which few tasks finish at the same time |
+| `JsonStore(path)` | Small builds on one machine |
 | `SqliteStore(db or path)` | Larger builds, and builds with many parallel tasks. It uses the table `dapat_task_state`. |
 
 ```ts
@@ -414,10 +419,9 @@ const store = new SqliteStore(".dapat/state.db")
 const build = new Build({ store })
 ```
 
-`JsonStore` reads the whole file and writes it again for each change. It writes to `<path>.tmp` and then renames that file to `<path>`. It does not lock the file, so two processes must not use the same file at the same time. Parallel tasks in one build can also call `store.set` at the same time:
+`JsonStore` reads the whole file and writes it again for each change. It writes to a temp file with a unique name next to `<path>`, and then renames that file to `<path>`. One `JsonStore` object does its changes one at a time, so parallel tasks in one build do not lose records. It does not lock the file, so two processes, or two `JsonStore` objects with the same path, must not use the file at the same time.
 
-- Two calls that overlap can lose one record. The task then runs on the next build.
-- Overlapping calls share one `.tmp` file, so one `rename` can fail. The task that called it then fails.
+If the file is not valid JSON, each `get` throws, so each task fails. Call `store.clear()` or delete the file to start again.
 
 `SqliteStore` accepts an open `Database` from `bun:sqlite` or a file path. If you give a path, the store opens the database, and `close()` closes it. If you give a `Database`, `close()` does nothing.
 
@@ -739,13 +743,14 @@ A task skips only when the store has a record for it. To skip unchanged tasks in
 - the store file, for example `.dapat/state.json`.
 - the output files of the tasks.
 
-The stamps of `FileArtifact` and `DirectoryArtifact` are hashes of the bytes. A new checkout changes the modification time of each file, but not the stamps. If the cache is empty, every task runs.
+The stamps of `FileArtifact` and `DirectoryArtifact` are hashes of the bytes. A new checkout changes the modification time of each file, but not the stamps. The ids of these artifacts are absolute paths. So check out the repo at the same path on each CI run. At a different path, the ids change, and every task runs. If the cache is empty, every task runs.
 
 ## 12. Limits
 
 - **A task that skips sends no `produced` or `deleted` events.** This applies to its prefix outputs and to its declared outputs. A subscriber gets only the `promised` events of that task on the next build.
+- **A plain prefix input never makes a task run.** dapat cannot stamp a plain prefix input such as `IdPrefix` or `PathPrefix`, so the skip check does not see a change under it. If the task has other artifacts to compare, it skips when they are equal to the record. To run the task when the folder changes, use a prefix artifact as the input, for example `DirectoryArtifact` or `SqliteTableArtifact`.
 - **A prefix artifact input does not wait for a plain prefix output in a subfolder.** See [section 5](#how-dapat-finds-dependencies).
-- **`FileArtifact.stamp()` returns `null` for all errors.** For example, a permission error on a file looks like a missing file. The task then runs again and does not fail. Check file permissions when a task always runs.
+- **`FileArtifact.stamp()` returns `null` for all errors.** For example, a permission error on a file looks like a missing file. On an output, the task then runs again and does not fail. On an input, a `null` stamp on two builds in a row is equal, so the task can skip. Check file permissions when a task always runs or never runs.
 - **No timeout and no concurrency limit.** All ready tasks start at the same time. Add limits and timeouts in your task code ([section 11.2](#112-limit-parallel-work)), and use `ctx.signal` to stop work.
 - **Bun only.** The adapters use Bun APIs.
 
@@ -826,7 +831,7 @@ Type guards. They use `instanceof`.
 | Member | Description |
 | --- | --- |
 | `abstract readonly id: string` | Unique id. Artifacts with the same id are the same thing. |
-| `abstract stamp(): Promise<string \| null>` | A string that changes when the artifact changes. `null` if the artifact does not exist. dapat compares stamps for equality only. |
+| `abstract stamp(): Promise<string \| null>` | A string that changes when the artifact changes. `null` if the artifact does not exist. dapat compares stamps for equality only. A throw fails the task that dapat stamps the artifact for. |
 | `abstract read(): Promise<T>` | Reads the value. |
 | `covers(other: Artifact): boolean` | Default: `other.id === this.id`. Override it for listings. |
 | `get coversOthers(): boolean` | Default: `false`. Return `true` when `covers` can match other ids. |

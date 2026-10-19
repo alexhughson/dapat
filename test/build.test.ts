@@ -1251,6 +1251,183 @@ describe("the skip rule", () => {
     const second = await runOnce(compile([src], out, runs), store)
     expect(second.skipped).toEqual(["compile"])
   })
+
+  test("a task with only prefix outputs runs on each build", async () => {
+    const store = new MemoryStore()
+    let runs = 0
+    const split = () =>
+      new Task({
+        id: "split",
+        outputs: [new IdPrefix("mem:pages/")],
+        run: async (ctx) => {
+          runs += 1
+          ctx.produced(new Mem("mem:pages/1", "p1"))
+        },
+      })
+
+    await runOnce(split(), store)
+    const second = await runOnce(split(), store)
+    expect(second.executed).toEqual(["split"])
+    expect(runs).toBe(2)
+  })
+
+  test("a task with no inputs and no outputs runs on each build", async () => {
+    const store = new MemoryStore()
+    let runs = 0
+    const deploy = () =>
+      new Task({
+        id: "deploy",
+        run: async () => {
+          runs += 1
+        },
+      })
+
+    await runOnce(deploy(), store)
+    const second = await runOnce(deploy(), store)
+    expect(second.executed).toEqual(["deploy"])
+    expect(runs).toBe(2)
+  })
+
+  test("a task with a plain prefix input and no artifact output runs on each build", async () => {
+    const store = new MemoryStore()
+    let runs = 0
+    const index = () =>
+      new Task({
+        id: "index",
+        inputs: [new IdPrefix("mem:pages/")],
+        run: async () => {
+          runs += 1
+        },
+      })
+
+    await runOnce(index(), store)
+    const second = await runOnce(index(), store)
+    expect(second.executed).toEqual(["index"])
+    expect(runs).toBe(2)
+  })
+
+  test("an input that changes during the run makes the next build run", async () => {
+    const src = new Mem("mem:src", "a")
+    const out = new Mem("mem:out")
+    const store = new MemoryStore()
+    let runs = 0
+    const make = () =>
+      new Task({
+        id: "compile",
+        inputs: [src],
+        outputs: [out],
+        run: async () => {
+          runs += 1
+          out.write(`compiled ${src.value}`)
+          // Someone edits the input after the task read it.
+          if (runs === 1) src.write("b")
+        },
+      })
+
+    await runOnce(make(), store)
+    expect(out.value).toBe("compiled a")
+    const record = await store.get("compile")
+    expect(record?.inputStamps["mem:src"]).toBe("a")
+
+    const second = await runOnce(make(), store)
+    expect(second.executed).toEqual(["compile"])
+    expect(out.value).toBe("compiled b")
+    const third = await runOnce(make(), store)
+    expect(third.skipped).toEqual(["compile"])
+  })
+
+  test("a stamp() that throws fails the task, and the tasks that read its outputs", async () => {
+    class Broken extends Mem {
+      override async stamp(): Promise<string | null> {
+        throw new Error(`cannot stamp ${this.id}`)
+      }
+    }
+    const broken = new Broken("mem:broken", "x")
+    const mid = new Mem("mem:mid")
+    const out = new Mem("mem:out")
+    let runs = 0
+    const build = new Build({ store: new MemoryStore() })
+    build.add(
+      new Task({
+        id: "first",
+        inputs: [broken],
+        outputs: [mid],
+        run: async () => {
+          runs += 1
+        },
+      }),
+    )
+    build.add(
+      new Task({
+        id: "second",
+        inputs: [mid],
+        outputs: [out],
+        run: async () => {
+          runs += 1
+        },
+      }),
+    )
+
+    const result = await build.run()
+    expect(result.success).toBe(false)
+    expect(runs).toBe(0)
+    const messages: string[] = []
+    for (const [task, error] of result.failed) {
+      messages.push(`${task.id}: ${error.message}`)
+    }
+    messages.sort()
+    expect(messages).toEqual([
+      "first: cannot stamp mem:broken",
+      "second: dependency of 'second' failed",
+    ])
+  })
+
+  test("without a store, the build reads no stamps", async () => {
+    let reads = 0
+    class Counted extends Mem {
+      override async stamp(): Promise<string | null> {
+        reads += 1
+        return this.value
+      }
+    }
+    const src = new Counted("mem:src", "a")
+    const out = new Counted("mem:out")
+    const runs = { count: 0 }
+
+    await runOnce(compile([src], out, runs))
+    await runOnce(compile([src], out, runs))
+    expect(runs.count).toBe(2)
+    expect(reads).toBe(0)
+  })
+
+  test("an artifact id \"__proto__\" keeps its stamp in the record", async () => {
+    const src = new Mem("__proto__", "a")
+    const out = new Mem("mem:out")
+    const store = new MemoryStore()
+    const runs = { count: 0 }
+
+    await runOnce(compile([src], out, runs), store)
+    const record = await store.get("compile")
+    expect(Object.keys(record?.inputStamps ?? {})).toEqual(["__proto__"])
+    const second = await runOnce(compile([src], out, runs), store)
+    expect(second.skipped).toEqual(["compile"])
+    src.write("b")
+    const third = await runOnce(compile([src], out, runs), store)
+    expect(third.executed).toEqual(["compile"])
+  })
+
+  test("a record whose stamp maps are arrays counts as no record", async () => {
+    // The input id "0" matches the array index, so only the shape check stops a skip.
+    const src = new Mem("0", "a")
+    const out = new Mem("mem:out", "obj")
+    const store = new MemoryStore()
+    const badRecord = { inputStamps: ["a"], outputStamps: { "mem:out": "obj" } }
+    await store.set("compile", badRecord as unknown as TaskState)
+    const runs = { count: 0 }
+
+    const first = await runOnce(compile([src], out, runs), store)
+    expect(first.executed).toEqual(["compile"])
+  })
 })
 
 describe("promised and withdrawn events", () => {

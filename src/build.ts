@@ -459,7 +459,22 @@ export class Build extends Emitter<ArtifactEvent> {
       return
     }
 
-    const skip = await this.canSkip(slot.task)
+    // The input stamps from before the run. The record keeps these, so an input
+    // that changes during the run makes the next build run the task again.
+    let inputStamps: StampMap | null = null
+    let skip = false
+    try {
+      if (this.store) {
+        inputStamps = await this.stampMap(this.artifactRefs(slot.task.inputs))
+        skip = await this.canSkip(this.store, slot.task, inputStamps)
+      }
+    } catch (error) {
+      // A store or a stamp() that throws fails the task, as an error in task.run does.
+      if (generation !== slot.generation) return
+      if (this.fatal !== null) return
+      this.finish(slot, { type: "failed", error: toError(error) })
+      return
+    }
     if (generation !== slot.generation) return
     if (this.fatal !== null) return
     if (skip) {
@@ -475,7 +490,7 @@ export class Build extends Emitter<ArtifactEvent> {
     try {
       await slot.task.run(ctx)
       if (this.endIfStopped(slot, generation)) return
-      await this.recordSuccess(slot, generation)
+      await this.recordSuccess(slot, generation, inputStamps)
       if (this.endIfStopped(slot, generation)) return
       this.finish(slot, { type: "executed" })
     } catch (error) {
@@ -570,7 +585,11 @@ export class Build extends Emitter<ArtifactEvent> {
     return false
   }
 
-  private async recordSuccess(slot: Slot, generation: number): Promise<void> {
+  private async recordSuccess(
+    slot: Slot,
+    generation: number,
+    inputStamps: StampMap | null,
+  ): Promise<void> {
     for (const output of slot.task.outputs) {
       // A subscriber can remove or replace this task. Then it sends no more events.
       // Each event is sent alone, so that the next check sees the change.
@@ -586,7 +605,7 @@ export class Build extends Emitter<ArtifactEvent> {
     // Subscribers did not get every event, so the build keeps no record.
     if (this.fatal !== null) return
     if (!this.store) return
-    const inputStamps = await this.stampMap(this.artifactRefs(slot.task.inputs))
+    if (inputStamps === null) return
     const outputStamps = await this.stampMap(this.artifactRefs(slot.task.outputs))
     if (generation !== slot.generation) return
     // A fatal error can come during the stamp reads above.
@@ -602,24 +621,32 @@ export class Build extends Emitter<ArtifactEvent> {
   protected override rejected(): void {}
 
   /**
-   * True when the store has a record for the task, the record has the same input and
-   * output ids, every output exists, and every stamp equals the recorded stamp.
+   * True when the task has an artifact input or output, the store has a record for the
+   * task, the record has the same input and output ids, every output exists, and every
+   * stamp equals the recorded stamp. `inputStamps` are the current input stamps.
    */
-  private async canSkip(task: Task): Promise<boolean> {
-    if (!this.store) return false
-    const record = await this.store.get(task.id)
+  private async canSkip(store: Store, task: Task, inputStamps: StampMap): Promise<boolean> {
+    const outputs = this.artifactRefs(task.outputs)
+    // With no stamps to compare, a record cannot show that the task is current.
+    if (Object.keys(inputStamps).length === 0 && outputs.length === 0) return false
+    const record = await store.get(task.id)
     if (!record) return false
     // A record from an older version of dapat has a different shape. It counts as no record.
     if (!isStampMap(record.inputStamps)) return false
     if (!isStampMap(record.outputStamps)) return false
-
-    const inputStamps = await this.stampMap(this.artifactRefs(task.inputs))
-    const outputStamps = await this.stampMap(this.artifactRefs(task.outputs))
-    for (const id of Object.keys(outputStamps)) {
-      if (outputStamps[id] === null) return false
-    }
     if (!sameStamps(record.inputStamps, inputStamps)) return false
-    if (!sameStamps(record.outputStamps, outputStamps)) return false
+
+    const outputStamps = newStampMap()
+    for (const output of outputs) {
+      const stamp = await output.stamp()
+      if (stamp === null) return false
+      if (!Object.hasOwn(record.outputStamps, output.id)) return false
+      if (record.outputStamps[output.id] !== stamp) return false
+      outputStamps[output.id] = stamp
+    }
+    const recordedCount = Object.keys(record.outputStamps).length
+    const currentCount = Object.keys(outputStamps).length
+    if (recordedCount !== currentCount) return false
     return true
   }
 
@@ -631,8 +658,8 @@ export class Build extends Emitter<ArtifactEvent> {
     return artifacts
   }
 
-  private async stampMap(artifacts: Artifact[]): Promise<Record<string, string | null>> {
-    const result: Record<string, string | null> = {}
+  private async stampMap(artifacts: Artifact[]): Promise<StampMap> {
+    const result = newStampMap()
     for (const artifact of artifacts) {
       result[artifact.id] = await artifact.stamp()
     }
@@ -690,11 +717,16 @@ export class Build extends Emitter<ArtifactEvent> {
   }
 }
 
+/** Stamps keyed by artifact id. */
+type StampMap = Record<string, string | null>
+
+/** An empty stamp map with no prototype, so that an id such as "__proto__" is a plain key. */
+function newStampMap(): StampMap {
+  return Object.create(null) as StampMap
+}
+
 /** True when both maps have the same ids, and each id has the same stamp. */
-function sameStamps(
-  recorded: Record<string, string | null>,
-  current: Record<string, string | null>,
-): boolean {
+function sameStamps(recorded: StampMap, current: StampMap): boolean {
   const recordedIds = Object.keys(recorded)
   const currentIds = Object.keys(current)
   if (recordedIds.length !== currentIds.length) return false
@@ -706,8 +738,9 @@ function sameStamps(
 }
 
 /** True when each value is a string or null. A stamp map from an older record is not. */
-function isStampMap(value: unknown): value is Record<string, string | null> {
+function isStampMap(value: unknown): value is StampMap {
   if (typeof value !== "object" || value === null) return false
+  if (Array.isArray(value)) return false
   for (const stamp of Object.values(value)) {
     if (stamp === null) continue
     if (typeof stamp !== "string") return false
