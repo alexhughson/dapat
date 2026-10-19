@@ -548,6 +548,8 @@ A subscriber can change tasks during a send, and that change sends new events at
 
 So let only one subscriber change tasks in reaction to an event, or write subscribers that do not depend on the order of events for one artifact.
 
+A subscriber that undoes each change it sees never settles. For example, it removes a task on `promised` and adds it again on `withdrawn`. The calls nest until the stack overflows, and `result.errors` holds the overflow errors.
+
 ## 10. Built-in artifacts
 
 The [API reference](#api-reference) gives the full details of each class.
