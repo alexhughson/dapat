@@ -26,18 +26,24 @@ class Slot {
   // The first listener error from a send that this task caused. The task fails with it.
   listenerError: Error | null = null
 
-  constructor(public task: Task) {}
+  constructor(
+    public task: Task,
+    // The owner that gave the task: `add:<task id>` for build.add.
+    public owner: string,
+  ) {}
 }
 
 export class Build extends Emitter<ArtifactEvent> {
   private readonly store: Store | undefined
   private readonly slots = new Map<string, Slot>()
+  // For each owner, the ids of the tasks that it gave. Slot.owner is the reverse.
+  private readonly owners = new Map<string, Set<string>>()
   private readonly exactOutputs = new Map<string, { artifact: Artifact; taskId: string }>()
   private readonly prefixOutputs: { prefix: Prefix; taskId: string }[] = []
   private readonly outcomes = new Map<Task, Outcome>()
   private readonly errors: Error[] = []
   // For each task id, the outputs that subscribers were last told about, by refKey.
-  // After a top-level add, remove, or run() returns, each entry equals the
+  // After a top-level add, remove, setTasks, or run() returns, each entry equals the
   // current outputs of that task id, or is gone when no task has that id.
   private readonly told = new Map<string, Map<string, Ref>>()
 
@@ -57,64 +63,111 @@ export class Build extends Emitter<ArtifactEvent> {
   }
 
   add(task: Task): void {
-    const existing = this.slots.get(task.id)
-    this.assertAddable(task, existing ? task.id : null)
-
-    const slot = new Slot(task)
-    if (existing) {
-      // A running task sees the new generation, so its later ctx.produced and ctx.deleted do nothing.
-      existing.generation += 1
-      this.unindex(existing.task)
-      if (existing.phase === "pending") {
-        this.finish(existing, { type: "cancelled", reason: "replaced" })
-      }
-    }
-
-    this.slots.set(task.id, slot)
-    this.index(task)
-    // abort() runs the task's abort listeners at once, so the state must be whole first.
-    if (existing && existing.phase === "running" && existing.abort) {
-      existing.abort.abort()
-    }
-
-    if (this.started) {
-      this.kick(slot)
-    }
-    this.wake()
-    this.tell(task.id)
+    this.setTasks(`add:${task.id}`, [task])
   }
 
+  /** Removes the task from its owner. The owner's other tasks stay. */
   remove(id: string): void {
     const slot = this.slots.get(id)
     if (!slot) return
+    this.change(slot.owner, [], [slot])
+  }
 
-    // A running task sees the new generation, so its later ctx.produced and ctx.deleted do nothing.
-    slot.generation += 1
-    this.unindex(slot.task)
-    const wasRunning = slot.phase === "running"
-    this.slots.delete(id)
-    if (this.store) {
-      void this.store.delete(id)
+  /**
+   * Makes `tasks` the tasks of `owner`. Adds each new id, replaces each known id,
+   * and removes each id that the owner gave before and does not give now.
+   * Rules call it. Throws, with no change, if another owner has one of the ids.
+   */
+  protected setTasks(owner: string, tasks: readonly Task[]): void {
+    this.assertSettable(owner, tasks)
+    const given = new Set<string>()
+    for (const task of tasks) {
+      given.add(task.id)
     }
-    if (slot.phase !== "completed") {
-      this.finish(slot, { type: "cancelled", reason: "removed" })
+    const dropped: Slot[] = []
+    const before = this.owners.get(owner) ?? new Set<string>()
+    for (const id of before) {
+      if (given.has(id)) continue
+      dropped.push(this.slots.get(id)!)
     }
-    // abort() runs the task's abort listeners at once, so the state must be whole first.
-    if (wasRunning && slot.abort) {
-      slot.abort.abort()
+    this.change(owner, tasks, dropped)
+  }
+
+  /**
+   * Adds or replaces each task in `tasks` and removes each slot in `dropped`.
+   * It changes all state first, and then sends the events.
+   */
+  private change(owner: string, tasks: readonly Task[], dropped: readonly Slot[]): void {
+    const replaced: Slot[] = []
+    // A stopped task sees the new generation, so its later ctx.produced and ctx.deleted do nothing.
+    for (const slot of dropped) {
+      slot.generation += 1
+      this.unindex(slot.task)
+      this.slots.delete(slot.task.id)
     }
+    for (const task of tasks) {
+      const existing = this.slots.get(task.id)
+      if (existing) {
+        existing.generation += 1
+        this.unindex(existing.task)
+        replaced.push(existing)
+      }
+      this.slots.set(task.id, new Slot(task, owner))
+      this.index(task)
+    }
+
+    const ids = new Set(this.owners.get(owner))
+    for (const slot of dropped) {
+      ids.delete(slot.task.id)
+    }
+    for (const task of tasks) {
+      ids.add(task.id)
+    }
+    if (ids.size === 0) {
+      this.owners.delete(owner)
+    } else {
+      this.owners.set(owner, ids)
+    }
+
+    // finish wakes the waiting tasks, and abort() runs the task's abort listeners
+    // at once, so the state must be whole first.
+    const running: Slot[] = []
+    for (const slot of dropped) {
+      if (slot.phase === "running") running.push(slot)
+      if (this.store) {
+        void this.store.delete(slot.task.id)
+      }
+      if (slot.phase !== "completed") {
+        this.finish(slot, { type: "cancelled", reason: "removed" })
+      }
+    }
+    for (const slot of replaced) {
+      if (slot.phase === "running") running.push(slot)
+      // A running task that is replaced ends as cancelled when its run returns (endIfStopped).
+      if (slot.phase === "pending") {
+        this.finish(slot, { type: "cancelled", reason: "replaced" })
+      }
+    }
+    for (const slot of running) {
+      if (slot.abort) slot.abort.abort()
+    }
+
     this.wake()
-    this.tell(id)
+    const changedIds: string[] = []
+    for (const slot of dropped) {
+      changedIds.push(slot.task.id)
+    }
+    for (const task of tasks) {
+      changedIds.push(task.id)
+    }
+    this.tell(changedIds)
   }
 
   async run(): Promise<Result> {
     if (!this.started) {
       this.started = true
       // Tells subscribers about the tasks that were added before the first run().
-      const ids = [...this.slots.keys()]
-      for (const id of ids) {
-        this.tell(id)
-      }
+      this.tell([...this.slots.keys()])
     }
     for (const slot of this.slots.values()) {
       this.kick(slot)
@@ -125,23 +178,25 @@ export class Build extends Emitter<ArtifactEvent> {
 
   /**
    * Sends withdrawn and promised events until the subscribers know the current
-   * outputs of task `id`. Before the first run(), it sends nothing.
+   * outputs of each task id in `ids`. Before the first run(), it sends nothing.
    */
-  private tell(id: string): void {
+  private tell(ids: readonly string[]): void {
     if (!this.started) return
-    this.sendAll(this.outputChanges(id))
+    this.sendAll(this.outputChanges(ids))
   }
 
   /**
    * Yields one event at a time. Each event comes from the state at the time
-   * that sendAll asks for it, so a subscriber that changes the task during a
+   * that sendAll asks for it, so a subscriber that changes a task during a
    * send never gets a stale event.
    */
-  private *outputChanges(id: string): Generator<ArtifactEvent> {
-    while (true) {
-      const event = this.nextOutputChange(id)
-      if (event === null) return
-      yield event
+  private *outputChanges(ids: readonly string[]): Generator<ArtifactEvent> {
+    for (const id of ids) {
+      let event = this.nextOutputChange(id)
+      while (event !== null) {
+        yield event
+        event = this.nextOutputChange(id)
+      }
     }
   }
 
@@ -176,19 +231,41 @@ export class Build extends Emitter<ArtifactEvent> {
     return null
   }
 
-  private assertAddable(task: Task, replacingId: string | null): void {
-    const seen = new Set<string>()
-    for (const output of task.outputs) {
-      if (!isArtifact(output)) continue
-      if (seen.has(output.id)) {
-        throw new Error(`task '${task.id}' declares output '${output.id}' twice`)
+  /** Throws if `setTasks(owner, tasks)` would break a rule of the build. */
+  private assertSettable(owner: string, tasks: readonly Task[]): void {
+    const ids = new Set<string>()
+    // Each exact output id in `tasks`, and the task that declares it.
+    const claims = new Map<string, string>()
+    for (const task of tasks) {
+      if (ids.has(task.id)) {
+        throw new Error(`owner '${owner}' gives task '${task.id}' twice`)
       }
-      seen.add(output.id)
-      const owner = this.exactOutputs.get(output.id)
-      if (owner && owner.taskId !== task.id && owner.taskId !== replacingId) {
+      ids.add(task.id)
+      const existing = this.slots.get(task.id)
+      if (existing && existing.owner !== owner) {
         throw new Error(
-          `duplicate output '${output.id}': claimed by '${owner.taskId}' and '${task.id}'`,
+          `task '${task.id}' has two owners: '${existing.owner}' and '${owner}'`,
         )
+      }
+      for (const output of task.outputs) {
+        if (!isArtifact(output)) continue
+        const claimedBy = claims.get(output.id)
+        if (claimedBy === task.id) {
+          throw new Error(`task '${task.id}' declares output '${output.id}' twice`)
+        }
+        if (claimedBy !== undefined) {
+          throw new Error(
+            `duplicate output '${output.id}': claimed by '${claimedBy}' and '${task.id}'`,
+          )
+        }
+        claims.set(output.id, task.id)
+        // The tasks of this owner are all replaced or removed, so their outputs are free.
+        const claimer = this.exactOutputs.get(output.id)
+        if (claimer && this.slots.get(claimer.taskId)!.owner !== owner) {
+          throw new Error(
+            `duplicate output '${output.id}': claimed by '${claimer.taskId}' and '${task.id}'`,
+          )
+        }
       }
     }
   }
@@ -206,8 +283,8 @@ export class Build extends Emitter<ArtifactEvent> {
   private unindex(task: Task): void {
     for (const output of task.outputs) {
       if (isArtifact(output)) {
-        const owner = this.exactOutputs.get(output.id)
-        if (owner && owner.taskId === task.id) {
+        const claimer = this.exactOutputs.get(output.id)
+        if (claimer && claimer.taskId === task.id) {
           this.exactOutputs.delete(output.id)
         }
       }

@@ -239,6 +239,8 @@ new Task({
 
 The task `id` must be unique in a build. The store uses the task `id` as its key, so use an id that stays the same from run to run.
 
+Each task in a build has one owner. `build.add(task)` gives the task the owner `add:<task id>`, so a replacement with the same id has the same owner. Later versions of dapat add rules, which make tasks under their own owners. A task id can have only one owner, so `build.add` will throw if a rule already made a task with the same id. `build.remove(id)` removes the task from its owner, and the owner can give the same id again later. For `build.add` and `build.remove`, owners change nothing else.
+
 The task writes its outputs itself. dapat does not write, move, or delete files. When a task deletes an artifact, it reports the delete with `ctx.deleted(artifact)`.
 
 ### What `build.run()` does
@@ -711,8 +713,9 @@ new Build(opts?: { store?: Store })
 | Member | Description |
 | --- | --- |
 | `add(task: Task): void` | Adds a task. If a task with the same id exists, replaces it (see [section 8](#replacement)). If `run()` has started, sends a `promised` event for each declared output, and the task starts at once. Throws if another task already declares one of its exact outputs, or if the task declares one output twice. |
-| `remove(id: string): void` | Removes a task. Aborts it if it is running and sends a `withdrawn` event for each declared output. Starts to delete its store record, but does not wait for the delete. Does nothing if the id is not known. |
+| `remove(id: string): void` | Removes a task. Aborts it if it is running and sends a `withdrawn` event for each declared output. Starts to delete its store record, but does not wait for the delete. Does nothing if the id is not known. The other tasks of the same owner stay. |
 | `subscribe(listener: (event: ArtifactEvent) => void): void` | From `Emitter`. Calls `listener` synchronously for each artifact event. Does not replay earlier events. See [section 9](#9-subscribe-to-artifact-events). |
+| `protected setTasks(owner: string, tasks: readonly Task[]): void` | Makes `tasks` the tasks of `owner` ([section 5](#5-tasks-and-dependencies)). Adds each new id, replaces each known id, and removes each id that `owner` gave before and does not give now. Changes all state first, then sends the events for each removed id and then for each given id, in order. Throws and changes nothing if another owner has one of the ids, if `tasks` has one id two times, or if two tasks declare one exact output. `add(task)` calls `setTasks("add:" + task.id, [task])`. Rules will call it; your code does not. |
 | `run(): Promise<Result>` | The first time, sends a `promised` event for each output of each task that is in the build. Then starts every task and resolves when every started task has finished. Does not reject when a task fails. |
 
 ### `class Task`
