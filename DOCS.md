@@ -122,7 +122,7 @@ The repo has this build in `examples/first-build.ts`. Run it with `bun run examp
 - `cancelled` lists the tasks that were replaced or removed before they finished ([section 8](#8-failure-cancellation-and-replacement)).
 - `errors` lists the errors that no task owns: a non-abort error that a task throws after it was replaced or removed ([section 8](#replacement)), and a store delete that rejects ([section 8](#removal)).
 
-A failed task does not stop the build. The other tasks continue. `build.run()` does not throw when a task fails, so always check `result.success`. `build.run()` rejects only when a subscriber throws ([section 9](#subscriber-errors)).
+A failed task does not stop the build. The other tasks continue. `build.run()` does not throw when a task fails, so always check `result.success`. `build.run()` rejects in three cases only: a subscriber throws, a subscriber returns a promise, or subscribers reach the send limit ([section 9](#subscriber-errors)).
 
 Call `build.run()` one time for each `Build`. A second call does not run the completed tasks again. To run the pipeline again, make a new `Build` with the same store.
 
@@ -289,7 +289,16 @@ A waiting task finds its producers again each time a task is added, removed, or 
 - If the producer was replaced, the waiting task waits for the new task with the same id.
 - If the producer was removed, the waiting task goes on to the skip check. It does not fail.
 
-If you add a producer after `build.run()` starts, a consumer waits for it only if that consumer is still waiting for other inputs. A consumer that has already started does not stop.
+After `build.run()` starts, a new task looks for its producers after the code that added it returns. That code is the synchronous code that called `build.add` or `ctx.add`, and the whole cascade of subscribers that it causes ([The event queue](#the-event-queue)). Thus a consumer waits for a producer that the same code adds later, or that a subscriber adds when it hears about the consumer.
+
+If you add a producer after that, a consumer waits for it only if that consumer is still waiting for other inputs. A consumer that has already started does not stop.
+
+```ts
+await build.run()
+build.add(consumer) // reads x
+build.add(producer) // writes x
+await build.run()   // consumer waits for producer
+```
 
 Tasks with no dependency between them run at the same time. dapat has no concurrency limit. [Section 11.2](#112-limit-parallel-work) shows how to limit parallel work inside `run`.
 
@@ -459,7 +468,7 @@ Your task code must stop work when `ctx.signal` aborts. dapat does not stop a ru
 
 `build.remove(id)` removes the task. It aborts the task if the task is running. It sends a `withdrawn` event for each output that the task declares. If the task had not finished, dapat marks it `cancelled` with the reason `"removed"`.
 
-`build.remove(id)` also starts to delete the store record for the task, but it does not wait for the delete. `build.run()` can return before the delete is done. A delete error goes into `result.errors` of the `build.run()` that is in progress, or of the next one.
+`build.remove(id)` also starts to delete the store record for the task. `build.remove` does not wait for the delete, but `build.run()` does. A delete error goes into `result.errors`.
 
 dapat does not delete files or objects. A `withdrawn` event only tells subscribers that the output will not come ([section 9](#9-subscribe-to-artifact-events)).
 
@@ -569,7 +578,7 @@ try {
 
 ### The event queue
 
-dapat keeps one queue of events for the build. A call that changes the state first changes the state, and then puts its events at the end of the queue. These calls are `add`, `remove`, `setTasks`, `ctx.produced`, `ctx.deleted`, the end of a task, and the start of the first `build.run()`. If no drain is in progress, the call then drains the queue: it sends one event at a time to every subscriber, until the queue is empty. The call returns after the drain.
+dapat keeps one queue of events for the build. A call that changes the state first changes the state, and then puts its events at the end of the queue. These calls are `add`, `remove`, `setTasks`, `ctx.produced`, `ctx.deleted`, the end of a task, and the start of the first `build.run()`. If no drain is in progress, the call then drains the queue: it sends one event at a time to every subscriber, until the queue is empty. When the drain ends, dapat starts the new tasks that can run. The call returns after that.
 
 A subscriber that changes tasks during a send does not start a new drain. Its events go at the end of the queue. The current event first reaches every subscriber, and then the new events follow. Thus every subscriber gets every event in the same order, and that order is the order of the state changes.
 
@@ -584,10 +593,12 @@ produced y by t
 
 Subscriber 2 gets `promised x by t` after `t` stopped declaring `x`, and then `withdrawn x by t`. A subscriber that applies every event in order ends with the true state. Do not act on one event in a way that a later event cannot undo.
 
-**The send limit.** One drain sends at most 10,000 events (`SEND_LIMIT`). To change the limit, use `new Build({ sendLimit })`. The limit stops a subscriber that undoes each change that it sees. For example, a subscriber removes a task on `promised` and adds it again on `withdrawn`. Then the queue never becomes empty. At the limit, the drain stops with this error:
+**The send limit.** During one drain, subscribers can cause at most 10,000 events (`SEND_LIMIT`). The limit counts only the events that subscribers cause during the drain. It does not count the events of the call that started the drain. Thus a `setTasks` call or a first `build.run()` with more than 10,000 outputs does not reach it. To change the limit, use `new Build({ sendLimit })`. The value must be a positive integer.
+
+The limit stops a subscriber that undoes each change that it sees. For example, a subscriber removes a task on `promised` and adds it again on `withdrawn`. Then the queue never becomes empty. At the limit, the drain stops with this error:
 
 ```text
-send limit: one drain sent 10000 events, and more wait; the last was 'withdrawn x by t'
+send limit: subscribers caused 10000 events in one drain, and more wait; the last sent was 'promised x by t'
 ```
 
 dapat handles this error as a subscriber error: `build.run()` rejects with it.
@@ -726,7 +737,6 @@ dapat then uses the content check, which does not depend on modification times. 
 - **A prefix artifact input does not wait for a plain prefix output in a subfolder.** See [section 5](#how-dapat-finds-dependencies).
 - **`FileArtifact` stamp methods return `null` for all errors.** For example, a permission error on a file looks like a missing file. The task then runs again and does not fail. Check file permissions when a task always runs.
 - **No timeout and no concurrency limit.** All ready tasks start at the same time. Add limits and timeouts in your task code ([section 11.2](#112-limit-parallel-work)), and use `ctx.signal` to stop work.
-- **`build.remove(id)` does not wait for the store.** Do not depend on the record being deleted when `build.run()` returns.
 - **Bun only.** The adapters use Bun APIs.
 
 ---
@@ -743,12 +753,12 @@ All paths in this section are relative to the repo root. `dapat` is `src/index.t
 new Build(opts?: { store?: Store; sendLimit?: number })
 ```
 
-`sendLimit` is the number of events that one drain of the event queue can send. The default is `SEND_LIMIT` (10,000), which `dapat` exports. See [The event queue](#the-event-queue).
+`sendLimit` is the number of events that subscribers can cause during one drain of the event queue. The default is `SEND_LIMIT` (10,000), which `dapat` exports. The constructor throws if `sendLimit` is not a positive integer. See [The event queue](#the-event-queue).
 
 | Member | Description |
 | --- | --- |
 | `add(task: Task): void` | Adds a task. If a task with the same id exists, replaces it (see [section 8](#replacement)). If `run()` has started, sends a `promised` event for each declared output, and the task starts at once. Does not throw when a subscriber throws ([section 9](#subscriber-errors)). Throws if another task already declares one of its exact outputs, if the task declares one output twice, or if another owner holds that id ([section 5](#5-tasks-and-dependencies)). |
-| `remove(id: string): void` | Removes a task. Aborts it if it is running and sends a `withdrawn` event for each declared output. Does not throw when a subscriber throws. Starts to delete its store record, but does not wait for the delete. A delete error goes into `result.errors`. Does nothing if the id is not known. The other tasks of the same owner stay. |
+| `remove(id: string): void` | Removes a task. Aborts it if it is running and sends a `withdrawn` event for each declared output. Does not throw when a subscriber throws. Starts to delete its store record. Does not wait for the delete, but `run()` does. A delete error goes into `result.errors`. Does nothing if the id is not known. The other tasks of the same owner stay. |
 | `subscribe(listener: (event: ArtifactEvent) => void): void` | From `Emitter`. Calls `listener` synchronously for each artifact event, in the order of the event queue. Does not replay earlier events. See [section 9](#9-subscribe-to-artifact-events). |
 | `protected setTasks(owner: string, tasks: readonly Task[]): void` | Makes `tasks` the tasks of `owner` ([section 5](#5-tasks-and-dependencies)). Adds each new id, replaces each known id, and removes each id that `owner` gave before and does not give now. Changes all state first, then puts the events on the queue: all `withdrawn` events of the call first, then the `promised` events, by id in list order. A dropped task ends as `cancelled` with the reason `"removed"` if it had not finished. Throws and changes nothing if another owner has one of the ids, if `tasks` has one id two times, or if two tasks declare one exact output. `add(task)` calls `setTasks("add:" + task.id, [task])`. Rules will call it; your code does not. |
 | `run(): Promise<Result>` | The first time, sends a `promised` event for each output of each task that is in the build. Then starts every task and resolves when every started task has finished. Does not reject when a task fails. Rejects with the first subscriber error or send-limit error of the build, at once if that error happened before the call ([section 9](#subscriber-errors)). |
@@ -890,7 +900,7 @@ type Outcome =
 | --- | --- |
 | `subscribe(listener: (event: E) => void): void` | Adds a listener. Listeners get events in the order that they subscribed. |
 | `protected send(event: E): void` | Calls each listener synchronously, in order. If a listener throws, `send` stops and throws that error to its caller. If a listener returns a promise, `send` throws an error. |
-| `protected rejected(reason: unknown): void` | Called when a listener's returned promise rejects. The default throws `reason` again, so the rejection stays unhandled. `Build` overrides it and keeps the error only if it is the first fatal error of the build ([section 9](#subscriber-errors)). |
+| `protected rejected(reason: unknown): void` | Called when a listener's returned promise rejects. The default throws `reason` again, so the rejection stays unhandled. `Build` overrides it with an empty method, so the rejection is not unhandled. The send already made `run()` reject ([section 9](#subscriber-errors)). |
 
 `Build` extends `Emitter<ArtifactEvent>`.
 

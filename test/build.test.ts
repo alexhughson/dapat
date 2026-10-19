@@ -807,7 +807,7 @@ describe("Build", () => {
 
   test("a subscriber error in one task's ctx.produced rejects run() and aborts the other running task", async () => {
     const bad = new Mem("mem:bad/1")
-    let aborted = false
+    let finished = false
     let started!: () => void
     const reached = new Promise<void>((resolve) => {
       started = resolve
@@ -827,25 +827,24 @@ describe("Build", () => {
         },
       }),
     )
-    // Ends only when its signal aborts.
+    // Waits for its signal to abort, and then works a little longer.
     build.add(
       new Task({
         id: "other",
         run: async (ctx) => {
           await new Promise<void>((resolve) => {
-            ctx.signal.addEventListener("abort", () => {
-              aborted = true
-              resolve()
-            })
+            ctx.signal.addEventListener("abort", () => resolve())
             started()
           })
-          ctx.signal.throwIfAborted()
+          await new Promise<void>((resolve) => setTimeout(resolve, 10))
+          finished = true
         },
       }),
     )
 
+    // run() rejects only after the aborted task returned.
     await expect(build.run()).rejects.toThrow("listener broke on bad")
-    expect(aborted).toBe(true)
+    expect(finished).toBe(true)
   })
 
   test("a subscriber that returns a promise rejects run(), and the promise's rejection is dropped", async () => {
@@ -1106,23 +1105,86 @@ describe("Build", () => {
     })
   }
 
-  test("a store delete that rejects goes to result.errors", async () => {
-    class BrokenDeleteStore extends MemoryStore {
-      override async delete(): Promise<void> {
-        throw new Error("delete broke")
+  test("run() waits for a store delete, and a delete that rejects goes to result.errors", async () => {
+    class SlowBrokenDeleteStore extends MemoryStore {
+      override async delete(id: string): Promise<void> {
+        await new Promise<void>((resolve) => setTimeout(resolve, 20))
+        throw new Error(`delete broke on ${id}`)
       }
     }
-    const build = new Build({ store: new BrokenDeleteStore() })
-    build.add(new Task({ id: "t", run: async () => {} }))
-    const first = await build.run()
-    expect(first.success).toBe(true)
+    const build = new Build({ store: new SlowBrokenDeleteStore() })
+    build.add(new Task({ id: "victim", inputs: [new Mem("mem:never")], outputs: [new Mem("mem:v")], run: async () => {} }))
+    build.add(
+      new Task({
+        id: "remover",
+        run: async (ctx) => {
+          ctx.remove("victim")
+        },
+      }),
+    )
+
+    const result = await build.run()
+    expect(result.success).toBe(false)
+    expect(result.errors.map((error) => error.message)).toEqual(["delete broke on victim"])
+  })
+
+  test("a store delete that throws at once does not stop build.remove", async () => {
+    class ThrowingDeleteStore extends MemoryStore {
+      override delete(): Promise<void> {
+        throw new Error("delete broke at once")
+      }
+    }
+    const events: string[] = []
+    const build = new Build({ store: new ThrowingDeleteStore() })
+    build.subscribe((event) => {
+      events.push(describeEvent(event))
+    })
+    build.add(new Task({ id: "t", outputs: [new Mem("mem:a")], run: async () => {} }))
+    await build.run()
 
     build.remove("t")
-    // The build does not wait for the delete, so let it settle first.
-    await new Promise<void>((resolve) => setTimeout(resolve, 1))
+    expect(events).toEqual(["promised mem:a", "produced mem:a", "withdrawn mem:a"])
     const second = await build.run()
-    expect(second.success).toBe(false)
-    expect(second.errors.map((error) => error.message)).toEqual(["delete broke"])
+    expect(second.errors.map((error) => error.message)).toEqual(["delete broke at once"])
+  })
+
+  test("a fatal error during the stamp reads of a task stops its store record", async () => {
+    /** An artifact whose order stamp takes time to read, after the task wrote it. */
+    class SlowStamp extends Mem {
+      override async orderStamp(): Promise<bigint | null> {
+        if (this.value === null) return null
+        await new Promise<void>((resolve) => setTimeout(resolve, 30))
+        return this.order
+      }
+    }
+    const store = new MemoryStore()
+    const slow = new SlowStamp("mem:slow")
+    const build = new Build({ store })
+    build.subscribe((event) => {
+      if (event.kind === "produced" && event.taskId === "b") throw new Error("late fatal")
+    })
+    build.add(
+      new Task({
+        id: "a",
+        outputs: [slow],
+        run: async () => {
+          slow.write("a", 1n, "a")
+        },
+      }),
+    )
+    // Its produced event comes while "a" reads its stamps.
+    build.add(
+      new Task({
+        id: "b",
+        outputs: [new Mem("mem:b")],
+        run: async () => {
+          await new Promise<void>((resolve) => setTimeout(resolve, 10))
+        },
+      }),
+    )
+
+    await expect(build.run()).rejects.toThrow("late fatal")
+    expect(await store.get("a")).toBeNull()
   })
 
   test("task can add another task during run", async () => {
@@ -1567,8 +1629,10 @@ describe("promised and withdrawn events", () => {
       })
       build.add(make())
 
+      // The first event started the drain. The subscriber caused each later one.
       await expect(build.run()).rejects.toThrow(
-        `send limit: one drain sent ${SEND_LIMIT} events, and more wait; the last was 'withdrawn mem:x by t'`,
+        `send limit: subscribers caused ${SEND_LIMIT} events in one drain, and more wait; ` +
+          "the last sent was 'promised mem:x by t'",
       )
     })
 
@@ -1583,9 +1647,154 @@ describe("promised and withdrawn events", () => {
       build.add(new Task({ id: "t", outputs: [new Mem("mem:x")], run: async () => {} }))
 
       await expect(build.run()).rejects.toThrow(
-        "send limit: one drain sent 5 events, and more wait; the last was 'promised mem:x by t'",
+        "send limit: subscribers caused 5 events in one drain, and more wait; the last sent was 'withdrawn mem:x by t'",
       )
-      expect(sent).toBe(5)
+      expect(sent).toBe(6)
+    })
+
+    test("the send limit does not count the events of the call that started the drain", async () => {
+      const build = new Build({ sendLimit: 3 })
+      for (let i = 0; i < 10; i++) {
+        build.add(new Task({ id: `t${i}`, outputs: [new Mem(`mem:${i}`)], run: async () => {} }))
+      }
+      const first = await build.run()
+      expect(first.executed.length).toBe(10)
+
+      class Owner extends Build {
+        give(tasks: Task[]): void {
+          this.setTasks("owner", tasks)
+        }
+      }
+      const owner = new Owner({ sendLimit: 3 })
+      await owner.run()
+      const tasks: Task[] = []
+      for (let i = 0; i < 10; i++) {
+        tasks.push(new Task({ id: `t${i}`, outputs: [new Mem(`mem:${i}`)], run: async () => {} }))
+      }
+      owner.give(tasks)
+      const second = await owner.run()
+      expect(second.executed.length).toBe(10)
+    })
+
+    test("the constructor rejects a send limit that is not a positive integer", () => {
+      for (const sendLimit of [0, -1, Number.NaN, 1.5]) {
+        expect(() => new Build({ sendLimit })).toThrow(`sendLimit must be a positive integer, not ${sendLimit}`)
+      }
+    })
+
+    test("the events of an abort listener that changes tasks come after the events of the change that aborted it", async () => {
+      const a = new Mem("mem:a")
+      const b = new Mem("mem:b")
+      const c = new Mem("mem:c")
+      const log: string[] = []
+      const promiser = new Map<string, string>()
+      let started!: () => void
+      const reached = new Promise<void>((resolve) => {
+        started = resolve
+      })
+      const build = new Build()
+      build.subscribe((event) => {
+        log.push(`${describeEvent(event)} by ${event.taskId}`)
+        if (event.kind === "promised") promiser.set(event.output.id, event.taskId)
+        if (event.kind === "withdrawn") promiser.delete(event.output.id)
+      })
+      build.add(
+        new Task({
+          id: "t",
+          outputs: [a],
+          run: async (ctx) => {
+            // Clean-up code that declares t again, with another output.
+            ctx.signal.addEventListener("abort", () => {
+              ctx.add(new Task({ id: "t", outputs: [c], run: () => new Promise<void>(() => {}) }))
+            })
+            started()
+            await new Promise<void>((resolve) => ctx.signal.addEventListener("abort", () => resolve()))
+          },
+        }),
+      )
+
+      const running = build.run()
+      await reached
+      build.add(new Task({ id: "t", outputs: [b], run: async () => {} }))
+      expect(log).toEqual([
+        "promised mem:a by t",
+        "withdrawn mem:a by t",
+        "promised mem:b by t",
+        "withdrawn mem:b by t",
+        "promised mem:c by t",
+      ])
+      expect(promiser).toEqual(new Map([["mem:c", "t"]]))
+      build.remove("t")
+      await running
+    })
+  })
+
+  describe("a task added after run() started", () => {
+    test("waits for a producer that the same synchronous code adds later", async () => {
+      const dep = new Mem("mem:dep")
+      const log: string[] = []
+      const build = new Build()
+      await build.run()
+
+      build.add(
+        new Task({
+          id: "consumer",
+          inputs: [dep],
+          run: async () => {
+            log.push(`consumer reads ${dep.value}`)
+          },
+        }),
+      )
+      build.add(
+        new Task({
+          id: "producer",
+          outputs: [dep],
+          run: async () => {
+            await new Promise<void>((resolve) => setTimeout(resolve, 10))
+            dep.write("v", 1n, "v")
+            log.push("producer wrote")
+          },
+        }),
+      )
+      const result = await build.run()
+      expect(result.success).toBe(true)
+      expect(log).toEqual(["producer wrote", "consumer reads v"])
+    })
+
+    test("waits for a producer that a subscriber adds in the same cascade", async () => {
+      const dep = new Mem("mem:dep")
+      const log: string[] = []
+      const build = new Build()
+      // Adds the producer when it hears about the consumer.
+      build.subscribe((event) => {
+        if (event.kind !== "promised" || event.taskId !== "consumer") return
+        build.add(
+          new Task({
+            id: "producer",
+            outputs: [dep],
+            run: async () => {
+              await new Promise<void>((resolve) => setTimeout(resolve, 10))
+              dep.write("v", 1n, "v")
+              log.push("producer wrote")
+            },
+          }),
+        )
+      })
+      await build.run()
+
+      build.add(
+        new Task({
+          id: "consumer",
+          inputs: [dep],
+          outputs: [new Mem("mem:out")],
+          run: async () => {
+            log.push(`consumer reads ${dep.value}`)
+          },
+        }),
+      )
+      const result = await build.run()
+      expect(result.success).toBe(true)
+      expect(log).toEqual(["producer wrote", "consumer reads v"])
     })
   })
 

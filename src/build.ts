@@ -15,8 +15,11 @@ type Phase = "pending" | "running" | "completed"
 
 type WaitResult = "ok" | "failed" | "cancelled" | "deadlock"
 
-/** The default number of events that one drain of the event queue can send. */
+/** The default number of events that subscribers can cause during one drain of the event queue. */
 export const SEND_LIMIT = 10_000
+
+// The outputs of no task. Shared, and never changed.
+const NO_OUTPUTS: ReadonlyMap<string, Ref> = new Map()
 
 class Slot {
   generation = 1
@@ -59,7 +62,11 @@ export class Build extends Emitter<ArtifactEvent> {
   constructor(opts?: { store?: Store; sendLimit?: number }) {
     super()
     this.store = opts?.store
-    this.sendLimit = opts?.sendLimit ?? SEND_LIMIT
+    const sendLimit = opts?.sendLimit ?? SEND_LIMIT
+    if (!Number.isInteger(sendLimit) || sendLimit < 1) {
+      throw new Error(`sendLimit must be a positive integer, not ${sendLimit}`)
+    }
+    this.sendLimit = sendLimit
   }
 
   add(task: Task): void {
@@ -95,7 +102,8 @@ export class Build extends Emitter<ArtifactEvent> {
 
   /**
    * Adds or replaces each task in `tasks` and removes each slot in `dropped`.
-   * It changes all state first, and then sends the events.
+   * It changes the state, puts the events on the queue, and then ends the stopped tasks.
+   * It drains the queue last.
    */
   private change(owner: string, tasks: readonly Task[], dropped: readonly Slot[]): void {
     const replaced: Slot[] = []
@@ -103,17 +111,16 @@ export class Build extends Emitter<ArtifactEvent> {
     // that moves from one task to another in one call is withdrawn before it is promised.
     const withdrawn: ArtifactEvent[] = []
     const promised: ArtifactEvent[] = []
-    const none = new Map<string, Ref>()
     // In both loops below, a stopped task sees the new generation, so its later
     // ctx.produced and ctx.deleted do nothing.
     for (const slot of dropped) {
       slot.generation += 1
       this.unindex(slot.task)
       this.slots.delete(slot.task.id)
-      addOutputEvents(withdrawn, "withdrawn", slot.task.id, outputsByKey(slot.task), none)
+      addOutputEvents(withdrawn, "withdrawn", slot.task.id, outputsByKey(slot.task), NO_OUTPUTS)
     }
     for (const task of tasks) {
-      let before = none
+      let before = NO_OUTPUTS
       const existing = this.slots.get(task.id)
       if (existing) {
         existing.generation += 1
@@ -140,6 +147,9 @@ export class Build extends Emitter<ArtifactEvent> {
     } else {
       this.owners.set(owner, ids)
     }
+    // An abort listener below can change tasks too. Its events must come after these.
+    this.push(withdrawn)
+    this.push(promised)
 
     // finish wakes the waiting tasks, and abort() runs the task's abort listeners
     // at once, so the state must be whole first.
@@ -147,10 +157,7 @@ export class Build extends Emitter<ArtifactEvent> {
     for (const slot of dropped) {
       if (slot.phase === "running") running.push(slot)
       if (this.store) {
-        // The build does not wait for the delete. A delete error goes to result.errors.
-        this.store.delete(slot.task.id).then(undefined, (error: unknown) => {
-          this.addError(toError(error))
-        })
+        void this.deleteRecord(this.store, slot.task.id)
       }
       if (slot.phase !== "completed") {
         this.finish(slot, { type: "cancelled", reason: "removed" })
@@ -167,11 +174,21 @@ export class Build extends Emitter<ArtifactEvent> {
     for (const slot of running) {
       if (slot.abort) slot.abort.abort()
     }
+    this.drain()
+  }
 
-    this.wake()
-    // Before the first run(), the build sends no events. run() then promises the current outputs.
-    if (!this.started) return
-    this.emit([...withdrawn, ...promised])
+  /** Starts to delete the record of a task. run() waits for it. A delete error goes to `errors`. */
+  private async deleteRecord(store: Store, id: string): Promise<void> {
+    this.workCount += 1
+    try {
+      // Inside the try, a delete that throws at once also goes to `errors`.
+      await store.delete(id)
+    } catch (error) {
+      this.errors.push(toError(error))
+    } finally {
+      this.workCount -= 1
+      this.maybeIdle()
+    }
   }
 
   /** Rejects with the first subscriber error or send-limit error of the build. */
@@ -181,9 +198,10 @@ export class Build extends Emitter<ArtifactEvent> {
       // Tells subscribers about the tasks that were added before the first run().
       const events: ArtifactEvent[] = []
       for (const slot of this.slots.values()) {
-        addOutputEvents(events, "promised", slot.task.id, outputsByKey(slot.task), new Map())
+        addOutputEvents(events, "promised", slot.task.id, outputsByKey(slot.task), NO_OUTPUTS)
       }
-      this.emit(events)
+      this.push(events)
+      this.drain()
     }
     if (this.fatal !== null) throw this.fatal
     for (const slot of this.slots.values()) {
@@ -194,27 +212,36 @@ export class Build extends Emitter<ArtifactEvent> {
     return new Result(this.outcomes, this.errors)
   }
 
-  /**
-   * Puts `events` on the queue. If no drain runs, sends the queue until it is empty.
-   * A subscriber that changes tasks during a send only adds events to the queue.
-   * The drain that runs sends them after the current event reached every subscriber.
-   */
-  private emit(events: readonly ArtifactEvent[]): void {
+  /** Puts `events` at the end of the queue. Before the first run(), the build sends no events. */
+  private push(events: readonly ArtifactEvent[]): void {
+    if (!this.started) return
     // After a fatal error, the build sends no more events.
     if (this.fatal !== null) return
     for (const event of events) {
       this.queue.push(event)
     }
+  }
+
+  /**
+   * Sends the queue, one event at a time to every subscriber, until it is empty.
+   * A subscriber that changes tasks during a send only pushes events, and this drain
+   * sends them after the current event reached every subscriber. When the outermost
+   * drain ends, the build wakes the tasks, so new tasks start after the whole cascade.
+   */
+  private drain(): void {
     if (this.draining) return
     this.draining = true
     try {
-      this.drain()
+      this.sendQueue()
     } finally {
       this.draining = false
     }
+    this.wake()
   }
 
-  private drain(): void {
+  private sendQueue(): void {
+    // The limit counts only the events that subscribers cause, not the events that started the drain.
+    const initial = this.queue.length
     let sent = 0
     while (this.queue.length > 0) {
       const event = this.queue.shift()!
@@ -225,8 +252,11 @@ export class Build extends Emitter<ArtifactEvent> {
         return
       }
       sent += 1
-      if (sent === this.sendLimit && this.queue.length > 0) {
-        const message = `send limit: one drain sent ${sent} events, and more wait; the last was '${eventLine(event)}'`
+      const caused = sent - initial
+      if (caused >= this.sendLimit && this.queue.length > 0) {
+        const message =
+          `send limit: subscribers caused ${caused} events in one drain, and more wait; ` +
+          `the last sent was '${eventLine(event)}'`
         this.fail(new Error(message))
         return
       }
@@ -405,9 +435,11 @@ export class Build extends Emitter<ArtifactEvent> {
 
   private async execute(slot: Slot): Promise<void> {
     const generation = slot.generation
+    // Lets the code that added the task finish first. Thus a producer that the same
+    // synchronous code adds later is in the build when the task looks for its producers.
+    await Promise.resolve()
     const wait = await this.waitForInputs(slot, generation)
     if (generation !== slot.generation) return
-    if (this.fatal !== null) return
     if (wait === "cancelled") return
     if (wait === "failed") {
       this.finish(slot, {
@@ -447,7 +479,7 @@ export class Build extends Emitter<ArtifactEvent> {
       if (generation !== slot.generation) {
         // A stopped task often throws because ctx.signal aborted. That is not an error.
         if (!isAbort(error, slot.abort.signal)) {
-          this.addError(toError(error))
+          this.errors.push(toError(error))
         }
         this.endIfStopped(slot, generation)
         return
@@ -523,7 +555,8 @@ export class Build extends Emitter<ArtifactEvent> {
     // already has the last report for it, so the last report wins.
     slot.reported.add(artifact.id)
     const event: ArtifactEvent = { kind, artifact, taskId: slot.task.id }
-    this.emit([event])
+    this.push([event])
+    this.drain()
   }
 
   private outputCovers(task: Task, artifact: Artifact): boolean {
@@ -539,11 +572,11 @@ export class Build extends Emitter<ArtifactEvent> {
       // A subscriber can remove or replace this task. Then it sends no more events.
       // Each event is sent alone, so that the next check sees the change.
       if (generation !== slot.generation) return
-      if (this.fatal !== null) return
       if (!isArtifact(output)) continue
       if (slot.reported.has(output.id)) continue
       const event: ArtifactEvent = { kind: "produced", artifact: output, taskId: slot.task.id }
-      this.emit([event])
+      this.push([event])
+      this.drain()
     }
 
     if (generation !== slot.generation) return
@@ -553,22 +586,17 @@ export class Build extends Emitter<ArtifactEvent> {
     const inputStamps = await this.stampMap(this.artifactRefs(slot.task.inputs))
     const outputStamps = await this.stampMap(this.artifactRefs(slot.task.outputs))
     if (generation !== slot.generation) return
+    // A fatal error can come during the stamp reads above.
+    if (this.fatal !== null) return
     const state: TaskState = { inputStamps, outputStamps }
     await this.store.set(slot.task.id, state)
   }
 
-  private addError(error: Error): void {
-    if (this.errors.includes(error)) return
-    this.errors.push(error)
-  }
-
   /**
-   * Gets the rejection of a promise that a subscriber returned. The send already
-   * failed the build, so this error is kept only if it is the first one.
+   * Gets the rejection of a promise that a subscriber returned. The send already failed
+   * the build with the first error. This override only keeps the rejection from being unhandled.
    */
-  protected override rejected(reason: unknown): void {
-    this.fail(toError(reason))
-  }
+  protected override rejected(): void {}
 
   private async decideSkip(task: Task): Promise<"content" | "order" | null> {
     const inputs = this.artifactRefs(task.inputs)
@@ -751,8 +779,8 @@ function addOutputEvents(
   events: ArtifactEvent[],
   kind: "promised" | "withdrawn",
   taskId: string,
-  outputs: Map<string, Ref>,
-  except: Map<string, Ref>,
+  outputs: ReadonlyMap<string, Ref>,
+  except: ReadonlyMap<string, Ref>,
 ): void {
   for (const [key, output] of outputs) {
     if (except.has(key)) continue
