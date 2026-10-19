@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test"
 import { Build, IdPrefix, MemoryStore, SEND_LIMIT, Task, isPrefix } from "../src/index"
 import type { Artifact, ArtifactEvent, Ref, TaskState } from "../src/index"
-import { Mem, MemDir } from "./mem"
+import { Mem, MemDir, MemPrefix } from "./mem"
 
 /** "<kind> <id>": the artifact id of a produced or deleted event, or the declared output id. */
 function describeEvent(event: ArtifactEvent): string {
@@ -1146,6 +1146,8 @@ describe("the skip rule", () => {
     expect(await store.get("compile")).toEqual({
       inputStamps: { "mem:src": "a" },
       outputStamps: { "mem:out": "obj" },
+      inputPrefixStamps: {},
+      outputPrefixStamps: {},
     })
   })
 
@@ -1225,6 +1227,8 @@ describe("the skip rule", () => {
     expect(await store.get("compile")).toEqual({
       inputStamps: { "mem:optional": null },
       outputStamps: { "mem:out": "obj" },
+      inputPrefixStamps: {},
+      outputPrefixStamps: {},
     })
     const second = await runOnce(compile([optional], out, runs), store)
     expect(second.skipped).toEqual(["compile"])
@@ -1247,6 +1251,8 @@ describe("the skip rule", () => {
     expect(await store.get("compile")).toEqual({
       inputStamps: { "mem:src": "a" },
       outputStamps: { "mem:out": "obj" },
+      inputPrefixStamps: {},
+      outputPrefixStamps: {},
     })
     const second = await runOnce(compile([src], out, runs), store)
     expect(second.skipped).toEqual(["compile"])
@@ -2246,7 +2252,8 @@ describe("deleted events", () => {
       new Task({
         id: "clean-dir",
         inputs: [src],
-        outputs: [new IdPrefix("mem:d/")],
+        // IdPrefix has a null stamp and always runs. This prefix can stamp what is under it.
+        outputs: [new MemPrefix("mem:d/", [child])],
         run: async (ctx) => {
           runs.push("clean-dir")
           child.value = null
@@ -2264,6 +2271,8 @@ describe("deleted events", () => {
     expect(await store.get("clean-out")).toEqual({
       inputStamps: { "mem:src": "a" },
       outputStamps: { "mem:out": null },
+      inputPrefixStamps: {},
+      outputPrefixStamps: {},
     })
 
     const second = new Build({ store })

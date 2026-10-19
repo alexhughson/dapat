@@ -109,6 +109,8 @@ describe("filesystem artifacts", () => {
     expect(written.tasks.copy).toEqual({
       inputStamps: { [src.id]: await src.stamp() },
       outputStamps: { [out.id]: await out.stamp() },
+      inputPrefixStamps: {},
+      outputPrefixStamps: {},
     })
 
     const second = await runOnce()

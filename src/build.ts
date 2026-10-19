@@ -461,11 +461,12 @@ export class Build extends Emitter<ArtifactEvent> {
 
     // The input stamps from before the run. The record keeps these, so an input
     // that changes during the run makes the next build run the task again.
-    let inputStamps: StampMap | null = null
+    // The wait above already gave the producers under each prefix input time to finish.
+    let inputStamps: RefStamps | null = null
     let skip = false
     try {
       if (this.store) {
-        inputStamps = await this.stampMap(this.artifactRefs(slot.task.inputs))
+        inputStamps = await this.stampRefs(slot.task.inputs)
         skip = await this.canSkip(this.store, slot.task, inputStamps)
       }
     } catch (error) {
@@ -588,7 +589,7 @@ export class Build extends Emitter<ArtifactEvent> {
   private async recordSuccess(
     slot: Slot,
     generation: number,
-    inputStamps: StampMap | null,
+    inputStamps: RefStamps | null,
   ): Promise<void> {
     for (const output of slot.task.outputs) {
       // A subscriber can remove or replace this task. Then it sends no more events.
@@ -606,11 +607,16 @@ export class Build extends Emitter<ArtifactEvent> {
     if (this.fatal !== null) return
     if (!this.store) return
     if (inputStamps === null) return
-    const outputStamps = await this.stampMap(this.artifactRefs(slot.task.outputs))
+    const outputStamps = await this.stampRefs(slot.task.outputs)
     if (generation !== slot.generation) return
     // A fatal error can come during the stamp reads above.
     if (this.fatal !== null) return
-    const state: TaskState = { inputStamps, outputStamps }
+    const state: TaskState = {
+      inputStamps: inputStamps.artifacts,
+      outputStamps: outputStamps.artifacts,
+      inputPrefixStamps: inputStamps.prefixes,
+      outputPrefixStamps: outputStamps.prefixes,
+    }
     await this.store.set(slot.task.id, state)
   }
 
@@ -621,49 +627,53 @@ export class Build extends Emitter<ArtifactEvent> {
   protected override rejected(): void {}
 
   /**
-   * True when the task has an artifact input or output, the store has a record for the
-   * task, the record has the same input and output ids, every output exists, and every
-   * stamp equals the recorded stamp. `inputStamps` are the current input stamps.
+   * True when the task has an input or output, the store has a record with the same ids,
+   * no output and no prefix has a null stamp, and every stamp equals the record.
+   * `inputStamps` are the current input stamps.
    */
-  private async canSkip(store: Store, task: Task, inputStamps: StampMap): Promise<boolean> {
-    const outputs = this.artifactRefs(task.outputs)
-    // With no stamps to compare, a record cannot show that the task is current.
-    if (Object.keys(inputStamps).length === 0 && outputs.length === 0) return false
+  private async canSkip(store: Store, task: Task, inputStamps: RefStamps): Promise<boolean> {
+    // With no refs, a record cannot show that the task is current.
+    if (task.inputs.length === 0 && task.outputs.length === 0) return false
+    // A prefix with a null stamp cannot tell what is under it, so it cannot show that the task is current.
+    if (hasNull(inputStamps.prefixes)) return false
     const record = await store.get(task.id)
     if (!record) return false
-    // A record from an older version of dapat has a different shape. It counts as no record.
+    // A record from an older version of dapat has a different shape, or no prefix stamps.
+    // It counts as no record.
     if (!isStampMap(record.inputStamps)) return false
     if (!isStampMap(record.outputStamps)) return false
-    if (!sameStamps(record.inputStamps, inputStamps)) return false
+    if (!isStampMap(record.inputPrefixStamps)) return false
+    if (!isStampMap(record.outputPrefixStamps)) return false
+    if (!sameStamps(record.inputStamps, inputStamps.artifacts)) return false
+    if (!sameStamps(record.inputPrefixStamps, inputStamps.prefixes)) return false
 
-    const outputStamps = newStampMap()
-    for (const output of outputs) {
-      const stamp = await output.stamp()
-      if (stamp === null) return false
-      if (!Object.hasOwn(record.outputStamps, output.id)) return false
-      if (record.outputStamps[output.id] !== stamp) return false
-      outputStamps[output.id] = stamp
+    const outputArtifacts: Ref[] = []
+    const outputPrefixes: Ref[] = []
+    for (const output of task.outputs) {
+      if (isArtifact(output)) {
+        outputArtifacts.push(output)
+      } else {
+        outputPrefixes.push(output)
+      }
     }
-    const recordedCount = Object.keys(record.outputStamps).length
-    const currentCount = Object.keys(outputStamps).length
-    if (recordedCount !== currentCount) return false
+    if (!(await outputsMatch(outputArtifacts, record.outputStamps))) return false
+    if (!(await outputsMatch(outputPrefixes, record.outputPrefixStamps))) return false
     return true
   }
 
-  private artifactRefs(refs: readonly Ref[]): Artifact[] {
-    const artifacts: Artifact[] = []
+  /** The stamps of `refs`, with the artifact stamps and the prefix stamps in separate maps. */
+  private async stampRefs(refs: readonly Ref[]): Promise<RefStamps> {
+    const artifacts = newStampMap()
+    const prefixes = newStampMap()
     for (const ref of refs) {
-      if (isArtifact(ref)) artifacts.push(ref)
+      const stamp = await ref.stamp()
+      if (isArtifact(ref)) {
+        artifacts[ref.id] = stamp
+      } else {
+        prefixes[ref.id] = stamp
+      }
     }
-    return artifacts
-  }
-
-  private async stampMap(artifacts: Artifact[]): Promise<StampMap> {
-    const result = newStampMap()
-    for (const artifact of artifacts) {
-      result[artifact.id] = await artifact.stamp()
-    }
-    return result
+    return { artifacts, prefixes }
   }
 
   private finish(slot: Slot, outcome: Outcome): void {
@@ -717,8 +727,11 @@ export class Build extends Emitter<ArtifactEvent> {
   }
 }
 
-/** Stamps keyed by artifact id. */
+/** Stamps keyed by artifact id or by prefix id. */
 type StampMap = Record<string, string | null>
+
+/** The stamps of a list of refs. Artifacts and prefixes are apart, so equal ids cannot collide. */
+type RefStamps = { artifacts: StampMap; prefixes: StampMap }
 
 /** An empty stamp map with no prototype, so that an id such as "__proto__" is a plain key. */
 function newStampMap(): StampMap {
@@ -734,6 +747,33 @@ function sameStamps(recorded: StampMap, current: StampMap): boolean {
     if (!Object.hasOwn(recorded, id)) return false
     if (recorded[id] !== current[id]) return false
   }
+  return true
+}
+
+/** True when any stamp in the map is null. */
+function hasNull(stamps: StampMap): boolean {
+  for (const stamp of Object.values(stamps)) {
+    if (stamp === null) return true
+  }
+  return false
+}
+
+/**
+ * True when each output in `outputs` has a stamp that is not null and equals
+ * its stamp in `recorded`, and `recorded` has no other ids.
+ */
+async function outputsMatch(outputs: readonly Ref[], recorded: StampMap): Promise<boolean> {
+  const current = newStampMap()
+  for (const output of outputs) {
+    const stamp = await output.stamp()
+    if (stamp === null) return false
+    if (!Object.hasOwn(recorded, output.id)) return false
+    if (recorded[output.id] !== stamp) return false
+    current[output.id] = stamp
+  }
+  const recordedCount = Object.keys(recorded).length
+  const currentCount = Object.keys(current).length
+  if (recordedCount !== currentCount) return false
   return true
 }
 

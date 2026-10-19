@@ -25,6 +25,12 @@ const sample: TaskState = {
   outputStamps: {
     "file:/tmp/b": "def",
   },
+  inputPrefixStamps: {
+    "file:/tmp/pages/": "123",
+  },
+  outputPrefixStamps: {
+    "file:/tmp/out/": null,
+  },
 }
 
 async function roundTrip(store: Store): Promise<void> {
@@ -164,6 +170,8 @@ describe("stores", () => {
     expect(await store.get("write")).toEqual({
       inputStamps: {},
       outputStamps: { [out.id]: await out.stamp() },
+      inputPrefixStamps: {},
+      outputPrefixStamps: {},
     })
     const second = await runOnce()
     expect(second.skipped.length).toBe(1)
@@ -184,6 +192,8 @@ describe("stores", () => {
         const state: TaskState = {
           inputStamps: { [`file:/tmp/${i}`]: "a".repeat(64) },
           outputStamps: {},
+          inputPrefixStamps: {},
+          outputPrefixStamps: {},
         }
         await store.set(`task-${i}`, state)
       }

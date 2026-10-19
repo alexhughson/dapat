@@ -2,13 +2,27 @@ import type { Artifact } from "./artifact"
 
 /**
  * A region of artifact ids. Subclass this for path prefixes, S3 prefixes,
- * table ranges. A prefix has no body and no stamp.
+ * table ranges. A prefix has no body, but it has a stamp.
  *
  * In inputs: wait until current writers this prefix covers have finished.
  * In outputs: this task may create some children. Call ctx.produced(child).
  */
 export abstract class Prefix {
   abstract readonly id: string
+
+  /**
+   * A string that changes when anything under the prefix changes.
+   * The subclass chooses how, for example a hash of each child id and stamp.
+   * An empty or missing region is a real stamp, for example the hash of an empty list.
+   * Returns null when the prefix cannot tell what is under it. Then each task
+   * that uses the prefix runs. A throw fails the task that the build stamps this prefix for.
+   *
+   * Default: null. A prefix that is only an id string cannot list its children,
+   * so a skip could hide a change under it. Running on every build is the safe choice.
+   */
+  async stamp(): Promise<string | null> {
+    return null
+  }
 
   /**
    * Default: same id, or `artifact.id` starts with `this.id`.
@@ -27,7 +41,10 @@ export abstract class Prefix {
   }
 }
 
-/** Prefix whose region is an id string. */
+/**
+ * Prefix whose region is an id string. It cannot list what is under it,
+ * so its stamp is null, and a task that uses it runs on every build.
+ */
 export class IdPrefix extends Prefix {
   constructor(readonly id: string) {
     super()

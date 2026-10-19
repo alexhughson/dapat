@@ -1,26 +1,23 @@
 import { readFile } from "node:fs/promises"
 import { Artifact } from "../../src/artifact"
-import { sha256Hex } from "./hash"
 import { fileId, resolveFilePath } from "./id"
+import { stampFile, stampMode, type FileStampMode, type FileStampOptions } from "./stamp"
 
 export class FileArtifact extends Artifact<Uint8Array> {
   readonly path: string
   readonly id: string
+  readonly stampMode: FileStampMode
 
-  constructor(p: string) {
+  constructor(p: string, opts?: FileStampOptions) {
     super()
     this.path = resolveFilePath(p)
     this.id = fileId(this.path)
+    this.stampMode = stampMode(opts)
   }
 
-  /** The SHA-256 hex of the bytes. */
+  /** "time": the modified time in nanoseconds and the size. "hash": the SHA-256 hex of the bytes. */
   async stamp(): Promise<string | null> {
-    try {
-      const bytes = await readFile(this.path)
-      return sha256Hex(bytes)
-    } catch {
-      return null
-    }
+    return stampFile(this.path, this.stampMode)
   }
 
   async read(): Promise<Uint8Array> {
@@ -28,6 +25,6 @@ export class FileArtifact extends Artifact<Uint8Array> {
   }
 }
 
-export function file(p: string): FileArtifact {
-  return new FileArtifact(p)
+export function file(p: string, opts?: FileStampOptions): FileArtifact {
+  return new FileArtifact(p, opts)
 }

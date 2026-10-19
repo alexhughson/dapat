@@ -9,7 +9,7 @@ Inputs and outputs can be files. They can also be S3 objects, database rows, or 
 When you run a build, dapat does these things:
 
 - **Order:** it starts a task only after the tasks that write its inputs have finished.
-- **Skip:** it skips a task when each input and output has the same stamp as in the last run, and each output still exists. This needs a store. The file artifacts use content hashes as stamps, so an edit that restores the old bytes does not cause a rebuild.
+- **Skip:** it skips a task when each input and output has the same stamp as in the last run, and each output still exists. This needs a store. By default, the file artifacts use the modification time and the size as stamps, because that is fast. Pass `{ stamp: "hash" }` to use a hash of the bytes. Then an edit that restores the old bytes does not cause a rebuild. A folder prefix also has a stamp, so a new file in a folder that a task reads makes the task run.
 - **Grow:** it adds tasks during the build. A subscriber (`build.subscribe`) gets a `promised` event for each output that a task declares, a `produced` event for each output that a task writes, a `deleted` event for each output that a task deletes, and a `withdrawn` event when the declaring task leaves the build. The subscriber can add the task that reads that output. dapat calls subscribers synchronously, so the new task exists before the writer continues. If a subscriber throws, `build.run()` rejects with that error.
 
 ```
@@ -98,7 +98,7 @@ if (!result.success) {
 1. **First run.** Both tasks execute. `out.txt` contains `[HELLO]`.
 2. **No change.** Both tasks skip.
 3. **Change** `in.txt` **to** `bye`**.** Both tasks execute. `out.txt` contains `[BYE]`.
-4. **Run** `touch in.txt`**.** The bytes do not change, so the stamp of `in.txt` does not change. Both tasks skip.
+4. **Run** `touch in.txt`**.** The modification time changes, so the default stamp of `in.txt` changes. Both tasks run. With `new FileArtifact("in.txt", { stamp: "hash" })`, the bytes decide the stamp, and both tasks skip.
 
 `build.run()` does not throw when a task fails. Always check `result.success`.
 
