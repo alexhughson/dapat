@@ -3,7 +3,6 @@ import path from "node:path"
 import { Artifact } from "../../src/artifact"
 import { sha256Hex } from "./hash"
 import { dirId, resolveDirPath } from "./id"
-import { pathOrderStamp } from "./stamp"
 
 export class DirectoryArtifact extends Artifact<string[]> {
   readonly path: string
@@ -24,20 +23,8 @@ export class DirectoryArtifact extends Artifact<string[]> {
     return other.id.startsWith(this.id)
   }
 
-  async orderStamp(): Promise<bigint | null> {
-    const files = await walkFiles(this.path)
-    if (files === null) return null
-    let max = await pathOrderStamp(this.path)
-    if (max === null) return null
-    for (const filePath of files) {
-      const order = await pathOrderStamp(filePath)
-      if (order === null) continue
-      if (order > max) max = order
-    }
-    return max
-  }
-
-  async contentStamp(): Promise<string | null> {
+  /** The SHA-256 of the sorted lines `<relative path>=<file sha256>`. */
+  async stamp(): Promise<string | null> {
     const files = await walkFiles(this.path)
     if (files === null) return null
     const lines: string[] = []

@@ -15,13 +15,13 @@ This document has two parts:
 
 You describe your work as **tasks**. Each task names its inputs and its outputs. Inputs and outputs can be files. They can also be S3 objects, database rows, or values in memory.
 
-dapat wraps each input and output in an **artifact**, which is a subclass of `Artifact`. The subclass tells dapat how to find out if the thing changed, with a timestamp, a hash, or both. dapat includes artifact classes for files, S3, and SQLite. For anything else, write a small subclass ([section 4](#4-artifacts)).
+dapat wraps each input and output in an **artifact**, which is a subclass of `Artifact`. The subclass gives dapat a **stamp**: a string that changes when the thing changes, for example a hash. dapat includes artifact classes for files, S3, and SQLite. For anything else, write a small subclass ([section 4](#4-artifacts)).
 
 When you run a **build**, dapat does these steps for each task:
 
 1. It waits for the tasks that write the inputs of the task.
 2. It compares the current artifact stamps with the stamps from the last successful run. The **store** keeps the last stamps.
-3. It skips the task when the stamps show that the outputs are current. Otherwise, it runs the task.
+3. It skips the task when every stamp is equal to the stamp from the last run. Otherwise, it runs the task.
 
 dapat does not know about disks or SQL. It only reads artifact ids and stamps. The adapters in `dapat/contrib` supply files, S3, and SQLite.
 
@@ -105,7 +105,7 @@ Put `hello` into `in.txt`, and then run the script more than one time:
 1. **First run.** Both tasks execute. `out.txt` contains `[HELLO]`.
 2. **No change.** Both tasks skip.
 3. **Change `in.txt` to `bye`.** Both tasks execute. `out.txt` contains `[BYE]`.
-4. **Run `touch in.txt`.** The modification time changes, but the bytes do not. Both tasks skip, because dapat compares the content of `in.txt` with the stored hash.
+4. **Run `touch in.txt`.** The modification time changes, but the bytes do not. The stamp of a `FileArtifact` is a hash of the bytes, so the stamp does not change. Both tasks skip.
 
 [Section 6](#6-when-a-task-skips) gives the full rules.
 
@@ -133,18 +133,16 @@ An artifact has four parts:
 ```ts
 abstract class Artifact<T = unknown> {
   abstract readonly id: string
-  abstract orderStamp(): Promise<bigint | null>
-  abstract contentStamp(): Promise<string | null>
+  abstract stamp(): Promise<string | null>
   abstract read(): Promise<T>
 }
 ```
 
 - **`id`** identifies the artifact. Two artifact objects with the same id are the same artifact. dapat connects tasks only through ids.
-- **`orderStamp()`** returns a number that increases when the value changes, for example a modification time or a version number.
-- **`contentStamp()`** returns a hash of the value.
+- **`stamp()`** returns a string that changes when the value changes, for example a hash of the value. dapat compares two stamps for equality only. It never asks which stamp is newer.
 - **`read()`** returns the value. dapat never calls `read()`. Only your task code calls it.
 
-Return `null` from a stamp method when the value does not exist. You can also return `null` when you cannot calculate that stamp. An artifact needs at least one stamp. If it has none, dapat always runs each task that reads or writes it.
+Return `null` from `stamp()` when the value does not exist. A `null` stamp on an output makes the task run. A `null` stamp on an input is a valid stamp: if the input is still missing on the next build, the stamp is still equal.
 
 ### Choose ids
 
@@ -167,16 +165,16 @@ dapat compares ids as plain strings. An id is in a folder when the id starts wit
 dapat has two kinds of prefix:
 
 - A **plain prefix** is a folder name only. It has no stamp and no value. The classes are `IdPrefix`, `PathPrefix`, `S3Prefix`, and `SqliteTablePrefix`. Use a plain prefix when a task writes files, but you do not know their names before the task runs ([section 5](#5-tasks-and-dependencies)).
-- A **prefix artifact** is a folder that you can stamp and read. Its stamps come from the artifacts in the folder. The classes are `DirectoryArtifact` and `SqliteTableArtifact`. Use a prefix artifact when a task reads all of the contents of a folder.
+- A **prefix artifact** is a folder that you can stamp and read. Its stamp comes from the artifacts in the folder. The classes are `DirectoryArtifact` and `SqliteTableArtifact`. Use a prefix artifact when a task reads all of the contents of a folder.
 
 ### Write your own artifact
 
-This artifact is a key in a `Map`. The map entry holds a value and a version number.
+This artifact is a key in a `Map`. The map entry holds a value.
 
 ```ts
 import { Artifact } from "dapat"
 
-type Entry = { value: string; version: bigint }
+type Entry = { value: string }
 
 class MapEntry extends Artifact<string> {
   readonly id: string
@@ -186,13 +184,7 @@ class MapEntry extends Artifact<string> {
     this.id = `map:${key}`
   }
 
-  async orderStamp(): Promise<bigint | null> {
-    const entry = this.map.get(this.key)
-    if (!entry) return null
-    return entry.version
-  }
-
-  async contentStamp(): Promise<string | null> {
+  async stamp(): Promise<string | null> {
     const entry = this.map.get(this.key)
     if (!entry) return null
     const hasher = new Bun.CryptoHasher("sha256")
@@ -208,7 +200,12 @@ class MapEntry extends Artifact<string> {
 }
 ```
 
-Keep order stamps in the same unit as the other artifacts in the same task. dapat compares order stamps as plain integers ([section 12](#12-limits)).
+Choose a stamp that changes each time the value changes. Two kinds work well:
+
+- A hash of the value. It is correct, but `stamp()` must read the full value.
+- A version number or a modification time, as a string, for example `String(version)`. It is fast. It also changes when your code writes the same value again, so a task can run one extra time.
+
+If two different values can have the same stamp, dapat can skip a task that must run.
 
 ### Write your own prefix artifact
 
@@ -253,9 +250,9 @@ build.run()
 │  │   ├─ a producer task failed           → this task fails: "dependency of '<id>' failed"
 │  │   └─ no task can make progress        → this task fails: "deadlock waiting for inputs of '<id>'"
 │  ├─ decide if the task can skip
+│  │   ├─ read the store record of the task
 │  │   ├─ stamp every artifact input and output
-│  │   ├─ compare with the store record     → skipped, reason "content"
-│  │   └─ compare order stamps              → skipped, reason "order"
+│  │   └─ all stamps equal the record       → skipped
 │  ├─ task.run(ctx)
 │  │   ├─ ctx.produced(artifact)            → calls each subscriber before it returns
 │  │   └─ ctx.deleted(artifact)             → calls each subscriber before it returns
@@ -318,7 +315,7 @@ This sample uses `MapEntry` and `Entry` from [section 4](#write-your-own-artifac
 import { Build, IdPrefix, Task } from "dapat"
 
 const map = new Map<string, Entry>()
-map.set("doc", { value: "p1\np2", version: 1n })
+map.set("doc", { value: "p1\np2" })
 const doc = new MapEntry(map, "doc")
 
 const build = new Build()
@@ -332,7 +329,7 @@ build.add(
       const lines = (await doc.read()).split("\n")
       for (let i = 0; i < lines.length; i++) {
         const key = `pages/${i + 1}`
-        map.set(key, { value: lines[i]!, version: 2n })
+        map.set(key, { value: lines[i]! })
         ctx.produced(new MapEntry(map, key))
       }
     },
@@ -342,7 +339,7 @@ build.add(
 
 A task that reads `map:pages/1` now waits for `split`. `ctx.produced()` throws when the artifact is not a declared output of the task and is not in one of the task's output folders. The task then fails.
 
-A plain prefix has no stamp. When dapat makes a skip decision ([section 6](#6-when-a-task-skips)), it ignores prefix inputs and prefix outputs. So `split` has no artifact outputs, and it cannot skip by order.
+A plain prefix has no stamp. When dapat makes a skip decision ([section 6](#6-when-a-task-skips)), it ignores prefix inputs and prefix outputs. So `split` has one artifact input and no artifact outputs. It skips when `doc` has the same stamp as in the record.
 
 ### The `ctx` argument
 
@@ -358,44 +355,50 @@ You can also call `build.add()` and `build.remove()` from outside a task while `
 
 ## 6. When a task skips
 
-dapat makes the decision for each task after the tasks that write its inputs finish. It stamps each artifact input and output. Then it uses the first rule that applies:
+dapat makes the decision for each task after the tasks that write its inputs finish. It uses one rule.
 
-1. **An output is missing.** An output has no order stamp and no content stamp. dapat **runs** the task.
-2. **The store has a record for this task id.**
-   1. The set of input ids or output ids is different from the record. dapat **runs** the task.
-   2. An input has a content stamp now and in the record, and the two stamps are different. dapat **runs** the task.
-   3. Each input has a content stamp now and in the record, and all of the stamps are equal. dapat **skips** the task with the reason `"content"`.
-   4. Otherwise, dapat goes to rule 3.
-3. **Order check.** All inputs and outputs have an order stamp, and the newest input is not newer than the oldest output. dapat **skips** the task with the reason `"order"`.
-4. In all other cases, dapat **runs** the task.
+dapat **skips** the task when all of these are true:
 
-Some results of these rules:
+- The build has a store, and the store has a record for the task id.
+- The record has the same input ids and the same output ids as the task. dapat counts artifact inputs and outputs only. It ignores plain prefixes.
+- Each artifact output exists. Its stamp is not `null`.
+- The current stamp of each artifact input and output is equal to the stamp in the record.
 
-- You touch an input, but its bytes do not change. The task skips by content.
-- An input changes, but the outputs have newer modification times. The task runs, because the content check comes before the order check.
-- There is no store, and the outputs are newer than the inputs. The task skips by order, as in `make`.
-- The task has no artifact inputs, and its outputs exist. The task skips by order.
-- The task has inputs and no artifact outputs, and the store has matching content. The task skips by content. Without a matching record, it runs each time.
-- A list of inputs gains or loses an artifact. The task runs, because the set of ids changed.
-- You delete an output. The task runs.
+In all other cases, dapat **runs** the task. With no store, or with no record for the task, the task always runs.
+
+The examples below use a task `compile` with the input `src.txt` and the output `out.txt`. The build has a store.
+
+1. **No record.** This is the first build with this store. The task runs. Then dapat writes the stamps of `src.txt` and `out.txt` to the store.
+2. **Same stamps.** Nothing changed since the last build. The stamps of `src.txt` and `out.txt` are equal to the record. The task skips.
+3. **An input changed.** You edit `src.txt`. Its stamp is different from the record. The task runs.
+4. **An output is missing.** You delete `out.txt`. Its stamp is `null`. The task runs.
+5. **The ids changed.** You add the input `header.txt` to the task. The record has no stamp for `header.txt`. The task runs.
+
+Some more results of the rule:
+
+- You edit an output by hand. Its stamp is different from the record, so the task runs and writes the output again.
+- You touch an input, but its bytes do not change. `FileArtifact` uses a hash of the bytes as its stamp, so the stamp does not change. The task skips.
+- An input is missing on two builds in a row. Its stamp is `null` both times. The stamps are equal, so this input does not make the task run.
+- The task has no artifact inputs and no artifact outputs, for example only prefix outputs. After the first successful run, the task skips while its record exists.
 - A task deletes one of its declared artifact outputs and calls `ctx.deleted`. That output is then missing, so the task runs on each build. To delete an artifact and still skip, declare its folder as a prefix output. Call `ctx.deleted` on each run, also when the artifact is already gone. If you do not, dapat sends a `produced` event for the missing output after the task returns.
+
+dapat does not compare modification times. Older versions of dapat skipped a task when its outputs were newer than its inputs, as `make` does. That check is gone. Without a store record, a task runs.
 
 After a task runs with no error, dapat stamps its artifact inputs and outputs again, and it writes those stamps to the store. It does not write stamps for a failed task, so a failed task runs again on the next build.
 
-The stamp methods do real I/O. For example, `FileArtifact.contentStamp()` reads and hashes the full file, and `DirectoryArtifact.contentStamp()` reads every file under the directory.
+The `stamp()` methods do real I/O. For example, `FileArtifact.stamp()` reads and hashes the full file, and `DirectoryArtifact.stamp()` reads every file under the directory. dapat calls `stamp()` only when the build has a store. Before a task runs, it calls `stamp()` only when the store has a record for the task.
 
 ### 6.1 Why did a task run or skip?
 
 `Result` tells you which tasks ran and which skipped. It does not tell you the reason. To find the reason, do these steps:
 
-1. Make sure that each output exists. A missing output always makes the task run.
-2. Read the task's record with `await store.get(taskId)`. If it is `null`, the task has never succeeded with this store. Then only the order check applies.
-3. Compare the record with the current stamps. Call `await artifact.contentStamp()` and `await artifact.orderStamp()` on each input and output. Compare the values with `inputStamps` and `outputStamps` in the record.
-4. Make sure that the task declares every file that it reads. dapat does not see an input that the task does not declare. A change to that file does not make the task run.
+1. Read the task's record with `await store.get(taskId)`. If it is `null`, the task has never succeeded with this store, so it runs.
+2. Call `await artifact.stamp()` on each artifact input and output. Compare the values with `inputStamps` and `outputStamps` in the record. A missing id, an extra id, a different stamp, or a `null` output stamp makes the task run.
+3. Make sure that the task declares every file that it reads. dapat does not see an input that the task does not declare. A change to that file does not make the task run.
 
 ## 7. Stores
 
-The store keeps the stamps from the last successful run of each task. The store is optional. Without a store, only the missing-output rule and the order check apply.
+The store keeps the stamps from the last successful run of each task. The store is optional. Without a store, every task runs on each build.
 
 | Store | Use it for |
 | --- | --- |
@@ -413,12 +416,14 @@ const build = new Build({ store })
 
 `JsonStore` reads the whole file and writes it again for each change. It writes to `<path>.tmp` and then renames that file to `<path>`. It does not lock the file, so two processes must not use the same file at the same time. Parallel tasks in one build can also call `store.set` at the same time:
 
-- Two calls that overlap can lose one record. The next build then uses only the order check for that task.
+- Two calls that overlap can lose one record. The task then runs on the next build.
 - Overlapping calls share one `.tmp` file, so one `rename` can fail. The task that called it then fails.
 
 `SqliteStore` accepts an open `Database` from `bun:sqlite` or a file path. If you give a path, the store opens the database, and `close()` closes it. If you give a `Database`, `close()` does nothing.
 
 The store keeps stamps for artifact inputs and outputs only. It does not keep prefixes. It does not keep the artifacts that a task reported with `ctx.produced()` or `ctx.deleted()`.
+
+A record has one stamp for each artifact id: a string, or `null` for a missing artifact. Older versions of dapat wrote two stamps for each id, an order stamp and a content stamp. dapat treats a record in that old shape as no record. The task runs, and dapat writes a record in the new shape. So the first build after an upgrade runs every task one time.
 
 Add the store file to `.gitignore`. To make tasks run again, see [section 11.1](#111-force-tasks-to-run-again).
 
@@ -535,7 +540,7 @@ build.subscribe((event) => {
       inputs: [page],
       outputs: [shot],
       run: async () => {
-        map.set(shot.key, { value: "img", version: 9n })
+        map.set(shot.key, { value: "img" })
       },
     }),
   )
@@ -619,11 +624,11 @@ The [API reference](#api-reference) gives the full details of each class.
 
 A relative path resolves against the current working directory when you create the object.
 
-| Class | Order stamp | Content stamp | `read()` returns |
-| --- | --- | --- | --- |
-| `FileArtifact(path)` | modification time in nanoseconds | SHA-256 of the bytes | `Uint8Array` |
-| `DirectoryArtifact(path)` | the newest modification time of the directory and the files in it | SHA-256 of each relative path and the hash of that file | absolute paths of all files, in all subdirectories |
-| `PathPrefix(path)` | none | none | none (plain prefix) |
+| Class | Stamp | `read()` returns |
+| --- | --- | --- |
+| `FileArtifact(path)` | SHA-256 of the bytes | `Uint8Array` |
+| `DirectoryArtifact(path)` | SHA-256 of each relative path and the hash of that file | absolute paths of all files, in all subdirectories |
+| `PathPrefix(path)` | none | none (plain prefix) |
 
 ### 10.2 S3: `S3ObjectArtifact`, `S3Prefix`, `S3Client`, `MemoryS3`
 
@@ -651,24 +656,22 @@ Write an adapter for the AWS SDK or for your own HTTP client. The adapter must o
 
 `MemoryS3` implements this interface in memory. Use it for tests.
 
-| Class | Order stamp | Content stamp | `read()` returns |
-| --- | --- | --- | --- |
-| `S3ObjectArtifact(client, bucket, key)` | `lastModified` in milliseconds | `etag` | `Uint8Array` |
-| `S3Prefix(bucket, keyPrefix)` | none | none | none (plain prefix) |
+| Class | Stamp | `read()` returns |
+| --- | --- | --- |
+| `S3ObjectArtifact(client, bucket, key)` | `etag` | `Uint8Array` |
+| `S3Prefix(bucket, keyPrefix)` | none | none (plain prefix) |
 
 ### 10.3 SQLite: `SqliteRowArtifact`, `SqliteTableArtifact`, `SqliteTablePrefix`
 
 These classes take a `bun:sqlite` `Database`. Table and column names must match `[A-Za-z_][A-Za-z0-9_]*`. Other names cause a throw.
 
-| Class | Order stamp | Content stamp | `read()` returns |
-| --- | --- | --- | --- |
-| `SqliteRowArtifact({ db, table, pkColumn, pk, orderColumn? })` | the value of `orderColumn`, or `rowid` | SHA-256 of the column values | the row as an object |
-| `SqliteTableArtifact({ db, table, pkColumn, orderColumn? })` | the largest row order stamp | SHA-256 of the hashes of all rows | the primary keys |
-| `SqliteTablePrefix(table)` | none | none | none (plain prefix) |
+| Class | Stamp | `read()` returns |
+| --- | --- | --- |
+| `SqliteRowArtifact({ db, table, pkColumn, pk })` | SHA-256 of the column values | the row as an object |
+| `SqliteTableArtifact({ db, table, pkColumn })` | SHA-256 of the hashes of all rows | the primary keys |
+| `SqliteTablePrefix(table)` | none | none (plain prefix) |
 
 `SqliteTableArtifact` is a prefix artifact. Each row is a file in the folder `sqlite:table/`.
-
-An `UPDATE` does not change the `rowid`. If rows change in place, give an `orderColumn` that your code increases on each write, or use a persistent store so that the content check decides.
 
 ## 11. Recipes
 
@@ -682,7 +685,7 @@ await store.clear()
 const build = new Build({ store })
 ```
 
-To run one task again, delete its record with `await store.delete(taskId)`. If the outputs of that task are newer than its inputs, the task still skips by order. Delete one of its outputs as well to make sure that it runs.
+To run one task again, delete its record with `await store.delete(taskId)`. A task with no record always runs.
 
 ### 11.2 Limit parallel work
 
@@ -731,19 +734,18 @@ When a task finishes, the gate gives its place directly to the next waiting task
 
 ### 11.3 Run in CI
 
-A new checkout sets the modification time of each file to the time of the checkout. The order check therefore does not give useful results in CI. To skip unchanged tasks in CI, keep these items in the CI cache between runs:
+A task skips only when the store has a record for it. To skip unchanged tasks in CI, keep these items in the CI cache between runs:
 
 - the store file, for example `.dapat/state.json`.
 - the output files of the tasks.
 
-dapat then uses the content check, which does not depend on modification times. If the cache is empty, every task runs.
+The stamps of `FileArtifact` and `DirectoryArtifact` are hashes of the bytes. A new checkout changes the modification time of each file, but not the stamps. If the cache is empty, every task runs.
 
 ## 12. Limits
 
 - **A task that skips sends no `produced` or `deleted` events.** This applies to its prefix outputs and to its declared outputs. A subscriber gets only the `promised` events of that task on the next build.
-- **Order stamps have different units.** dapat compares the order stamps of all artifacts in one task as plain integers. `FileArtifact` and `DirectoryArtifact` use nanoseconds. `S3ObjectArtifact` uses milliseconds. `SqliteRowArtifact` uses `rowid` or your `orderColumn`. If one task has artifacts of two kinds, the order check gives wrong results. For example, an S3 input and a file output always look current. The content check comes first, so a persistent store decides correctly after the first successful run. On the first run, and each time the task has no store record, the order check decides.
 - **A prefix artifact input does not wait for a plain prefix output in a subfolder.** See [section 5](#how-dapat-finds-dependencies).
-- **`FileArtifact` stamp methods return `null` for all errors.** For example, a permission error on a file looks like a missing file. The task then runs again and does not fail. Check file permissions when a task always runs.
+- **`FileArtifact.stamp()` returns `null` for all errors.** For example, a permission error on a file looks like a missing file. The task then runs again and does not fail. Check file permissions when a task always runs.
 - **No timeout and no concurrency limit.** All ready tasks start at the same time. Add limits and timeouts in your task code ([section 11.2](#112-limit-parallel-work)), and use `ctx.signal` to stop work.
 - **Bun only.** The adapters use Bun APIs.
 
@@ -824,8 +826,7 @@ Type guards. They use `instanceof`.
 | Member | Description |
 | --- | --- |
 | `abstract readonly id: string` | Unique id. Artifacts with the same id are the same thing. |
-| `abstract orderStamp(): Promise<bigint \| null>` | A value that increases when the artifact changes. `null` if the artifact does not exist. |
-| `abstract contentStamp(): Promise<string \| null>` | A hash of the content. `null` if the artifact does not exist. |
+| `abstract stamp(): Promise<string \| null>` | A string that changes when the artifact changes. `null` if the artifact does not exist. dapat compares stamps for equality only. |
 | `abstract read(): Promise<T>` | Reads the value. |
 | `covers(other: Artifact): boolean` | Default: `other.id === this.id`. Override it for listings. |
 | `get coversOthers(): boolean` | Default: `false`. Return `true` when `covers` can match other ids. |
@@ -855,21 +856,18 @@ A prefix whose region is the id string.
 | `delete(taskId): Promise<void>` | Deletes a record. The build calls it from `remove`. |
 | `clear(): Promise<void>` | Deletes every record. The build does not call it. |
 
-To write your own store, implement these four methods. `Stamp.order` is a `bigint`, and `JSON.stringify` cannot encode it. Convert it to a string before you write it, and back with `BigInt()` when you read it. `JsonStore` and `SqliteStore` do this.
+To write your own store, implement these four methods. A record holds strings and `null` only, so `JSON.stringify` can encode it as it is. `get` can return a record in an older shape. The build then treats it as no record ([section 7](#7-stores)).
 
-### `interface TaskState` and `interface Stamp`
+### `interface TaskState`
 
 ```ts
 interface TaskState {
-  inputStamps: Record<string, Stamp>  // keyed by artifact id
-  outputStamps: Record<string, Stamp>
-}
-
-interface Stamp {
-  order?: bigint
-  content?: string
+  inputStamps: Record<string, string | null>  // keyed by artifact id
+  outputStamps: Record<string, string | null>
 }
 ```
+
+`null` means that the artifact did not exist.
 
 ### `class MemoryStore implements Store`
 
@@ -885,19 +883,19 @@ Keeps records in a `Map`. The records are lost when the process ends. `MemorySto
 | --- | --- | --- |
 | `success` | `boolean` | `true` when no task failed and `errors` is empty. Cancelled tasks do not make it `false`. |
 | `executed` | `readonly Task[]` | Tasks whose `run` completed. |
-| `skipped` | `readonly Task[]` | Tasks that the skip rules skipped. |
+| `skipped` | `readonly Task[]` | Tasks that the skip rule skipped. |
 | `failed` | `ReadonlyMap<Task, Error>` | Tasks that threw, whose producer failed, or that were in a deadlock. |
 | `cancelled` | `readonly Task[]` | Tasks that were replaced or removed before they completed. |
 | `errors` | `readonly Error[]` | Errors that no task owns: a non-abort error that a task throws after it was replaced or removed, and a store delete that rejects. It keeps the errors of earlier runs of the same build. A subscriber error is not here: `run()` rejects with it. |
 
-`Result` does not give the reason for a skip. The build keeps an `Outcome` for each task, but no public member returns it. See [section 6.1](#61-why-did-a-task-run-or-skip).
+`Result` does not say why a task ran. The build keeps an `Outcome` for each task, but no public member returns it. See [section 6.1](#61-why-did-a-task-run-or-skip).
 
 ### `type Outcome`
 
 ```ts
 type Outcome =
   | { type: "executed" }
-  | { type: "skipped"; reason: "content" | "order" }
+  | { type: "skipped" }
   | { type: "failed"; error: Error }
   | { type: "cancelled"; reason: "replaced" | "removed" }
 ```
@@ -946,8 +944,7 @@ file(path: string): FileArtifact
 | --- | --- |
 | `path` | Absolute path |
 | `id` | `file:<absolute path>` |
-| `orderStamp()` | Modification time in nanoseconds. `null` if the path is missing or is not a regular file. |
-| `contentStamp()` | SHA-256 hex of the bytes. `null` if the file cannot be read. |
+| `stamp()` | SHA-256 hex of the bytes. `null` if the file cannot be read. |
 | `read()` | The bytes. Throws if the file is missing. |
 
 ### `class DirectoryArtifact extends Artifact<string[]>` and `directory(path)`
@@ -963,8 +960,7 @@ directory(path: string): DirectoryArtifact
 | `id` | `file:<absolute path>/` |
 | `covers(other)` | `true` for every id under the directory |
 | `coversOthers` | `true` |
-| `orderStamp()` | The largest modification time of the directory and every file under it, in nanoseconds. `null` if the directory is missing. |
-| `contentStamp()` | SHA-256 of the sorted lines `<relative path>=<file sha256>`. `null` if the directory is missing. |
+| `stamp()` | SHA-256 of the sorted lines `<relative path>=<file sha256>`. `null` if the directory is missing. |
 | `read()` | Absolute paths of every file under the directory, at any depth. Throws if the directory is missing. |
 
 ### `class PathPrefix extends Prefix` and `pathPrefix(path)`
@@ -996,8 +992,7 @@ s3Object(client: S3Client, bucket: string, key: string): S3ObjectArtifact
 | --- | --- |
 | `client`, `bucket`, `key` | The constructor arguments |
 | `id` | `s3://<bucket>/<key>` |
-| `orderStamp()` | `head().lastModified` in milliseconds. `null` if `head` returns `null`. |
-| `contentStamp()` | `head().etag`. `null` if `head` returns `null`. |
+| `stamp()` | `head().etag`. `null` if `head` returns `null`. |
 | `read()` | `client.get(bucket, key)` |
 
 ### `class S3Prefix extends Prefix` and `s3Prefix(bucket, keyPrefix)`
@@ -1015,7 +1010,7 @@ s3Prefix(bucket: string, keyPrefix: string): S3Prefix
 new MemoryS3()
 ```
 
-Keeps objects in a `Map`. `put` sets the `etag` to the SHA-256 of the body. `put` also sets `lastModified` to a value that increases by at least 1 ms on each call, so two fast writes get different order stamps. `get` throws for a missing object. `list` returns sorted keys.
+Keeps objects in a `Map`. `put` sets the `etag` to the SHA-256 of the body. `put` also sets `lastModified` to a value that increases by at least 1 ms on each call. `get` throws for a missing object. `list` returns sorted keys.
 
 ## SQLite (`dapat/contrib`)
 
@@ -1027,17 +1022,15 @@ sqliteRow(opts: {
   table: string
   pkColumn: string
   pk: string | number
-  orderColumn?: string
 }): SqliteRowArtifact
 ```
 
 | Member | Value |
 | --- | --- |
-| `table`, `pkColumn`, `orderColumn` | The validated names |
+| `table`, `pkColumn` | The validated names |
 | `pk` | The primary key as a string |
 | `id` | `sqlite:<table>/<pkColumn>/<pk>` |
-| `orderStamp()` | The value of `orderColumn` as a `bigint`, or the `rowid` if you give no `orderColumn`. `null` if the row is missing. |
-| `contentStamp()` | SHA-256 of the sorted `column=value` lines, without `rowid`. `null` if the row is missing. |
+| `stamp()` | SHA-256 of the sorted `column=value` lines, without `rowid`. `null` if the row is missing. |
 | `read()` | The row without `rowid`. Throws if the row is missing. |
 
 ### `class SqliteTableArtifact extends Artifact<string[]>` and `sqliteTable(opts)`
@@ -1047,7 +1040,6 @@ sqliteTable(opts: {
   db: Database
   table: string
   pkColumn: string
-  orderColumn?: string
 }): SqliteTableArtifact
 ```
 
@@ -1055,8 +1047,7 @@ sqliteTable(opts: {
 | --- | --- |
 | `id` | `sqlite:<table>/` |
 | `covers(other)`, `coversOthers` | Covers every row id of the table |
-| `orderStamp()` | The largest row order stamp. `null` if the table does not exist. |
-| `contentStamp()` | SHA-256 of the sorted `<pk>=<row hash>` lines. `null` if the table does not exist. |
+| `stamp()` | SHA-256 of the sorted `<pk>=<row hash>` lines. `null` if the table does not exist. |
 | `read()` | Every primary key as a string. Throws if the table does not exist. |
 
 ### `class SqliteTablePrefix extends Prefix` and `sqliteTablePrefix(table)`
@@ -1075,7 +1066,7 @@ sqliteTablePrefix(table: string): SqliteTablePrefix
 new JsonStore(path: string)
 ```
 
-Keeps every record in one JSON file with the shape `{ "tasks": { "<taskId>": { "inputStamps": ..., "outputStamps": ... } } }`. Order stamps are written as strings. A missing file is the same as an empty store. `set` creates the parent directory.
+Keeps every record in one JSON file with the shape `{ "tasks": { "<taskId>": { "inputStamps": ..., "outputStamps": ... } } }`. Each stamp is a string or `null`. A missing file is the same as an empty store. `set` creates the parent directory.
 
 ### `class SqliteStore implements Store`
 

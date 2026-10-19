@@ -1,11 +1,7 @@
-export interface Stamp {
-  order?: bigint
-  content?: string
-}
-
+/** The stamps of the last successful run of a task, keyed by artifact id. null means the artifact did not exist. */
 export interface TaskState {
-  inputStamps: Record<string, Stamp>
-  outputStamps: Record<string, Stamp>
+  inputStamps: Record<string, string | null>
+  outputStamps: Record<string, string | null>
 }
 
 export interface Store {

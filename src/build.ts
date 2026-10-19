@@ -2,7 +2,7 @@ import type { Artifact } from "./artifact"
 import { Emitter } from "./emitter"
 import type { Prefix } from "./prefix"
 import { Task, isArtifact, isPrefix, type Context, type Ref } from "./task"
-import type { Stamp, Store, TaskState } from "./store"
+import type { Store, TaskState } from "./store"
 import { Outcome, Result } from "./result"
 
 export type ArtifactEvent =
@@ -459,11 +459,11 @@ export class Build extends Emitter<ArtifactEvent> {
       return
     }
 
-    const skip = await this.decideSkip(slot.task)
+    const skip = await this.canSkip(slot.task)
     if (generation !== slot.generation) return
     if (this.fatal !== null) return
     if (skip) {
-      this.finish(slot, { type: "skipped", reason: skip })
+      this.finish(slot, { type: "skipped" })
       return
     }
 
@@ -601,32 +601,26 @@ export class Build extends Emitter<ArtifactEvent> {
    */
   protected override rejected(): void {}
 
-  private async decideSkip(task: Task): Promise<"content" | "order" | null> {
-    const inputs = this.artifactRefs(task.inputs)
-    const outputs = this.artifactRefs(task.outputs)
-    const inputStamps = await this.stampMap(inputs)
-    const outputStamps = await this.stampMap(outputs)
+  /**
+   * True when the store has a record for the task, the record has the same input and
+   * output ids, every output exists, and every stamp equals the recorded stamp.
+   */
+  private async canSkip(task: Task): Promise<boolean> {
+    if (!this.store) return false
+    const record = await this.store.get(task.id)
+    if (!record) return false
+    // A record from an older version of dapat has a different shape. It counts as no record.
+    if (!isStampMap(record.inputStamps)) return false
+    if (!isStampMap(record.outputStamps)) return false
 
-    for (const output of outputs) {
-      const stamp = outputStamps[output.id]
-      if (!stamp || (stamp.order === undefined && stamp.content === undefined)) {
-        return null
-      }
+    const inputStamps = await this.stampMap(this.artifactRefs(task.inputs))
+    const outputStamps = await this.stampMap(this.artifactRefs(task.outputs))
+    for (const id of Object.keys(outputStamps)) {
+      if (outputStamps[id] === null) return false
     }
-
-    const last = this.store ? await this.store.get(task.id) : null
-    if (last) {
-      if (!sameIds(last.inputStamps, inputStamps)) return null
-      if (!sameIds(last.outputStamps, outputStamps)) return null
-      const content = contentDecision(inputs, inputStamps, last.inputStamps)
-      if (content === "match") return "content"
-      if (content === "differ") return null
-    }
-
-    if (ordersFresh(inputs, outputs, inputStamps, outputStamps)) {
-      return "order"
-    }
-    return null
+    if (!sameStamps(record.inputStamps, inputStamps)) return false
+    if (!sameStamps(record.outputStamps, outputStamps)) return false
+    return true
   }
 
   private artifactRefs(refs: readonly Ref[]): Artifact[] {
@@ -637,15 +631,10 @@ export class Build extends Emitter<ArtifactEvent> {
     return artifacts
   }
 
-  private async stampMap(artifacts: Artifact[]): Promise<Record<string, Stamp>> {
-    const result: Record<string, Stamp> = {}
+  private async stampMap(artifacts: Artifact[]): Promise<Record<string, string | null>> {
+    const result: Record<string, string | null> = {}
     for (const artifact of artifacts) {
-      const order = await artifact.orderStamp()
-      const content = await artifact.contentStamp()
-      const stamp: Stamp = {}
-      if (order !== null) stamp.order = order
-      if (content !== null) stamp.content = content
-      result[artifact.id] = stamp
+      result[artifact.id] = await artifact.stamp()
     }
     return result
   }
@@ -701,65 +690,29 @@ export class Build extends Emitter<ArtifactEvent> {
   }
 }
 
-function sameIds(
-  left: Record<string, Stamp>,
-  right: Record<string, Stamp>,
+/** True when both maps have the same ids, and each id has the same stamp. */
+function sameStamps(
+  recorded: Record<string, string | null>,
+  current: Record<string, string | null>,
 ): boolean {
-  const leftKeys = Object.keys(left)
-  const rightKeys = Object.keys(right)
-  if (leftKeys.length !== rightKeys.length) return false
-  for (const key of leftKeys) {
-    if (!(key in right)) return false
+  const recordedIds = Object.keys(recorded)
+  const currentIds = Object.keys(current)
+  if (recordedIds.length !== currentIds.length) return false
+  for (const id of currentIds) {
+    if (!Object.hasOwn(recorded, id)) return false
+    if (recorded[id] !== current[id]) return false
   }
   return true
 }
 
-function contentDecision(
-  inputs: Artifact[],
-  current: Record<string, Stamp>,
-  stored: Record<string, Stamp>,
-): "match" | "differ" | "unknown" {
-  if (inputs.length === 0) return "unknown"
-  let sawAll = true
-  for (const input of inputs) {
-    const now = current[input.id]
-    const then = stored[input.id]
-    if (!now || now.content === undefined || !then || then.content === undefined) {
-      sawAll = false
-      continue
-    }
-    if (now.content !== then.content) return "differ"
+/** True when each value is a string or null. A stamp map from an older record is not. */
+function isStampMap(value: unknown): value is Record<string, string | null> {
+  if (typeof value !== "object" || value === null) return false
+  for (const stamp of Object.values(value)) {
+    if (stamp === null) continue
+    if (typeof stamp !== "string") return false
   }
-  if (!sawAll) return "unknown"
-  return "match"
-}
-
-function ordersFresh(
-  inputs: Artifact[],
-  outputs: Artifact[],
-  inputStamps: Record<string, Stamp>,
-  outputStamps: Record<string, Stamp>,
-): boolean {
-  if (outputs.length === 0) return false
-  let maxInput: bigint | null = null
-  for (const input of inputs) {
-    const stamp = inputStamps[input.id]
-    if (!stamp || stamp.order === undefined) return false
-    if (maxInput === null || stamp.order > maxInput) {
-      maxInput = stamp.order
-    }
-  }
-  let minOutput: bigint | null = null
-  for (const output of outputs) {
-    const stamp = outputStamps[output.id]
-    if (!stamp || stamp.order === undefined) return false
-    if (minOutput === null || stamp.order < minOutput) {
-      minOutput = stamp.order
-    }
-  }
-  if (minOutput === null) return false
-  if (maxInput === null) return true
-  return maxInput <= minOutput
+  return true
 }
 
 /** An artifact and a prefix with the same id are different outputs. */

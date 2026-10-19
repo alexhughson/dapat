@@ -1,10 +1,9 @@
 import { mkdir, rename } from "node:fs/promises"
 import path from "node:path"
 import type { Store, TaskState } from "../../src/store"
-import { decodeState, encodeState, type EncodedTaskState } from "./codec"
 
 type FileData = {
-  tasks: Record<string, EncodedTaskState>
+  tasks: Record<string, TaskState>
 }
 
 export class JsonStore implements Store {
@@ -12,14 +11,14 @@ export class JsonStore implements Store {
 
   async get(taskId: string): Promise<TaskState | null> {
     const data = await this.load()
-    const encoded = data.tasks[taskId]
-    if (!encoded) return null
-    return decodeState(encoded)
+    const state = data.tasks[taskId]
+    if (!state) return null
+    return state
   }
 
   async set(taskId: string, state: TaskState): Promise<void> {
     const data = await this.load()
-    data.tasks[taskId] = encodeState(state)
+    data.tasks[taskId] = state
     await this.save(data)
   }
 

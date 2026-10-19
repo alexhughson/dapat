@@ -66,7 +66,57 @@ describe("filesystem artifacts", () => {
     expect(runs).toBe(2)
   })
 
-  test("directory listing waits for writers and reruns when a child changes", async () => {
+  test("a JsonStore record in the old shape makes the task run and write a new record", async () => {
+    const root = await tempDir()
+    const srcPath = path.join(root, "a.txt")
+    const outPath = path.join(root, "b.txt")
+    const statePath = path.join(root, "state.json")
+    await writeFile(srcPath, "hello")
+    await writeFile(outPath, "hello")
+    const src = new FileArtifact(srcPath)
+    const out = new FileArtifact(outPath)
+    // The file shape that dapat wrote before one stamp per artifact.
+    const oldFile = {
+      tasks: {
+        copy: {
+          inputStamps: { [src.id]: { order: "1", content: await src.stamp() } },
+          outputStamps: { [out.id]: { order: "2", content: await out.stamp() } },
+        },
+      },
+    }
+    await writeFile(statePath, JSON.stringify(oldFile))
+    let runs = 0
+
+    const runOnce = async () => {
+      const build = new Build({ store: new JsonStore(statePath) })
+      build.add(
+        new Task({
+          id: "copy",
+          inputs: [src],
+          outputs: [out],
+          run: async () => {
+            runs += 1
+            await writeFile(outPath, await src.read())
+          },
+        }),
+      )
+      return build.run()
+    }
+
+    const first = await runOnce()
+    expect(first.executed.length).toBe(1)
+    const written = await Bun.file(statePath).json()
+    expect(written.tasks.copy).toEqual({
+      inputStamps: { [src.id]: await src.stamp() },
+      outputStamps: { [out.id]: await out.stamp() },
+    })
+
+    const second = await runOnce()
+    expect(second.skipped.length).toBe(1)
+    expect(runs).toBe(1)
+  })
+
+  test("directory listing waits for writers and reruns when the directory changes", async () => {
     const root = await tempDir()
     const outDir = path.join(root, "out")
     const zipPath = path.join(root, "bundle.txt")
@@ -133,10 +183,13 @@ describe("filesystem artifacts", () => {
     expect(writes).toBe(2)
     expect(zips).toBe(1)
 
-    await writeFile(path.join(outDir, "foo.txt"), "FOO")
+    // No task writes baz.txt. The listing changes, so only zip runs.
+    await writeFile(path.join(outDir, "baz.txt"), "baz")
     const third = await runOnce()
+    expect(third.executed.map((task) => task.id)).toEqual(["zip"])
+    expect(writes).toBe(2)
     expect(zips).toBe(2)
-    expect(await Bun.file(zipPath).text()).toBe("bar+FOO")
+    expect(await Bun.file(zipPath).text()).toBe("bar+baz+foo")
     store.close()
   })
 

@@ -53,14 +53,12 @@ describe("sqlite row artifacts", () => {
         table: "notes",
         pkColumn: "id",
         pk: "src",
-        orderColumn: "rev",
       })
       const out = new SqliteRowArtifact({
         db,
         table: "notes",
         pkColumn: "id",
         pk: "out",
-        orderColumn: "rev",
       })
       const build = new Build({ store })
       build.add(
@@ -132,15 +130,14 @@ describe("sqlite row artifacts", () => {
     let writes = 0
     let summaries = 0
 
-    const a = new SqliteRowArtifact({ db, table: "notes", pkColumn: "id", pk: "a", orderColumn: "rev" })
-    const b = new SqliteRowArtifact({ db, table: "notes", pkColumn: "id", pk: "b", orderColumn: "rev" })
-    const table = new SqliteTableArtifact({ db, table: "notes", pkColumn: "id", orderColumn: "rev" })
+    const a = new SqliteRowArtifact({ db, table: "notes", pkColumn: "id", pk: "a" })
+    const b = new SqliteRowArtifact({ db, table: "notes", pkColumn: "id", pk: "b" })
+    const table = new SqliteTableArtifact({ db, table: "notes", pkColumn: "id" })
     const summary = new SqliteRowArtifact({
       db,
       table: "reports",
       pkColumn: "id",
       pk: "summary",
-      orderColumn: "rev",
     })
 
     const build = new Build({ store })
@@ -203,7 +200,6 @@ describe("sqlite row artifacts", () => {
       table: "notes",
       pkColumn: "id",
       pk: "n1",
-      orderColumn: "rev",
     })
 
     const build = new Build()
@@ -217,7 +213,6 @@ describe("sqlite row artifacts", () => {
             table: "notes",
             pkColumn: "id",
             pk: "copy",
-            orderColumn: "rev",
           }),
         ],
         run: async () => {

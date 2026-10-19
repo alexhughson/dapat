@@ -2,7 +2,7 @@ import type { Task } from "./task"
 
 export type Outcome =
   | { type: "executed" }
-  | { type: "skipped"; reason: "content" | "order" }
+  | { type: "skipped" }
   | { type: "failed"; error: Error }
   | { type: "cancelled"; reason: "replaced" | "removed" }
 

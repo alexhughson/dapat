@@ -4,12 +4,12 @@ dapat is a build tool for TypeScript on Bun. As in `make`, you declare tasks, an
 
 Inspired by [doit](https://github.com/pydoit/doit)
 
-Inputs and outputs can be files. They can also be S3 objects, database rows, or values in memory. dapat wraps each input and output in a subclass of `Artifact`. The subclass tells dapat how to find out if the thing changed, with a timestamp, a hash, or both. dapat includes artifact classes for files, S3 objects, and SQLite rows and tables. For anything else, write a small subclass.
+Inputs and outputs can be files. They can also be S3 objects, database rows, or values in memory. dapat wraps each input and output in a subclass of `Artifact`. The subclass gives dapat a stamp: a string that changes when the thing changes, for example a hash. dapat includes artifact classes for files, S3 objects, and SQLite rows and tables. For anything else, write a small subclass.
 
 When you run a build, dapat does these things:
 
 - **Order:** it starts a task only after the tasks that write its inputs have finished.
-- **Skip:** it skips a task when its inputs did not change since the last run and its outputs still exist. It compares content hashes, so an edit that restores the old bytes does not cause a rebuild.
+- **Skip:** it skips a task when each input and output has the same stamp as in the last run, and each output still exists. This needs a store. The file artifacts use content hashes as stamps, so an edit that restores the old bytes does not cause a rebuild.
 - **Grow:** it adds tasks during the build. A subscriber (`build.subscribe`) gets a `promised` event for each output that a task declares, a `produced` event for each output that a task writes, a `deleted` event for each output that a task deletes, and a `withdrawn` event when the declaring task leaves the build. The subscriber can add the task that reads that output. dapat calls subscribers synchronously, so the new task exists before the writer continues. If a subscriber throws, `build.run()` rejects with that error.
 
 ```
@@ -98,7 +98,7 @@ if (!result.success) {
 1. **First run.** Both tasks execute. `out.txt` contains `[HELLO]`.
 2. **No change.** Both tasks skip.
 3. **Change** `in.txt` **to** `bye`**.** Both tasks execute. `out.txt` contains `[BYE]`.
-4. **Run** `touch in.txt`**.** The bytes do not change, so both tasks skip.
+4. **Run** `touch in.txt`**.** The bytes do not change, so the stamp of `in.txt` does not change. Both tasks skip.
 
 `build.run()` does not throw when a task fails. Always check `result.success`.
 
@@ -119,7 +119,7 @@ if (!result.success) {
 
 - how to write your own artifact
 - how dapat finds dependencies
-- the exact rules for when a task skips, and how to find out why a task ran
+- the rule for when a task skips, and how to find out why a task ran
 - failure, cancellation, and replacement of tasks
 - subscribers for the outputs that tasks declare and write during the build, and their errors
 - recipes: force a rebuild, limit parallel work, run in CI

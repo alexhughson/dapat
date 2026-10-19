@@ -13,13 +13,8 @@ export class S3ObjectArtifact extends Artifact<Uint8Array> {
     this.id = `s3://${bucket}/${key}`
   }
 
-  async orderStamp(): Promise<bigint | null> {
-    const head = await this.client.head(this.bucket, this.key)
-    if (!head) return null
-    return BigInt(head.lastModified.getTime())
-  }
-
-  async contentStamp(): Promise<string | null> {
+  /** The etag of the object. */
+  async stamp(): Promise<string | null> {
     const head = await this.client.head(this.bucket, this.key)
     if (!head) return null
     return head.etag

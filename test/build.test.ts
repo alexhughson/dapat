@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import { Build, IdPrefix, MemoryStore, SEND_LIMIT, Task, isPrefix } from "../src/index"
-import type { Artifact, ArtifactEvent, Ref } from "../src/index"
+import type { Artifact, ArtifactEvent, Ref, TaskState } from "../src/index"
 import { Mem, MemDir } from "./mem"
 
 /** "<kind> <id>": the artifact id of a produced or deleted event, or the declared output id. */
@@ -25,7 +25,7 @@ describe("Build", () => {
         outputs: [resultArt],
         run: async () => {
           executed.push("consumer")
-          resultArt.write("ok", 2n, "ok")
+          resultArt.write("ok")
         },
       }),
     )
@@ -35,7 +35,7 @@ describe("Build", () => {
         outputs: [data],
         run: async () => {
           executed.push("producer")
-          data.write("v", 1n, "v")
+          data.write("v")
         },
       }),
     )
@@ -43,134 +43,6 @@ describe("Build", () => {
     const result = await build.run()
     expect(result.success).toBe(true)
     expect(executed).toEqual(["producer", "consumer"])
-  })
-
-  test("skips when content stamps match the store", async () => {
-    const src = new Mem("mem:src", "a", 1n, "hash-a")
-    const out = new Mem("mem:out")
-    const store = new MemoryStore()
-    let runs = 0
-
-    const task = () =>
-      new Task({
-        id: "compile",
-        inputs: [src],
-        outputs: [out],
-        run: async () => {
-          runs += 1
-          out.write("obj", 2n, "hash-out")
-        },
-      })
-
-    const first = new Build({ store })
-    first.add(task())
-    const r1 = await first.run()
-    expect(r1.executed.length).toBe(1)
-    expect(runs).toBe(1)
-
-    const second = new Build({ store })
-    second.add(task())
-    const r2 = await second.run()
-    expect(r2.skipped.length).toBe(1)
-    expect(runs).toBe(1)
-
-    src.write("b", 3n, "hash-b")
-    const third = new Build({ store })
-    third.add(task())
-    const r3 = await third.run()
-    expect(r3.executed.length).toBe(1)
-    expect(runs).toBe(2)
-  })
-
-  test("content change runs even when output order is newer", async () => {
-    const src = new Mem("mem:src", "a", 1n, "hash-a")
-    const out = new Mem("mem:out", "obj", 9n, "hash-out")
-    const store = new MemoryStore()
-    await store.set("compile", {
-      inputStamps: { "mem:src": { order: 1n, content: "hash-a" } },
-      outputStamps: { "mem:out": { order: 9n, content: "hash-out" } },
-    })
-    let runs = 0
-    const build = new Build({ store })
-    build.add(
-      new Task({
-        id: "compile",
-        inputs: [src],
-        outputs: [out],
-        run: async () => {
-          runs += 1
-          out.write("obj2", 10n, "hash-out2")
-        },
-      }),
-    )
-    src.write("b", 1n, "hash-b")
-    const result = await build.run()
-    expect(result.executed.length).toBe(1)
-    expect(runs).toBe(1)
-  })
-
-  test("skips on order stamps when outputs are newer", async () => {
-    const src = new Mem("mem:src", "a", 1n, null)
-    const out = new Mem("mem:out")
-    let runs = 0
-
-    const make = () =>
-      new Task({
-        id: "stamp",
-        inputs: [src],
-        outputs: [out],
-        run: async () => {
-          runs += 1
-          out.write("obj", 5n, null)
-        },
-      })
-
-    const first = new Build()
-    first.add(make())
-    await first.run()
-    expect(runs).toBe(1)
-
-    const second = new Build()
-    second.add(make())
-    const r2 = await second.run()
-    expect(r2.skipped.length).toBe(1)
-    expect(runs).toBe(1)
-
-    src.order = 9n
-    const third = new Build()
-    third.add(make())
-    const r3 = await third.run()
-    expect(r3.executed.length).toBe(1)
-    expect(runs).toBe(2)
-  })
-
-  test("runs when a declared output is missing", async () => {
-    const src = new Mem("mem:src", "a", 1n, "a")
-    const out = new Mem("mem:out")
-    const store = new MemoryStore()
-    let runs = 0
-
-    const make = () =>
-      new Task({
-        id: "compile",
-        inputs: [src],
-        outputs: [out],
-        run: async () => {
-          runs += 1
-          out.write("obj", 2n, "old")
-        },
-      })
-
-    const first = new Build({ store })
-    first.add(make())
-    await first.run()
-    expect(runs).toBe(1)
-
-    out.value = null
-    const second = new Build({ store })
-    second.add(make())
-    await second.run()
-    expect(runs).toBe(2)
   })
 
   test("prefix output makes a child consumer wait", async () => {
@@ -186,7 +58,7 @@ describe("Build", () => {
         outputs: [used],
         run: async () => {
           executed.push("use-foo")
-          used.write("y", 2n, "y")
+          used.write("y")
         },
       }),
     )
@@ -196,7 +68,7 @@ describe("Build", () => {
         outputs: [new IdPrefix("mem:out/")],
         run: async (ctx) => {
           executed.push("write-unknown")
-          foo.write("x", 1n, "x")
+          foo.write("x")
           ctx.produced(foo)
         },
       }),
@@ -221,7 +93,7 @@ describe("Build", () => {
         outputs: [zip],
         run: async () => {
           executed.push("zip")
-          zip.write("z", 2n, "z")
+          zip.write("z")
         },
       }),
     )
@@ -231,7 +103,7 @@ describe("Build", () => {
         outputs: [foo],
         run: async () => {
           executed.push("write")
-          foo.write("x", 1n, "x")
+          foo.write("x")
         },
       }),
     )
@@ -257,7 +129,7 @@ describe("Build", () => {
           outputs: [report],
           run: async () => {
             executed.push("report")
-            report.write("r", 2n, "r")
+            report.write("r")
           },
         }),
       )
@@ -268,7 +140,7 @@ describe("Build", () => {
         outputs: [new IdPrefix("mem:logs/")],
         run: async (ctx) => {
           executed.push("write-log")
-          foo.write("log", 1n, "log")
+          foo.write("log")
           ctx.produced(foo)
         },
       }),
@@ -296,7 +168,7 @@ describe("Build", () => {
             inputs: [first],
             outputs: [report],
             run: async () => {
-              report.write("r", 3n, "r")
+              report.write("r")
             },
           }),
         )
@@ -307,16 +179,16 @@ describe("Build", () => {
         id: "write",
         outputs: [new IdPrefix("mem:out/"), declared],
         run: async (ctx) => {
-          first.write("1", 1n, "1")
+          first.write("1")
           ctx.produced(first)
           log.push("produced returned")
           // The listener added "report" before ctx.produced returned,
           // so a second task with the same output is a duplicate.
           const duplicate = new Task({ id: "other", outputs: [report], run: async () => {} })
           expect(() => ctx.add(duplicate)).toThrow(/duplicate output 'mem:report'/)
-          second.write("2", 1n, "2")
+          second.write("2")
           ctx.produced(second)
-          declared.write("d", 1n, "d")
+          declared.write("d")
         },
       }),
     )
@@ -349,7 +221,7 @@ describe("Build", () => {
         id: "write",
         outputs: [new IdPrefix("mem:out/")],
         run: async (ctx) => {
-          foo.write("x", 1n, "x")
+          foo.write("x")
           ctx.produced(foo)
           returned = true
         },
@@ -372,7 +244,7 @@ describe("Build", () => {
         id: "write",
         outputs: [out],
         run: async () => {
-          out.write("x", 1n, "x")
+          out.write("x")
         },
       }),
     )
@@ -406,7 +278,7 @@ describe("Build", () => {
           id: "write",
           outputs: [out],
           run: async () => {
-            out.write("x", 1n, "x")
+            out.write("x")
           },
         }),
       )
@@ -432,7 +304,7 @@ describe("Build", () => {
             id: "write",
             outputs: [other],
             run: async () => {
-              other.write("y", 1n, "y")
+              other.write("y")
             },
           }),
         )
@@ -454,7 +326,7 @@ describe("Build", () => {
         id: "write",
         outputs: [new IdPrefix("mem:out/")],
         run: async (ctx) => {
-          foo.write("x", 1n, "x")
+          foo.write("x")
           ctx.produced(foo)
         },
       }),
@@ -476,7 +348,7 @@ describe("Build", () => {
         outputs: [out],
         run: async () => {
           executed.push("old")
-          out.write("old", 1n, "old")
+          out.write("old")
         },
       }),
     )
@@ -486,7 +358,7 @@ describe("Build", () => {
         outputs: [out],
         run: async () => {
           executed.push("new")
-          out.write("new", 1n, "new")
+          out.write("new")
         },
       }),
     )
@@ -595,7 +467,7 @@ describe("Build", () => {
         inputs: [new IdPrefix("mem:out/")],
         outputs: [x],
         run: async () => {
-          x.write("x", 1n, "x")
+          x.write("x")
         },
       }),
     )
@@ -623,8 +495,8 @@ describe("Build", () => {
         id: "write",
         outputs: [a, b],
         run: async () => {
-          a.write("a", 1n, "a")
-          b.write("b", 1n, "b")
+          a.write("a")
+          b.write("b")
         },
       }),
     )
@@ -665,7 +537,7 @@ describe("Build", () => {
         outputs: [old],
         run: async () => {
           executed.push("old t")
-          old.write("o", 1n, "o")
+          old.write("o")
         },
       }),
     )
@@ -681,7 +553,7 @@ describe("Build", () => {
               outputs: [next],
               run: async () => {
                 executed.push("new t")
-                next.write("n", 1n, "n")
+                next.write("n")
               },
             }),
           )
@@ -943,7 +815,7 @@ describe("Build", () => {
         id: "t",
         outputs: [out],
         run: async () => {
-          out.write("v", 1n, "v")
+          out.write("v")
         },
       }),
     )
@@ -1149,12 +1021,12 @@ describe("Build", () => {
   })
 
   test("a fatal error during the stamp reads of a task stops its store record", async () => {
-    /** An artifact whose order stamp takes time to read, after the task wrote it. */
+    /** An artifact whose stamp takes time to read, after the task wrote it. */
     class SlowStamp extends Mem {
-      override async orderStamp(): Promise<bigint | null> {
+      override async stamp(): Promise<string | null> {
         if (this.value === null) return null
         await new Promise<void>((resolve) => setTimeout(resolve, 30))
-        return this.order
+        return this.value
       }
     }
     const store = new MemoryStore()
@@ -1168,7 +1040,7 @@ describe("Build", () => {
         id: "a",
         outputs: [slow],
         run: async () => {
-          slow.write("a", 1n, "a")
+          slow.write("a")
         },
       }),
     )
@@ -1199,7 +1071,7 @@ describe("Build", () => {
         outputs: [done],
         run: async (ctx) => {
           executed.push("parent")
-          done.write("p", 1n, "p")
+          done.write("p")
           ctx.add(
             new Task({
               id: "child",
@@ -1207,7 +1079,7 @@ describe("Build", () => {
               outputs: [childOut],
               run: async () => {
                 executed.push("child")
-                childOut.write("c", 2n, "c")
+                childOut.write("c")
               },
             }),
           )
@@ -1218,6 +1090,166 @@ describe("Build", () => {
     const result = await build.run()
     expect(result.success).toBe(true)
     expect(executed).toEqual(["parent", "child"])
+  })
+})
+
+describe("the skip rule", () => {
+  /** A task "compile" that reads `src` and writes `out`. It counts its runs in `runs.count`. */
+  function compile(inputs: Mem[], out: Mem, runs: { count: number }): Task {
+    return new Task({
+      id: "compile",
+      inputs,
+      outputs: [out],
+      run: async () => {
+        runs.count += 1
+        out.write("obj")
+      },
+    })
+  }
+
+  /** Runs `task` in a new build with `store`, and returns the ids that ran and skipped. */
+  async function runOnce(task: Task, store?: MemoryStore): Promise<{ executed: string[]; skipped: string[] }> {
+    const build = new Build({ store })
+    build.add(task)
+    const result = await build.run()
+    expect(result.success).toBe(true)
+    const executed: string[] = []
+    for (const done of result.executed) {
+      executed.push(done.id)
+    }
+    const skipped: string[] = []
+    for (const done of result.skipped) {
+      skipped.push(done.id)
+    }
+    return { executed, skipped }
+  }
+
+  test("no store: the task runs each time", async () => {
+    const src = new Mem("mem:src", "a")
+    const out = new Mem("mem:out")
+    const runs = { count: 0 }
+
+    await runOnce(compile([src], out, runs))
+    const second = await runOnce(compile([src], out, runs))
+    expect(second.executed).toEqual(["compile"])
+    expect(runs.count).toBe(2)
+  })
+
+  test("no record: the task runs and writes a record of its stamps", async () => {
+    const src = new Mem("mem:src", "a")
+    const out = new Mem("mem:out", "old")
+    const store = new MemoryStore()
+    const runs = { count: 0 }
+
+    const first = await runOnce(compile([src], out, runs), store)
+    expect(first.executed).toEqual(["compile"])
+    expect(await store.get("compile")).toEqual({
+      inputStamps: { "mem:src": "a" },
+      outputStamps: { "mem:out": "obj" },
+    })
+  })
+
+  test("same stamps: the task skips", async () => {
+    const src = new Mem("mem:src", "a")
+    const out = new Mem("mem:out")
+    const store = new MemoryStore()
+    const runs = { count: 0 }
+
+    await runOnce(compile([src], out, runs), store)
+    const second = await runOnce(compile([src], out, runs), store)
+    expect(second.skipped).toEqual(["compile"])
+    expect(runs.count).toBe(1)
+  })
+
+  test("an input changed: the task runs", async () => {
+    const src = new Mem("mem:src", "a")
+    const out = new Mem("mem:out")
+    const store = new MemoryStore()
+    const runs = { count: 0 }
+
+    await runOnce(compile([src], out, runs), store)
+    src.write("b")
+    const second = await runOnce(compile([src], out, runs), store)
+    expect(second.executed).toEqual(["compile"])
+    expect(runs.count).toBe(2)
+  })
+
+  test("an output changed: the task runs", async () => {
+    const src = new Mem("mem:src", "a")
+    const out = new Mem("mem:out")
+    const store = new MemoryStore()
+    const runs = { count: 0 }
+
+    await runOnce(compile([src], out, runs), store)
+    out.write("edited by hand")
+    const second = await runOnce(compile([src], out, runs), store)
+    expect(second.executed).toEqual(["compile"])
+    expect(out.value).toBe("obj")
+  })
+
+  test("an output is missing: the task runs", async () => {
+    const src = new Mem("mem:src", "a")
+    const out = new Mem("mem:out")
+    const store = new MemoryStore()
+    const runs = { count: 0 }
+
+    await runOnce(compile([src], out, runs), store)
+    out.value = null
+    const second = await runOnce(compile([src], out, runs), store)
+    expect(second.executed).toEqual(["compile"])
+    expect(runs.count).toBe(2)
+  })
+
+  test("the input ids changed: the task runs", async () => {
+    const src = new Mem("mem:src", "a")
+    const extra = new Mem("mem:extra", "e")
+    const out = new Mem("mem:out")
+    const store = new MemoryStore()
+    const runs = { count: 0 }
+
+    await runOnce(compile([src], out, runs), store)
+    const second = await runOnce(compile([src, extra], out, runs), store)
+    expect(second.executed).toEqual(["compile"])
+    const third = await runOnce(compile([src], out, runs), store)
+    expect(third.executed).toEqual(["compile"])
+    expect(runs.count).toBe(3)
+  })
+
+  test("a missing input that is still missing: the task skips", async () => {
+    const optional = new Mem("mem:optional")
+    const out = new Mem("mem:out")
+    const store = new MemoryStore()
+    const runs = { count: 0 }
+
+    await runOnce(compile([optional], out, runs), store)
+    expect(await store.get("compile")).toEqual({
+      inputStamps: { "mem:optional": null },
+      outputStamps: { "mem:out": "obj" },
+    })
+    const second = await runOnce(compile([optional], out, runs), store)
+    expect(second.skipped).toEqual(["compile"])
+  })
+
+  test("a record in the old shape counts as no record: the task runs and writes a new record", async () => {
+    const src = new Mem("mem:src", "a")
+    const out = new Mem("mem:out", "obj")
+    const store = new MemoryStore()
+    // The shape that dapat wrote before one stamp per artifact.
+    const oldRecord = {
+      inputStamps: { "mem:src": { order: 1n, content: "a" } },
+      outputStamps: { "mem:out": { order: 2n, content: "obj" } },
+    }
+    await store.set("compile", oldRecord as unknown as TaskState)
+    const runs = { count: 0 }
+
+    const first = await runOnce(compile([src], out, runs), store)
+    expect(first.executed).toEqual(["compile"])
+    expect(await store.get("compile")).toEqual({
+      inputStamps: { "mem:src": "a" },
+      outputStamps: { "mem:out": "obj" },
+    })
+    const second = await runOnce(compile([src], out, runs), store)
+    expect(second.skipped).toEqual(["compile"])
   })
 })
 
@@ -1755,7 +1787,7 @@ describe("promised and withdrawn events", () => {
           outputs: [dep],
           run: async () => {
             await new Promise<void>((resolve) => setTimeout(resolve, 10))
-            dep.write("v", 1n, "v")
+            dep.write("v")
             log.push("producer wrote")
           },
         }),
@@ -1778,7 +1810,7 @@ describe("promised and withdrawn events", () => {
             outputs: [dep],
             run: async () => {
               await new Promise<void>((resolve) => setTimeout(resolve, 10))
-              dep.write("v", 1n, "v")
+              dep.write("v")
               log.push("producer wrote")
             },
           }),
@@ -1856,7 +1888,7 @@ describe("deleted events", () => {
         run: async (ctx) => {
           ctx.deleted(child)
           log.push("deleted returned")
-          kept.write("k", 1n, "k")
+          kept.write("k")
         },
       }),
     )
@@ -1927,11 +1959,10 @@ describe("deleted events", () => {
   })
 
   test("the last report for an id wins, and a deleted declared output gets no produced event after the task returns", async () => {
-    const gone = new Mem("mem:gone", "old", 1n, "old")
-    const back = new Mem("mem:back", "old", 1n, "old")
-    const regone = new Mem("mem:regone", "old", 1n, "old")
-    // The input is newer than the outputs, so the task does not skip by order.
-    const src = new Mem("mem:src", "a", 2n, "a")
+    const gone = new Mem("mem:gone", "old")
+    const back = new Mem("mem:back", "old")
+    const regone = new Mem("mem:regone", "old")
+    const src = new Mem("mem:src", "a")
     const log: string[] = []
 
     const build = new Build()
@@ -1948,9 +1979,9 @@ describe("deleted events", () => {
           ctx.deleted(gone)
           back.value = null
           ctx.deleted(back)
-          back.write("new", 2n, "new")
+          back.write("new")
           ctx.produced(back)
-          regone.write("new", 2n, "new")
+          regone.write("new")
           ctx.produced(regone)
           regone.value = null
           ctx.deleted(regone)
@@ -2018,10 +2049,9 @@ describe("deleted events", () => {
   })
 
   test("a task that deletes a declared output runs again on the next build; a deletion under a prefix output does not stop a skip", async () => {
-    // The input is newer than the output, so the first run does not skip by order.
-    const src = new Mem("mem:src", "a", 2n, "a")
-    const out = new Mem("mem:out", "old", 1n, "old")
-    const child = new Mem("mem:d/1", "old", 1n, "old")
+    const src = new Mem("mem:src", "a")
+    const out = new Mem("mem:out", "old")
+    const child = new Mem("mem:d/1", "old")
     const store = new MemoryStore()
     const runs: string[] = []
 
@@ -2053,10 +2083,10 @@ describe("deleted events", () => {
     const r1 = await first.run()
     expect(r1.success).toBe(true)
     expect(runs.toSorted()).toEqual(["clean-dir", "clean-out"])
-    // The record keeps an empty stamp for the deleted output.
+    // The record keeps null for the deleted output.
     expect(await store.get("clean-out")).toEqual({
-      inputStamps: { "mem:src": { order: 2n, content: "a" } },
-      outputStamps: { "mem:out": {} },
+      inputStamps: { "mem:src": "a" },
+      outputStamps: { "mem:out": null },
     })
 
     const second = new Build({ store })
@@ -2070,8 +2100,8 @@ describe("deleted events", () => {
 
   test("for each output, promised comes before deleted, and nothing comes after withdrawn", async () => {
     const child = new Mem("mem:p/1")
-    const declared = new Mem("mem:x", "old", 1n, "old")
-    const src = new Mem("mem:src", "a", 2n, "a")
+    const declared = new Mem("mem:x", "old")
+    const src = new Mem("mem:src", "a")
     let release!: () => void
     const gate = new Promise<void>((resolve) => {
       release = resolve

@@ -16,10 +16,11 @@ afterEach(async () => {
 
 const sample: TaskState = {
   inputStamps: {
-    "file:/tmp/a": { order: 10n, content: "abc" },
+    "file:/tmp/a": "abc",
+    "file:/tmp/missing": null,
   },
   outputStamps: {
-    "file:/tmp/b": { order: 20n, content: "def" },
+    "file:/tmp/b": "def",
   },
 }
 
@@ -36,7 +37,7 @@ describe("stores", () => {
     await roundTrip(new MemoryStore())
   })
 
-  test("JsonStore writes bigint stamps to disk", async () => {
+  test("JsonStore writes stamps to disk", async () => {
     const dir = await mkdtemp(path.join(tmpdir(), "dapat-json-"))
     temps.push(dir)
     const filePath = path.join(dir, "state.json")
@@ -46,10 +47,9 @@ describe("stores", () => {
     const second = new JsonStore(filePath)
     const got = await second.get("copy")
     expect(got).toEqual(sample)
-    expect(typeof got?.inputStamps["file:/tmp/a"]?.order).toBe("bigint")
   })
 
-  test("SqliteStore writes bigint stamps to disk", async () => {
+  test("SqliteStore writes stamps to disk", async () => {
     const dir = await mkdtemp(path.join(tmpdir(), "dapat-sqlstore-"))
     temps.push(dir)
     const dbPath = path.join(dir, "state.sqlite")

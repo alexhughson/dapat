@@ -1,10 +1,10 @@
-import { Build, Task, MemoryStore } from "dapat"
-import { FileArtifact } from "dapat/contrib"
+import { Build, Task } from "dapat"
+import { FileArtifact, JsonStore } from "dapat/contrib"
 
 const src = new FileArtifact("in.txt")
 const mid = new FileArtifact("mid.txt")
 const out = new FileArtifact("out.txt")
-const store = new MemoryStore()
+const store = new JsonStore(".dapat/state.json")
 const build = new Build({ store })
 
 build.add(
