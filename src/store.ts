@@ -1,4 +1,8 @@
-/** The stamps of the last successful run of a task, keyed by artifact id. null means the artifact did not exist. */
+/**
+ * The stamps of the last successful run of a task. Each key is "artifact <id>" or
+ * "prefix <id>", so a prefix and an artifact with the same id cannot collide.
+ * For an artifact, null means it did not exist. A prefix with a null stamp is left out.
+ */
 export interface TaskState {
   inputStamps: Record<string, string | null>
   outputStamps: Record<string, string | null>

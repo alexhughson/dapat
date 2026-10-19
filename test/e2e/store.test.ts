@@ -19,11 +19,12 @@ afterEach(async () => {
 
 const sample: TaskState = {
   inputStamps: {
-    "file:/tmp/a": "abc",
-    "file:/tmp/missing": null,
+    "artifact file:/tmp/a": "abc",
+    "artifact file:/tmp/missing": null,
+    "prefix file:/tmp/pages/": "123",
   },
   outputStamps: {
-    "file:/tmp/b": "def",
+    "artifact file:/tmp/b": "def",
   },
 }
 
@@ -71,6 +72,9 @@ describe("stores", () => {
     temps.push(dir)
     const store = new JsonStore(path.join(dir, "state.json"))
     const count = 8
+    // A task with no input always runs, so each task reads a seed file.
+    const seed = new FileArtifact(path.join(dir, "seed.txt"))
+    await writeFile(seed.path, "seed")
 
     const runOnce = async () => {
       const build = new Build({ store })
@@ -79,6 +83,7 @@ describe("stores", () => {
         build.add(
           new Task({
             id: `write-${i}`,
+            inputs: [seed],
             outputs: [out],
             run: async () => {
               await writeFile(out.path, String(i))
@@ -103,11 +108,15 @@ describe("stores", () => {
     const statePath = path.join(dir, "state.json")
     await writeFile(statePath, '{"tasks":{')
     const out = new FileArtifact(path.join(dir, "out.txt"))
+    // With no input the task runs without a look at the store, so it reads a seed file.
+    const seed = new FileArtifact(path.join(dir, "seed.txt"))
+    await writeFile(seed.path, "seed")
     let runs = 0
     const build = new Build({ store: new JsonStore(statePath) })
     build.add(
       new Task({
         id: "write",
+        inputs: [seed],
         outputs: [out],
         run: async () => {
           runs += 1
@@ -131,11 +140,13 @@ describe("stores", () => {
     temps.push(dir)
     const out = new FileArtifact(path.join(dir, "out.txt"))
     await writeFile(out.path, "x")
+    const seed = new FileArtifact(path.join(dir, "seed.txt"))
+    await writeFile(seed.path, "seed")
     const db = new Database(path.join(dir, "state.sqlite"))
     const store = new SqliteStore(db)
     // The payload that dapat wrote before one stamp per artifact.
     const oldPayload = {
-      inputStamps: {},
+      inputStamps: { [seed.id]: { order: "1", content: await seed.stamp() } },
       outputStamps: { [out.id]: { order: "1", content: await out.stamp() } },
     }
     db.query(`INSERT INTO dapat_task_state (task_id, payload) VALUES (?, ?)`).run(
@@ -149,6 +160,7 @@ describe("stores", () => {
       build.add(
         new Task({
           id: "write",
+          inputs: [seed],
           outputs: [out],
           run: async () => {
             runs += 1
@@ -162,8 +174,8 @@ describe("stores", () => {
     const first = await runOnce()
     expect(first.executed.length).toBe(1)
     expect(await store.get("write")).toEqual({
-      inputStamps: {},
-      outputStamps: { [out.id]: await out.stamp() },
+      inputStamps: { [`artifact ${seed.id}`]: await seed.stamp() },
+      outputStamps: { [`artifact ${out.id}`]: await out.stamp() },
     })
     const second = await runOnce()
     expect(second.skipped.length).toBe(1)

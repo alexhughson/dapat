@@ -1,6 +1,7 @@
 export { FileArtifact, DirectoryArtifact, PathPrefix, file, directory, pathPrefix } from "./fs"
+export type { FileStampMode, FileStampOptions } from "./fs"
 export { S3ObjectArtifact, S3Prefix, MemoryS3, s3Object, s3Prefix } from "./s3"
-export type { S3Client, S3Head } from "./s3"
+export type { S3Client, S3Head, S3ListEntry } from "./s3"
 export {
   SqliteRowArtifact,
   SqliteTableArtifact,

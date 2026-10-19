@@ -91,6 +91,9 @@ describe("filesystem stress", () => {
       const outDir = path.join(root, "out")
       const manifestPath = path.join(root, "manifest.txt")
 
+      // A task with no input always runs, so the writer reads a seed file.
+      const seedPath = path.join(root, "seed.txt")
+      await writeFile(seedPath, "seed")
       const store = new MemoryStore()
       let writes = 0
       let manifests = 0
@@ -102,6 +105,7 @@ describe("filesystem stress", () => {
         build.add(
           new Task({
             id: "write-all",
+            inputs: [new FileArtifact(seedPath)],
             outputs: [new PathPrefix(outDir), listing],
             run: async (ctx) => {
               writes += 1

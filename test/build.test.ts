@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test"
 import { Build, IdPrefix, MemoryStore, SEND_LIMIT, Task, isPrefix } from "../src/index"
 import type { Artifact, ArtifactEvent, Ref, TaskState } from "../src/index"
-import { Mem, MemDir } from "./mem"
+import { Mem, MemDir, MemPrefix } from "./mem"
 
 /** "<kind> <id>": the artifact id of a produced or deleted event, or the declared output id. */
 function describeEvent(event: ArtifactEvent): string {
@@ -1144,8 +1144,8 @@ describe("the skip rule", () => {
     const first = await runOnce(compile([src], out, runs), store)
     expect(first.executed).toEqual(["compile"])
     expect(await store.get("compile")).toEqual({
-      inputStamps: { "mem:src": "a" },
-      outputStamps: { "mem:out": "obj" },
+      inputStamps: { "artifact mem:src": "a" },
+      outputStamps: { "artifact mem:out": "obj" },
     })
   })
 
@@ -1223,8 +1223,8 @@ describe("the skip rule", () => {
 
     await runOnce(compile([optional], out, runs), store)
     expect(await store.get("compile")).toEqual({
-      inputStamps: { "mem:optional": null },
-      outputStamps: { "mem:out": "obj" },
+      inputStamps: { "artifact mem:optional": null },
+      outputStamps: { "artifact mem:out": "obj" },
     })
     const second = await runOnce(compile([optional], out, runs), store)
     expect(second.skipped).toEqual(["compile"])
@@ -1245,8 +1245,8 @@ describe("the skip rule", () => {
     const first = await runOnce(compile([src], out, runs), store)
     expect(first.executed).toEqual(["compile"])
     expect(await store.get("compile")).toEqual({
-      inputStamps: { "mem:src": "a" },
-      outputStamps: { "mem:out": "obj" },
+      inputStamps: { "artifact mem:src": "a" },
+      outputStamps: { "artifact mem:out": "obj" },
     })
     const second = await runOnce(compile([src], out, runs), store)
     expect(second.skipped).toEqual(["compile"])
@@ -1327,7 +1327,7 @@ describe("the skip rule", () => {
     await runOnce(make(), store)
     expect(out.value).toBe("compiled a")
     const record = await store.get("compile")
-    expect(record?.inputStamps["mem:src"]).toBe("a")
+    expect(record?.inputStamps["artifact mem:src"]).toBe("a")
 
     const second = await runOnce(make(), store)
     expect(second.executed).toEqual(["compile"])
@@ -1408,12 +1408,34 @@ describe("the skip rule", () => {
 
     await runOnce(compile([src], out, runs), store)
     const record = await store.get("compile")
-    expect(Object.keys(record?.inputStamps ?? {})).toEqual(["__proto__"])
+    expect(Object.keys(record?.inputStamps ?? {})).toEqual(["artifact __proto__"])
     const second = await runOnce(compile([src], out, runs), store)
     expect(second.skipped).toEqual(["compile"])
     src.write("b")
     const third = await runOnce(compile([src], out, runs), store)
     expect(third.executed).toEqual(["compile"])
+  })
+
+  test("a record keyed by bare ids, as PR 7 wrote it, makes the task run once and then skip", async () => {
+    const src = new Mem("mem:src", "a")
+    const out = new Mem("mem:out", "obj")
+    const store = new MemoryStore()
+    const runs = { count: 0 }
+    const bareRecord: TaskState = {
+      inputStamps: { "mem:src": "a" },
+      outputStamps: { "mem:out": "obj" },
+    }
+    await store.set("compile", bareRecord)
+
+    const first = await runOnce(compile([src], out, runs), store)
+    expect(first.executed).toEqual(["compile"])
+    expect(await store.get("compile")).toEqual({
+      inputStamps: { "artifact mem:src": "a" },
+      outputStamps: { "artifact mem:out": "obj" },
+    })
+    const second = await runOnce(compile([src], out, runs), store)
+    expect(second.skipped).toEqual(["compile"])
+    expect(runs.count).toBe(1)
   })
 
   test("a record whose stamp maps are arrays counts as no record", async () => {
@@ -2246,7 +2268,8 @@ describe("deleted events", () => {
       new Task({
         id: "clean-dir",
         inputs: [src],
-        outputs: [new IdPrefix("mem:d/")],
+        // IdPrefix has a null stamp and always runs. This prefix can stamp what is under it.
+        outputs: [new MemPrefix("mem:d/", [child])],
         run: async (ctx) => {
           runs.push("clean-dir")
           child.value = null
@@ -2262,8 +2285,8 @@ describe("deleted events", () => {
     expect(runs.toSorted()).toEqual(["clean-dir", "clean-out"])
     // The record keeps null for the deleted output.
     expect(await store.get("clean-out")).toEqual({
-      inputStamps: { "mem:src": "a" },
-      outputStamps: { "mem:out": null },
+      inputStamps: { "artifact mem:src": "a" },
+      outputStamps: { "artifact mem:out": null },
     })
 
     const second = new Build({ store })

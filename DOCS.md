@@ -20,7 +20,7 @@ dapat wraps each input and output in an **artifact**, which is a subclass of `Ar
 When you run a **build**, dapat does these steps for each task:
 
 1. It waits for the tasks that write the inputs of the task.
-2. It compares the current artifact stamps with the stamps from the last successful run. The **store** keeps the last stamps.
+2. It compares the current stamps of the inputs and outputs with the stamps from the last successful run. The **store** keeps the last stamps.
 3. It skips the task when every stamp is equal to the stamp from the last run. Otherwise, it runs the task.
 
 dapat does not know about disks or SQL. It only reads artifact ids and stamps. The adapters in `dapat/contrib` supply files, S3, and SQLite.
@@ -43,7 +43,7 @@ The package has two entry points:
 | Import | Contents |
 | --- | --- |
 | `dapat` | `Build`, `Task`, `Artifact`, `Prefix`, `IdPrefix`, `MemoryStore`, `Result`, and their types |
-| `dapat/contrib` | `FileArtifact`, `DirectoryArtifact`, `PathPrefix`, `S3ObjectArtifact`, `S3Prefix`, `MemoryS3`, `SqliteRowArtifact`, `SqliteTableArtifact`, `SqliteTablePrefix`, `JsonStore`, `SqliteStore`, and a short factory function for each artifact and prefix (`file`, `directory`, `pathPrefix`, `s3Object`, `s3Prefix`, `sqliteRow`, `sqliteTable`, `sqliteTablePrefix`) |
+| `dapat/contrib` | `FileArtifact`, `DirectoryArtifact`, `PathPrefix` (and the types `FileStampMode` and `FileStampOptions`), `S3ObjectArtifact`, `S3Prefix`, `MemoryS3` (and the types `S3Client`, `S3Head`, and `S3ListEntry`), `SqliteRowArtifact`, `SqliteTableArtifact`, `SqliteTablePrefix`, `JsonStore`, `SqliteStore`, and a short factory function for each artifact and prefix (`file`, `directory`, `pathPrefix`, `s3Object`, `s3Prefix`, `sqliteRow`, `sqliteTable`, `sqliteTablePrefix`) |
 
 ## 3. First build
 
@@ -105,7 +105,7 @@ Put `hello` into `in.txt`, and then run the script more than one time:
 1. **First run.** Both tasks execute. `out.txt` contains `[HELLO]`.
 2. **No change.** Both tasks skip.
 3. **Change `in.txt` to `bye`.** Both tasks execute. `out.txt` contains `[BYE]`.
-4. **Run `touch in.txt`.** The modification time changes, but the bytes do not. The stamp of a `FileArtifact` is a hash of the bytes, so the stamp does not change. Both tasks skip.
+4. **Run `touch in.txt`.** The modification time changes, but the bytes do not. By default, the stamp of a `FileArtifact` is the modification time and the size, so the stamp changes. Both tasks run. To skip in this case, use `new FileArtifact("in.txt", { stamp: "hash" })`. Then the stamp is a hash of the bytes ([section 10.1](#101-files-fileartifact-directoryartifact-pathprefix)).
 
 [Section 6](#6-when-a-task-skips) gives the full rules.
 
@@ -164,8 +164,37 @@ dapat compares ids as plain strings. An id is in a folder when the id starts wit
 
 dapat has two kinds of prefix:
 
-- A **plain prefix** is a folder name only. It has no stamp and no value. The classes are `IdPrefix`, `PathPrefix`, `S3Prefix`, and `SqliteTablePrefix`. Use a plain prefix when a task writes files, but you do not know their names before the task runs ([section 5](#5-tasks-and-dependencies)).
+- A **plain prefix** is a folder. It has a stamp, but no value. The classes are `IdPrefix`, `PathPrefix`, `S3Prefix`, and `SqliteTablePrefix`. Use a plain prefix when a task writes files, but you do not know their names before the task runs ([section 5](#5-tasks-and-dependencies)). Also use it as an input when a task reads files in a folder.
 - A **prefix artifact** is a folder that you can stamp and read. Its stamp comes from the artifacts in the folder. The classes are `DirectoryArtifact` and `SqliteTableArtifact`. Use a prefix artifact when a task reads all of the contents of a folder.
+
+### Prefix stamps
+
+A plain prefix has a `stamp()` method, as an artifact has. The stamp changes when anything under the prefix changes. Each prefix class chooses how to make it. For example, `PathPrefix` hashes the relative path and the stamp of each file under the folder.
+
+Example: a task writes `index.html` from every page under `pages/`. Its input is `pathPrefix("pages/")`. `index.html` is next to `pages/`, not in it. In `pages/`, it would change the stamp of its own input ([Prefix layouts](#prefix-layouts)).
+
+1. Build 1 sees `a.md`, `b.md`, and `c.md`. The task runs.
+2. You add `d.md`. The stamp of the prefix changes.
+3. Build 2 runs the task, and `index.html` lists `d.md`.
+
+An edit to a page or a deleted page also changes the stamp.
+
+An empty or missing folder has a real stamp, for example the hash of an empty list. So a task can skip when its folder is still empty.
+
+A prefix returns `null` from `stamp()` when it cannot tell what is under it. Then each task that uses that prefix runs on each build. The base class `Prefix` returns `null`. `IdPrefix` uses the base class, because an id string cannot list its children. A skip could then hide a change, so the task runs. `SqliteTablePrefix` also returns `null`.
+
+To write your own prefix with a stamp, extend `Prefix` and override `stamp()`. List the children, and hash each child id with its stamp. Sort the lines first, so that the order of the list has no effect. [Section 5](#outputs-with-unknown-names) has an example.
+
+**`pathPrefix` or `directory()` as an input?** Both stamp the same files in the same way. The only difference is a missing folder: `PathPrefix` gives it the stamp of an empty list, and `DirectoryArtifact` gives it `null`. Use `directory()` when the task also calls `read()` to get the file list. Use `pathPrefix()` when the folder can be missing. A later version of dapat merges the two classes.
+
+### Prefix layouts
+
+A **region** is a ref that stands for many ids: a plain prefix, or a prefix artifact such as `directory()` or `SqliteTableArtifact`. Regions with different ids may overlap. dapat does not reject them. (Two tasks that declare the same id are still rejected as a duplicate output.) But two layouts make tasks run again with no edits, and dapat gives no warning:
+
+- **A task writes into a folder that it reads.** For example, a task reads `pathPrefix("pages/")` or `directory("pages/")` and writes `pages/index.html`. With the default `"time"` stamp, the task runs on every build. Put `index.html` next to `pages/`, not in it.
+- **Two tasks write into one folder.** For example, `split` writes `pathPrefix("out/")`, and `index` writes `out/index.html`. The writers, and a task that reads `out/`, run again on later builds. In some layouts they run on every build. Give each writer its own folder, for example `out/pages/` for `split`.
+
+[Section 12](#12-limits) explains what runs again and why.
 
 ### Write your own artifact
 
@@ -250,9 +279,9 @@ build.run()
 │  │   ├─ a producer task failed           → this task fails: "dependency of '<id>' failed"
 │  │   └─ no task can make progress        → this task fails: "deadlock waiting for inputs of '<id>'"
 │  ├─ decide if the task can skip
-│  │   ├─ stamp every artifact input
+│  │   ├─ stamp every input: artifacts and prefixes
 │  │   ├─ read the store record of the task
-│  │   ├─ stamp every artifact output
+│  │   ├─ stamp every output: artifacts and prefixes
 │  │   ├─ all stamps equal the record       → skipped
 │  │   └─ store.get or stamp() throws       → this task fails
 │  ├─ task.run(ctx)
@@ -279,7 +308,7 @@ A prefix artifact input does **not** wait for a plain prefix output in a subfold
 
 An input that no task writes is a **source**, for example `in.txt` in section 3. dapat does not wait for a source.
 
-Only one task can declare a given artifact as an output. `build.add()` throws `duplicate output '<id>'` when a second task declares the same output id. One task also cannot declare the same output two times.
+Only one task can declare a given artifact as an output. `build.add()` throws `duplicate output '<id>'` when a second task declares the same output id. One task also cannot declare the same output two times. Two tasks can still write into one folder, and a task can write into a folder that it reads. Those tasks run on every build ([Prefix layouts](#prefix-layouts)).
 
 A waiting task finds its producers again each time a task is added, removed, or completed. When a producer finishes, the waiting task continues in this way:
 
@@ -311,10 +340,31 @@ Tasks with no dependency between them run at the same time. dapat has no concurr
 
 Some tasks write a set of artifacts, and the names are not known before the task runs. For example, a task can split a document into pages. For this case, declare a plain prefix output: the folder that the task writes into. Then call `ctx.produced(artifact)` for each artifact that the task writes.
 
-This sample uses `MapEntry` and `Entry` from [section 4](#write-your-own-artifact):
+This sample uses `MapEntry` and `Entry` from [section 4](#write-your-own-artifact). `MapPrefix` is a folder of map keys. Its stamp lists each key in the folder with its value, so `split` can skip:
 
 ```ts
-import { Build, IdPrefix, Task } from "dapat"
+import { Build, Prefix, Task } from "dapat"
+
+class MapPrefix extends Prefix {
+  readonly id: string
+
+  constructor(readonly map: Map<string, Entry>, readonly folder: string) {
+    super()
+    this.id = `map:${folder}`
+  }
+
+  async stamp(): Promise<string | null> {
+    const lines: string[] = []
+    for (const [key, entry] of this.map) {
+      if (!key.startsWith(this.folder)) continue
+      lines.push(`${key}=${entry.value}`)
+    }
+    lines.sort()
+    const hasher = new Bun.CryptoHasher("sha256")
+    hasher.update(lines.join("\n"))
+    return hasher.digest("hex")
+  }
+}
 
 const map = new Map<string, Entry>()
 map.set("doc", { value: "p1\np2" })
@@ -326,7 +376,7 @@ build.add(
   new Task({
     id: "split",
     inputs: [doc],
-    outputs: [new IdPrefix("map:pages/")],
+    outputs: [new MapPrefix(map, "pages/")],
     run: async (ctx) => {
       const lines = (await doc.read()).split("\n")
       for (let i = 0; i < lines.length; i++) {
@@ -341,7 +391,7 @@ build.add(
 
 A task that reads `map:pages/1` now waits for `split`. `ctx.produced()` throws when the artifact is not a declared output of the task and is not in one of the task's output folders. The task then fails.
 
-A plain prefix has no stamp. When dapat makes a skip decision ([section 6](#6-when-a-task-skips)), it ignores prefix inputs and prefix outputs. So `split` has one artifact input and no artifact outputs. It skips when `doc` has the same stamp as in the record.
+`split` skips when `doc` and the pages have the same stamps as in the record. With `new IdPrefix("map:pages/")` as the output, `split` runs on each build, because an `IdPrefix` cannot list the pages ([Prefix stamps](#prefix-stamps)).
 
 ### The `ctx` argument
 
@@ -359,15 +409,16 @@ You can also call `build.add()` and `build.remove()` from outside a task while `
 
 dapat makes the decision for each task after the tasks that write its inputs finish. It uses one rule.
 
-dapat **skips** the task when all of these are true:
+In one sentence: dapat skips a task that has an input when no output and no prefix has a `null` stamp, and every id and stamp equals the record. In detail, dapat **skips** the task when all of these are true:
 
-- The task has at least one artifact input or artifact output. dapat ignores plain prefixes.
+- The task has at least one input.
 - The build has a store, and the store has a record for the task id.
 - The record has the same input ids and the same output ids as the task.
 - Each artifact output exists. Its stamp is not `null`.
-- The current stamp of each artifact input and output is equal to the stamp in the record.
+- No prefix input or output has a `null` stamp.
+- The current stamp of each input and output, artifact or prefix, is equal to the stamp in the record.
 
-In all other cases, dapat **runs** the task. With no store, with no record for the task, or with no artifact input or output to compare, the task always runs.
+In all other cases, dapat **runs** the task. With no store, with no record for the task, with no input, or with an `IdPrefix`, the task always runs.
 
 The examples below use a task `compile` with the input `src.txt` and the output `out.txt`. The build has a store.
 
@@ -380,16 +431,18 @@ The examples below use a task `compile` with the input `src.txt` and the output 
 Some more results of the rule:
 
 - You edit an output by hand. Its stamp is different from the record, so the task runs and writes the output again.
-- You touch an input, but its bytes do not change. `FileArtifact` uses a hash of the bytes as its stamp, so the stamp does not change. The task skips.
+- You touch an input, but its bytes do not change. By default, `FileArtifact` uses the modification time and the size as its stamp, so the stamp changes. The task runs. With `{ stamp: "hash" }`, the stamp does not change, and the task skips.
+- You add a file to a folder that a `PathPrefix` input covers. The stamp of the prefix changes. The task runs.
 - An input is missing on two builds in a row. Its stamp is `null` both times. The stamps are equal, so this input does not make the task run.
-- The task has no artifact inputs and no artifact outputs. Examples are a task with only prefix outputs, a deploy task with no inputs and no outputs, and a task with only a plain prefix input. dapat has nothing to compare, so the task runs on each build.
-- A task deletes one of its declared artifact outputs and calls `ctx.deleted`. That output is then missing, so the task runs on each build. To delete an artifact and still skip, declare its folder as a prefix output. This works only when the task also has an artifact input or an artifact output, because a task with nothing to compare always runs. Call `ctx.deleted` on each run, also when the artifact is already gone. If you do not, dapat sends a `produced` event for the missing output after the task returns.
+- The task has no inputs, for example a deploy task, or a task that fetches data into `raw/` with only a prefix output. Nothing can tell dapat that the result is still current, so the task runs on each build. To let it skip, give it an input, for example a config file.
+- The task has an `IdPrefix` input or output. Its stamp is `null`, so the task runs on each build.
+- A task deletes one of its declared artifact outputs and calls `ctx.deleted`. That output is then missing, so the task runs on each build. To delete an artifact and still skip, declare its folder as a prefix output with a stamp, for example a `PathPrefix`. The task must also have an input. An `IdPrefix` output makes the task run on each build. Call `ctx.deleted` on each run, also when the artifact is already gone. If you do not, dapat sends a `produced` event for the missing output after the task returns.
 
-dapat does not compare modification times. Older versions of dapat skipped a task when its outputs were newer than its inputs, as `make` does. That check is gone. Without a store record, a task runs.
+dapat does not ask which modification time is newer. Older versions of dapat skipped a task when its outputs were newer than its inputs, as `make` does. That check is gone. A file stamp can hold a modification time, but dapat compares it for equality only. Without a store record, a task runs.
 
-dapat stamps the artifact inputs before the task runs. After the task runs with no error, dapat stamps the artifact outputs. Then it writes the input stamps from before the run and the output stamps from after the run to the store. If an input changes while the task runs, the record keeps the old stamp, so the next build runs the task again. dapat does not write stamps for a failed task, so a failed task runs again on the next build.
+dapat stamps the inputs, artifacts and prefixes, before the task runs. It stamps a prefix input after the tasks that write under the prefix have finished. After the task runs with no error, dapat stamps the outputs, artifacts and prefixes. Then it writes the input stamps from before the run and the output stamps from after the run to the store. If an input changes while the task runs, the record keeps the old stamp, so the next build runs the task again. dapat does not write stamps for a failed task, so a failed task runs again on the next build.
 
-The `stamp()` methods do real I/O. For example, `FileArtifact.stamp()` reads and hashes the full file, and `DirectoryArtifact.stamp()` reads every file under the directory. dapat calls `stamp()` only when the build has a store. Before a task runs, it always stamps the inputs. It stamps the outputs only when the store has a record for the task.
+The `stamp()` methods do real I/O. For example, `FileArtifact.stamp()` reads the modification time and size of the file, and `PathPrefix.stamp()` walks the folder and does the same for each file. With `{ stamp: "hash" }`, they read and hash the full bytes. dapat calls `stamp()` only when the build has a store. Before a task runs, it always stamps the inputs. It stamps the outputs only when the store has a record for the task.
 
 If `store.get()` or a `stamp()` method throws during this check, the task fails with that error. It does not run. The tasks that read its outputs fail too, as for any failed task.
 
@@ -398,7 +451,7 @@ If `store.get()` or a `stamp()` method throws during this check, the task fails 
 `Result` tells you which tasks ran and which skipped. It does not tell you the reason. To find the reason, do these steps:
 
 1. Read the task's record with `await store.get(taskId)`. If it is `null`, the task has never succeeded with this store, so it runs.
-2. Call `await artifact.stamp()` on each artifact input and output. Compare the values with `inputStamps` and `outputStamps` in the record. A missing id, an extra id, a different stamp, or a `null` output stamp makes the task run.
+2. Call `await ref.stamp()` on each input and output. Compare the values with `inputStamps` and `outputStamps` in the record. The key of an artifact is `artifact <id>`, and the key of a prefix is `prefix <id>`. A missing key, an extra key, a different stamp, a `null` output stamp, or a `null` prefix stamp makes the task run.
 3. Make sure that the task declares every file that it reads. dapat does not see an input that the task does not declare. A change to that file does not make the task run.
 
 ## 7. Stores
@@ -425,9 +478,9 @@ If the file is not valid JSON, each `get` throws, so each task fails. Call `stor
 
 `SqliteStore` accepts an open `Database` from `bun:sqlite` or a file path. If you give a path, the store opens the database, and `close()` closes it. If you give a `Database`, `close()` does nothing.
 
-The store keeps stamps for artifact inputs and outputs only. It does not keep prefixes. It does not keep the artifacts that a task reported with `ctx.produced()` or `ctx.deleted()`.
+The store keeps one stamp for each declared input and output. The key is `artifact <id>` or `prefix <id>`, so a prefix and an artifact with the same id cannot share a stamp. An artifact stamp is a string, or `null` for a missing artifact. A prefix with a `null` stamp has no key, because the task runs anyway. The store does not keep the artifacts that a task reported with `ctx.produced()` or `ctx.deleted()`.
 
-A record has one stamp for each artifact id: a string, or `null` for a missing artifact. Older versions of dapat wrote two stamps for each id, an order stamp and a content stamp. dapat treats a record in that old shape as no record. The task runs, and dapat writes a record in the new shape. So the first build after an upgrade runs every task one time.
+dapat treats a record from an older version as no record. The task runs, and dapat writes a record in the new shape. So the first build after an upgrade runs every task one time. Older versions keyed the stamps by the bare id, or wrote two stamps for each id.
 
 Add the store file to `.gitignore`. To make tasks run again, see [section 11.1](#111-force-tasks-to-run-again).
 
@@ -630,9 +683,37 @@ A relative path resolves against the current working directory when you create t
 
 | Class | Stamp | `read()` returns |
 | --- | --- | --- |
-| `FileArtifact(path)` | SHA-256 of the bytes | `Uint8Array` |
-| `DirectoryArtifact(path)` | SHA-256 of each relative path and the hash of that file | absolute paths of all files, in all subdirectories |
-| `PathPrefix(path)` | none | none (plain prefix) |
+| `FileArtifact(path, { stamp })` | the modification time and size, or the SHA-256 of the bytes | `Uint8Array` |
+| `DirectoryArtifact(path, { stamp })` | SHA-256 of each relative path and the stamp of that file. `null` if the directory is missing. | absolute paths of all files, in all subdirectories |
+| `PathPrefix(path, { stamp })` | SHA-256 of each relative path and the stamp of that file. A missing directory has the stamp of an empty list. | none (plain prefix) |
+
+#### Time or hash
+
+Each of the three classes takes the option `stamp: "time" | "hash"`. The factory functions `file()`, `directory()`, and `pathPrefix()` take it too. The default is `"time"`.
+
+- `"time"`: the stamp of a file is its modification time in nanoseconds and its size. dapat reads no bytes.
+- `"hash"`: the stamp of a file is the SHA-256 of its bytes. dapat reads each file in full.
+
+The folder classes follow symlinks. A link to a file counts as that file, with the stamp of its target. A link to a folder is walked. A link back to a folder above it is not walked again. A link that cannot resolve adds no file: a broken link, a link to itself, two links that point at each other, or a link through a file. If the folder of the prefix itself cannot resolve, `stamp()` throws.
+
+`"time"` stats up to 256 files at the same time. `"hash"` reads up to 8 files at the same time, and streams a file of 1 MB or more into the hash, so a large file does not fill the memory.
+
+`"time"` is the default because it is much faster. These are measured times on Bun, with a cold cache and then a warm cache:
+
+| Files | `"time"` | `"hash"` |
+| --- | --- | --- |
+| 400 text pages, 2 MB | 21–26 ms / 13–19 ms | 47–55 ms / 22–23 ms |
+| 40 image files, 86 MB | 5–6 ms / 2–3 ms | 165–371 ms / 115–155 ms |
+| 1 file, 287 MB | 2–3 ms / under 1 ms | 0.4–2 s / 0.4–0.6 s |
+
+`"time"` has a cost. A `touch`, a `git checkout`, or a copy that changes the modification time and keeps the bytes changes the stamp. Then the task runs again. Set `stamp: "hash"` where a run is expensive, for example a task that calls a paid model.
+
+```ts
+const prompt = file("prompts/summary.txt", { stamp: "hash" })
+const pages = pathPrefix("pages/", { stamp: "hash" })
+```
+
+Older versions of dapat used the hash for every file. After an upgrade, every stamp of a file is different, so each task with a file runs one time.
 
 ### 10.2 S3: `S3ObjectArtifact`, `S3Prefix`, `S3Client`, `MemoryS3`
 
@@ -643,7 +724,12 @@ interface S3Client {
   head(bucket: string, key: string): Promise<S3Head | null>
   get(bucket: string, key: string): Promise<Uint8Array>
   put(bucket: string, key: string, body: Uint8Array): Promise<S3Head>
-  list(bucket: string, prefix: string): Promise<string[]>
+  list(bucket: string, prefix: string): Promise<S3ListEntry[]>
+}
+
+interface S3ListEntry {
+  key: string
+  etag: string
 }
 
 interface S3Head {
@@ -655,7 +741,7 @@ interface S3Head {
 Write an adapter for the AWS SDK or for your own HTTP client. The adapter must obey these rules:
 
 - `head` must return `null` when the object does not exist. Do not throw. A `null` tells dapat that an output is missing, so the task must run.
-- `list` must return every key under the prefix. S3 `ListObjectsV2` returns at most 1000 keys in one response. Follow `ContinuationToken` until the response is not truncated.
+- `list` must return every object under the prefix, with its key and its `etag`. S3 `ListObjectsV2` returns at most 1000 objects in one response. Follow `ContinuationToken` until the response is not truncated, and return the objects from every page. If you return one page only, `S3Prefix` does not see a change on the other pages.
 - `put` must return the `lastModified` and `etag` of the new object.
 
 `MemoryS3` implements this interface in memory. Use it for tests.
@@ -663,7 +749,7 @@ Write an adapter for the AWS SDK or for your own HTTP client. The adapter must o
 | Class | Stamp | `read()` returns |
 | --- | --- | --- |
 | `S3ObjectArtifact(client, bucket, key)` | `etag` | `Uint8Array` |
-| `S3Prefix(bucket, keyPrefix)` | none | none (plain prefix) |
+| `S3Prefix(client, bucket, keyPrefix)` | SHA-256 of each key under the prefix and its `etag` | none (plain prefix) |
 
 ### 10.3 SQLite: `SqliteRowArtifact`, `SqliteTableArtifact`, `SqliteTablePrefix`
 
@@ -673,7 +759,7 @@ These classes take a `bun:sqlite` `Database`. Table and column names must match 
 | --- | --- | --- |
 | `SqliteRowArtifact({ db, table, pkColumn, pk })` | SHA-256 of the column values | the row as an object |
 | `SqliteTableArtifact({ db, table, pkColumn })` | SHA-256 of the hashes of all rows | the primary keys |
-| `SqliteTablePrefix(table)` | none | none (plain prefix) |
+| `SqliteTablePrefix(table)` | `null`, so a task that uses it runs on each build | none (plain prefix) |
 
 `SqliteTableArtifact` is a prefix artifact. Each row is a file in the folder `sqlite:table/`.
 
@@ -743,14 +829,32 @@ A task skips only when the store has a record for it. To skip unchanged tasks in
 - the store file, for example `.dapat/state.json`.
 - the output files of the tasks.
 
-The stamps of `FileArtifact` and `DirectoryArtifact` are hashes of the bytes. A new checkout changes the modification time of each file, but not the stamps. The ids of these artifacts are absolute paths. So check out the repo at the same path on each CI run. At a different path, the ids change, and every task runs. If the cache is empty, every task runs.
+A new checkout changes the modification time of each file. With the default `stamp: "time"`, that changes the stamp of each file, and every task with a file input runs. In CI, pass `{ stamp: "hash" }` to `FileArtifact`, `DirectoryArtifact`, and `PathPrefix`. A hash does not change when the bytes stay the same. The ids of these artifacts are absolute paths. So check out the repo at the same path on each CI run. At a different path, the ids change, and every task runs. If the cache is empty, every task runs.
 
 ## 12. Limits
 
 - **A task that skips sends no `produced` or `deleted` events.** This applies to its prefix outputs and to its declared outputs. A subscriber gets only the `promised` events of that task on the next build.
-- **A plain prefix input never makes a task run.** dapat cannot stamp a plain prefix input such as `IdPrefix` or `PathPrefix`, so the skip check does not see a change under it. If the task has other artifacts to compare, it skips when they are equal to the record. To run the task when the folder changes, use a prefix artifact as the input, for example `DirectoryArtifact` or `SqliteTableArtifact`.
+- **A task with an `IdPrefix` input or output runs on each build.** An `IdPrefix` cannot list what is under it, so its stamp is `null`. A skip could hide a change under it. `SqliteTablePrefix` is the same. To let the task skip, use a prefix that can stamp, for example `PathPrefix` or `S3Prefix`, or write a prefix subclass with a `stamp()` method.
+- **A `"time"` stamp misses an edit that keeps the size and the modification time.** Then the task skips. These cases do that:
+  - Tools that copy the old modification time: `cp -p`, `rsync -t` (also `rsync -a`), and tar extraction.
+  - File systems with coarse times: HFS+ keeps 1 second, and FAT and some network file systems keep 2 seconds. An edit inside that time that keeps the size is not seen. Most Linux file systems keep a few milliseconds or better.
+
+  `stamp: "hash"` sees all of these edits. Use it for files that such tools write, and for files that a program edits during the build.
+- **A link to a folder above the prefix pulls that folder into the stamp.** If that folder holds the store file or the outputs of the task, the task runs on every build.
+- **Many links to one folder are walked one time for each path.** The stamp then reads that folder many times. Only a link back to a folder above it is not walked again.
+- **A task that writes into a folder that it reads runs again with no edits.** For example, a task reads `pathPrefix("pages/")` and writes `pages/index.html`. Each run writes `index.html`, so the stamp of `pages/` changes, and on the next build the input stamp differs from the record. With the default `"time"` stamp, each write gives `index.html` a new modification time, so the task runs on every build. With `stamp: "hash"`, the task stops running once a run writes the same bytes as the run before. For example, if it writes the same bytes each time, it runs on builds 1 and 2 and skips from build 3. `directory("pages/")` as the input does the same. Each build finishes, and the task runs one time in each build. dapat gives no warning. To let the task skip from build 2, put `index.html` next to `pages/`, not in it.
+- **Two tasks that write into one folder run again with no edits.** For example, `split` writes `pathPrefix("out/")`, and `index` writes `out/index.html`. dapat records the stamp of `out/` when `split` ends. If `index` writes after that, the record of `split` is old on the next build. Each build finishes, and dapat gives no warning. With the default `"time"` stamp:
+  - If `index` also reads a file that `split` writes, `index` waits for `split`. Then `split`, `index`, and a task that reads `out/` run on every build.
+  - If the two writers do not wait for each other, the writer that ended first, and a task that reads `out/`, run one extra time on the next build. Which writer that is depends on which one ends first. Then the tasks skip. If both writers declare the whole folder, for example both write `pathPrefix("out/")`, they can take turns and run again on every build.
+
+  With `stamp: "hash"`, the tasks skip from build 3 when each run writes the same bytes.
+
+  Nested outputs of two tasks also miss a wait. For example, `top` writes `directory("out/")`, and `sub` writes `pathPrefix("out/sub/")`. A task that reads `directory("out/")` does not wait for `sub`, so in build 1 it can see `out/` without the files of `sub`. The next build runs `top` and the reader again, and the reader sees all the files. See the limit below about a prefix artifact input and a plain prefix output in a subfolder.
+
+  To let all of these tasks skip from build 2, give each writer its own folder, for example `out/pages/` for `split` and `out/index.html` next to it, with no task that reads all of `out/`.
+- **A prefix input that covers the store file runs on every build.** For example, a task reads `pathPrefix(".")`, and the store is `.dapat/state.json`. Each build writes the store, so the stamp of the prefix changes. Put the store outside the folders that tasks read, or read a narrower prefix.
 - **A prefix artifact input does not wait for a plain prefix output in a subfolder.** See [section 5](#how-dapat-finds-dependencies).
-- **`FileArtifact.stamp()` returns `null` for all errors.** For example, a permission error on a file looks like a missing file. On an output, the task then runs again and does not fail. On an input, a `null` stamp on two builds in a row is equal, so the task can skip. Check file permissions when a task always runs or never runs.
+- **Only a missing path counts as missing.** The file classes return `null` (or an empty stamp for `PathPrefix`) only for `ENOENT`. Every other error makes `stamp()` throw, so the task fails with that error, for example a permission error, or a file where a folder must be. In `"time"` mode, dapat reads only the metadata of a file. A file that the task cannot read still gets a stamp, and `read()` fails later.
 - **No timeout and no concurrency limit.** All ready tasks start at the same time. Add limits and timeouts in your task code ([section 11.2](#112-limit-parallel-work)), and use `ctx.signal` to stop work.
 - **Bun only.** The adapters use Bun APIs.
 
@@ -772,7 +876,7 @@ new Build(opts?: { store?: Store; sendLimit?: number })
 
 | Member | Description |
 | --- | --- |
-| `add(task: Task): void` | Adds a task. If a task with the same id exists, replaces it (see [section 8](#replacement)). If `run()` has started, sends a `promised` event for each declared output, and the task starts at once. Does not throw when a subscriber throws ([section 9](#subscriber-errors)). Throws if another task already declares one of its exact outputs, if the task declares one output twice, or if another owner holds that id ([section 5](#5-tasks-and-dependencies)). |
+| `add(task: Task): void` | Adds a task. If a task with the same id exists, replaces it (see [section 8](#replacement)). If `run()` has started, sends a `promised` event for each declared output, and the task starts at once. Does not throw when a subscriber throws ([section 9](#subscriber-errors)). Throws if another task already declares one of its exact outputs, if the task declares one output twice, or if another owner holds that id ([section 5](#5-tasks-and-dependencies)). Throws before it changes anything. |
 | `remove(id: string): void` | Removes a task. Aborts it if it is running and sends a `withdrawn` event for each declared output. Does not throw when a subscriber throws. Starts to delete its store record. Does not wait for the delete, but `run()` does. A delete error goes into `result.errors`. Does nothing if the id is not known. The other tasks of the same owner stay. |
 | `subscribe(listener: (event: ArtifactEvent) => void): void` | From `Emitter`. Calls `listener` synchronously for each artifact event, in the order of the event queue. Does not replay earlier events. See [section 9](#9-subscribe-to-artifact-events). |
 | `protected setTasks(owner: string, tasks: readonly Task[]): void` | Makes `tasks` the tasks of `owner` ([section 5](#5-tasks-and-dependencies)). Adds each new id, replaces each known id, and removes each id that `owner` gave before and does not give now. Changes all state first, then puts the events on the queue: all `withdrawn` events of the call first, then the `promised` events, by id in list order. A dropped task ends as `cancelled` with the reason `"removed"` if it had not finished. Throws and changes nothing if another owner has one of the ids, if `tasks` has one id two times, or if two tasks declare one exact output. `add(task)` calls `setTasks("add:" + task.id, [task])`. Rules will call it; your code does not. |
@@ -841,6 +945,7 @@ Type guards. They use `instanceof`.
 | Member | Description |
 | --- | --- |
 | `abstract readonly id: string` | The region. End it with a delimiter. |
+| `stamp(): Promise<string \| null>` | A string that changes when anything under the prefix changes. An empty region has a real stamp. `null` when the prefix cannot tell what is under it; then each task that uses it runs. Default: `null`. A throw fails the task that dapat stamps the prefix for. See [Prefix stamps](#prefix-stamps). |
 | `covers(artifact: Artifact): boolean` | Default: `artifact.id` equals or starts with `this.id`. |
 | `overlaps(other: Prefix): boolean` | Default: one id equals or starts with the other. |
 
@@ -850,7 +955,7 @@ Type guards. They use `instanceof`.
 new IdPrefix(id: string)
 ```
 
-A prefix whose region is the id string.
+A prefix whose region is the id string. Its stamp is `null`, because an id string cannot list its children. So a task that uses an `IdPrefix` runs on each build.
 
 ### `interface Store`
 
@@ -867,12 +972,12 @@ To write your own store, implement these four methods. A record holds strings an
 
 ```ts
 interface TaskState {
-  inputStamps: Record<string, string | null>  // keyed by artifact id
+  inputStamps: Record<string, string | null>  // keyed by "artifact <id>" or "prefix <id>"
   outputStamps: Record<string, string | null>
 }
 ```
 
-`null` means that the artifact did not exist.
+`null` means that the artifact did not exist. A prefix with a `null` stamp has no key.
 
 ### `class MemoryStore implements Store`
 
@@ -941,22 +1046,23 @@ Relative paths are resolved against `process.cwd()` when you construct the artif
 ### `class FileArtifact extends Artifact<Uint8Array>` and `file(path)`
 
 ```ts
-new FileArtifact(path: string)
-file(path: string): FileArtifact
+new FileArtifact(path: string, opts?: { stamp?: "time" | "hash" })
+file(path: string, opts?: { stamp?: "time" | "hash" }): FileArtifact
 ```
 
 | Member | Value |
 | --- | --- |
 | `path` | Absolute path |
 | `id` | `file:<absolute path>` |
-| `stamp()` | SHA-256 hex of the bytes. `null` if the file cannot be read. |
+| `stampMode` | `"time"` or `"hash"`. Default `"time"`. The constructor throws for any other value. |
+| `stamp()` | `"time"`: `<modification time in ns>:<size>`. `"hash"`: SHA-256 hex of the bytes. Follows a symlink. `null` if the file is missing. Throws if the path is not a file, and for every other error. |
 | `read()` | The bytes. Throws if the file is missing. |
 
 ### `class DirectoryArtifact extends Artifact<string[]>` and `directory(path)`
 
 ```ts
-new DirectoryArtifact(path: string)
-directory(path: string): DirectoryArtifact
+new DirectoryArtifact(path: string, opts?: { stamp?: "time" | "hash" })
+directory(path: string, opts?: { stamp?: "time" | "hash" }): DirectoryArtifact
 ```
 
 | Member | Value |
@@ -965,20 +1071,23 @@ directory(path: string): DirectoryArtifact
 | `id` | `file:<absolute path>/` |
 | `covers(other)` | `true` for every id under the directory |
 | `coversOthers` | `true` |
-| `stamp()` | SHA-256 of the sorted lines `<relative path>=<file sha256>`. `null` if the directory is missing. |
+| `stampMode` | `"time"` or `"hash"`. Default `"time"`. |
+| `stamp()` | SHA-256 of the sorted lines `<relative path>=<file stamp>`. Each file stamp is as in `FileArtifact`. `null` if the directory is missing. Throws if the path is a file, and for every other error. |
 | `read()` | Absolute paths of every file under the directory, at any depth. Throws if the directory is missing. |
 
 ### `class PathPrefix extends Prefix` and `pathPrefix(path)`
 
 ```ts
-new PathPrefix(path: string)
-pathPrefix(path: string): PathPrefix
+new PathPrefix(path: string, opts?: { stamp?: "time" | "hash" })
+pathPrefix(path: string, opts?: { stamp?: "time" | "hash" }): PathPrefix
 ```
 
 | Member | Value |
 | --- | --- |
 | `path` | Absolute path, ending with `/` |
 | `id` | `file:<absolute path>/` |
+| `stampMode` | `"time"` or `"hash"`. Default `"time"`. |
+| `stamp()` | SHA-256 of the sorted lines `<relative path>=<file stamp>` for every file under the path, at any depth. Each file stamp is as in `FileArtifact`. A missing directory has the stamp of an empty list. Never `null`. Throws if the path is a file, and for every other error. |
 
 ## S3 (`dapat/contrib`)
 
@@ -1000,14 +1109,16 @@ s3Object(client: S3Client, bucket: string, key: string): S3ObjectArtifact
 | `stamp()` | `head().etag`. `null` if `head` returns `null`. |
 | `read()` | `client.get(bucket, key)` |
 
-### `class S3Prefix extends Prefix` and `s3Prefix(bucket, keyPrefix)`
+### `class S3Prefix extends Prefix` and `s3Prefix(client, bucket, keyPrefix)`
 
 ```ts
-new S3Prefix(bucket: string, keyPrefix: string)
-s3Prefix(bucket: string, keyPrefix: string): S3Prefix
+new S3Prefix(client: S3Client, bucket: string, keyPrefix: string)
+s3Prefix(client: S3Client, bucket: string, keyPrefix: string): S3Prefix
 ```
 
 `id` is `s3://<bucket>/<keyPrefix>/`. The constructor adds the trailing `/` if `keyPrefix` is not empty and does not end with `/`.
+
+`stamp()` calls `client.list` one time for the objects under `<keyPrefix>/`. It returns the SHA-256 of the sorted lines `<key>=<etag>`. An empty prefix has the stamp of an empty list. It throws if `list` returns an entry without a string `key` and a string `etag`, for example the plain keys of an adapter for the older interface. Older versions took no `client`.
 
 ### `class MemoryS3 implements S3Client`
 
@@ -1015,7 +1126,7 @@ s3Prefix(bucket: string, keyPrefix: string): S3Prefix
 new MemoryS3()
 ```
 
-Keeps objects in a `Map`. `put` sets the `etag` to the SHA-256 of the body. `put` also sets `lastModified` to a value that increases by at least 1 ms on each call. `get` throws for a missing object. `list` returns sorted keys.
+Keeps objects in a `Map`. `put` sets the `etag` to the SHA-256 of the body. `put` also sets `lastModified` to a value that increases by at least 1 ms on each call. `get` throws for a missing object. `list` returns `{ key, etag }` for each object, sorted by key.
 
 ## SQLite (`dapat/contrib`)
 
@@ -1061,7 +1172,7 @@ sqliteTable(opts: {
 sqliteTablePrefix(table: string): SqliteTablePrefix
 ```
 
-`id` is `sqlite:<table>/`.
+`id` is `sqlite:<table>/`. `stamp()` is the base `Prefix.stamp()`, which returns `null`. So a task that uses a `SqliteTablePrefix` runs on each build.
 
 ## Stores (`dapat/contrib`)
 

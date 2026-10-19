@@ -3,6 +3,12 @@ export interface S3Head {
   etag: string
 }
 
+/** One object that `list` returns. */
+export interface S3ListEntry {
+  key: string
+  etag: string
+}
+
 /**
  * I/O port for S3 objects. Pass AWS SDK v3, a custom signer, or MemoryS3.
  *
@@ -17,5 +23,6 @@ export interface S3Client {
   head(bucket: string, key: string): Promise<S3Head | null>
   get(bucket: string, key: string): Promise<Uint8Array>
   put(bucket: string, key: string, body: Uint8Array): Promise<S3Head>
-  list(bucket: string, prefix: string): Promise<string[]>
+  /** Every object under the prefix, from every page of results. */
+  list(bucket: string, prefix: string): Promise<S3ListEntry[]>
 }

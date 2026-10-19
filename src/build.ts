@@ -44,7 +44,8 @@ export class Build extends Emitter<ArtifactEvent> {
   // For each owner, the ids of the tasks that it gave. Slot.owner is the reverse.
   private readonly owners = new Map<string, Set<string>>()
   private readonly exactOutputs = new Map<string, { artifact: Artifact; taskId: string }>()
-  private readonly prefixOutputs: { prefix: Prefix; taskId: string }[] = []
+  // The prefix outputs of all tasks. The producer lookup scans them; exact outputs are in exactOutputs.
+  private readonly prefixOutputs: PrefixOutput[] = []
   private readonly outcomes = new Map<Task, Outcome>()
   private readonly errors: Error[] = []
   // The events that wait to go to the subscribers, oldest first.
@@ -324,8 +325,9 @@ export class Build extends Emitter<ArtifactEvent> {
     for (const output of task.outputs) {
       if (isArtifact(output)) {
         this.exactOutputs.set(output.id, { artifact: output, taskId: task.id })
-      } else {
-        this.prefixOutputs.push({ prefix: output, taskId: task.id })
+      }
+      if (isPrefix(output)) {
+        this.prefixOutputs.push({ output, taskId: task.id })
       }
     }
   }
@@ -377,7 +379,7 @@ export class Build extends Emitter<ArtifactEvent> {
       }
     }
     for (const entry of this.prefixOutputs) {
-      if (input.overlaps(entry.prefix)) {
+      if (input.overlaps(entry.output)) {
         ids.add(entry.taskId)
       }
     }
@@ -389,7 +391,7 @@ export class Build extends Emitter<ArtifactEvent> {
       ids.add(exact.taskId)
     }
     for (const entry of this.prefixOutputs) {
-      if (entry.prefix.covers(input)) {
+      if (entry.output.covers(input)) {
         ids.add(entry.taskId)
       }
     }
@@ -461,11 +463,12 @@ export class Build extends Emitter<ArtifactEvent> {
 
     // The input stamps from before the run. The record keeps these, so an input
     // that changes during the run makes the next build run the task again.
+    // The wait above already gave the producers under each prefix input time to finish.
     let inputStamps: StampMap | null = null
     let skip = false
     try {
       if (this.store) {
-        inputStamps = await this.stampMap(this.artifactRefs(slot.task.inputs))
+        inputStamps = await this.stampRefs(slot.task.inputs)
         skip = await this.canSkip(this.store, slot.task, inputStamps)
       }
     } catch (error) {
@@ -606,7 +609,7 @@ export class Build extends Emitter<ArtifactEvent> {
     if (this.fatal !== null) return
     if (!this.store) return
     if (inputStamps === null) return
-    const outputStamps = await this.stampMap(this.artifactRefs(slot.task.outputs))
+    const outputStamps = await this.stampRefs(slot.task.outputs)
     if (generation !== slot.generation) return
     // A fatal error can come during the stamp reads above.
     if (this.fatal !== null) return
@@ -621,28 +624,33 @@ export class Build extends Emitter<ArtifactEvent> {
   protected override rejected(): void {}
 
   /**
-   * True when the task has an artifact input or output, the store has a record for the
-   * task, the record has the same input and output ids, every output exists, and every
-   * stamp equals the recorded stamp. `inputStamps` are the current input stamps.
+   * True when the task has an input, every prefix has a stamp, every output exists,
+   * and the stamps and ids equal the record. `inputStamps` are the current input stamps.
    */
   private async canSkip(store: Store, task: Task, inputStamps: StampMap): Promise<boolean> {
-    const outputs = this.artifactRefs(task.outputs)
-    // With no stamps to compare, a record cannot show that the task is current.
-    if (Object.keys(inputStamps).length === 0 && outputs.length === 0) return false
+    // With no input, nothing can show that the result is still current.
+    if (task.inputs.length === 0) return false
+    // stampRefs leaves out a prefix with a null stamp. That prefix cannot tell what is under it.
+    for (const input of task.inputs) {
+      if (!Object.hasOwn(inputStamps, refKey(input))) return false
+    }
     const record = await store.get(task.id)
     if (!record) return false
-    // A record from an older version of dapat has a different shape. It counts as no record.
+    // A record with two stamps for each id has a different shape. It counts as no record.
+    // A record from PR 7, before prefix stamps, keyed its stamps by bare id. No key
+    // matches the current "artifact <id>" keys, so the task runs once and writes a new record.
     if (!isStampMap(record.inputStamps)) return false
     if (!isStampMap(record.outputStamps)) return false
     if (!sameStamps(record.inputStamps, inputStamps)) return false
 
     const outputStamps = newStampMap()
-    for (const output of outputs) {
+    for (const output of task.outputs) {
       const stamp = await output.stamp()
       if (stamp === null) return false
-      if (!Object.hasOwn(record.outputStamps, output.id)) return false
-      if (record.outputStamps[output.id] !== stamp) return false
-      outputStamps[output.id] = stamp
+      const key = refKey(output)
+      if (!Object.hasOwn(record.outputStamps, key)) return false
+      if (record.outputStamps[key] !== stamp) return false
+      outputStamps[key] = stamp
     }
     const recordedCount = Object.keys(record.outputStamps).length
     const currentCount = Object.keys(outputStamps).length
@@ -650,18 +658,16 @@ export class Build extends Emitter<ArtifactEvent> {
     return true
   }
 
-  private artifactRefs(refs: readonly Ref[]): Artifact[] {
-    const artifacts: Artifact[] = []
-    for (const ref of refs) {
-      if (isArtifact(ref)) artifacts.push(ref)
-    }
-    return artifacts
-  }
-
-  private async stampMap(artifacts: Artifact[]): Promise<StampMap> {
+  /**
+   * The stamps of `refs`, keyed by refKey. A prefix with a null stamp is left out:
+   * the record never holds it, and the task always runs.
+   */
+  private async stampRefs(refs: readonly Ref[]): Promise<StampMap> {
     const result = newStampMap()
-    for (const artifact of artifacts) {
-      result[artifact.id] = await artifact.stamp()
+    for (const ref of refs) {
+      const stamp = await ref.stamp()
+      if (stamp === null && isPrefix(ref)) continue
+      result[refKey(ref)] = stamp
     }
     return result
   }
@@ -717,8 +723,11 @@ export class Build extends Emitter<ArtifactEvent> {
   }
 }
 
-/** Stamps keyed by artifact id. */
+/** Stamps keyed by refKey, so a prefix and an artifact with the same id cannot collide. */
 type StampMap = Record<string, string | null>
+
+/** An output and the task that declares it. */
+type PrefixOutput = { output: Prefix; taskId: string }
 
 /** An empty stamp map with no prototype, so that an id such as "__proto__" is a plain key. */
 function newStampMap(): StampMap {
