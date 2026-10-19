@@ -15,7 +15,7 @@ This document has two parts:
 
 You describe your work as **tasks**. Each task names its inputs and its outputs. Inputs and outputs can be files. They can also be S3 objects, database rows, or values in memory.
 
-dapat wraps each input and output in an **artifact**, which is a subclass of `Artifact`. The subclass gives dapat a **stamp**: a string that changes when the thing changes, for example a hash. dapat includes artifact classes for files, S3, and SQLite. For anything else, write a small subclass ([section 4](#4-artifacts)).
+dapat wraps each input and output in an **artifact**, which is a subclass of `Artifact`. The subclass gives dapat a **stamp**: a string that changes when the thing changes, for example a hash. dapat includes artifact classes for files and S3. For anything else, write a small subclass ([section 4](#4-artifacts)).
 
 When you run a **build**, dapat does these steps for each task:
 
@@ -23,7 +23,7 @@ When you run a **build**, dapat does these steps for each task:
 2. It compares the current stamps of the inputs and outputs with the stamps from the last successful run. The **store** keeps the last stamps.
 3. It skips the task when every stamp is equal to the stamp from the last run. Otherwise, it runs the task.
 
-dapat does not know about disks or SQL. It only reads artifact ids and stamps. The adapters in `dapat/contrib` supply files, S3, and SQLite.
+dapat does not know about disks or SQL. It only reads artifact ids and stamps. The adapters in `dapat/contrib` supply files, S3, and stores in JSON and SQLite.
 
 You declare tasks with `Build` and `Task`. You can know each task in advance, or your code can decide which tasks to add. Sections 3 to 9 describe this.
 
@@ -43,7 +43,7 @@ The package has two entry points:
 | Import | Contents |
 | --- | --- |
 | `dapat` | `Build`, `Task`, `Artifact`, `Prefix`, `IdPrefix`, `MemoryStore`, `Result`, and their types |
-| `dapat/contrib` | `FileArtifact`, `DirectoryArtifact`, `PathPrefix` (and the types `FileStampMode` and `FileStampOptions`), `S3ObjectArtifact`, `S3Prefix`, `MemoryS3` (and the types `S3Client`, `S3Head`, and `S3ListEntry`), `SqliteRowArtifact`, `SqliteTableArtifact`, `SqliteTablePrefix`, `JsonStore`, `SqliteStore`, and a short factory function for each artifact and prefix (`file`, `directory`, `pathPrefix`, `s3Object`, `s3Prefix`, `sqliteRow`, `sqliteTable`, `sqliteTablePrefix`) |
+| `dapat/contrib` | `FileArtifact`, `DirectoryArtifact`, `PathPrefix` (and the types `FileStampMode` and `FileStampOptions`), `S3ObjectArtifact`, `S3Prefix`, `MemoryS3` (and the types `S3Client`, `S3Head`, and `S3ListEntry`), `JsonStore`, `SqliteStore`, and a short factory function for each artifact and prefix (`file`, `directory`, `pathPrefix`, `s3Object`, and `s3Prefix`) |
 
 ## 3. First build
 
@@ -153,8 +153,6 @@ Use a URI-like id that includes the kind of artifact, so that ids of different k
 | `FileArtifact("out/a.txt")` | `file:/abs/path/out/a.txt` |
 | `DirectoryArtifact("out")`, `PathPrefix("out")` | `file:/abs/path/out/` |
 | `S3ObjectArtifact(client, "b", "k/x")` | `s3://b/k/x` |
-| `SqliteRowArtifact` | `sqlite:table/pkColumn/pk` |
-| `SqliteTableArtifact`, `SqliteTablePrefix` | `sqlite:table/` |
 
 ### Prefixes
 
@@ -164,8 +162,8 @@ dapat compares ids as plain strings. An id is in a folder when the id starts wit
 
 dapat has two kinds of prefix:
 
-- A **plain prefix** is a folder. It has a stamp, but no value. The classes are `IdPrefix`, `PathPrefix`, `S3Prefix`, and `SqliteTablePrefix`. Use a plain prefix when a task writes files, but you do not know their names before the task runs ([section 5](#5-tasks-and-dependencies)). Also use it as an input when a task reads files in a folder.
-- A **prefix artifact** is a folder that you can stamp and read. Its stamp comes from the artifacts in the folder. The classes are `DirectoryArtifact` and `SqliteTableArtifact`. Use a prefix artifact when a task reads all of the contents of a folder.
+- A **plain prefix** is a folder. It has a stamp, but no value. The classes are `IdPrefix`, `PathPrefix`, and `S3Prefix`. Use a plain prefix when a task writes files, but you do not know their names before the task runs ([section 5](#5-tasks-and-dependencies)). Also use it as an input when a task reads files in a folder.
+- A **prefix artifact** is a folder that you can stamp and read. Its stamp comes from the artifacts in the folder. The class is `DirectoryArtifact`. Use a prefix artifact when a task reads all of the contents of a folder.
 
 ### Prefix stamps
 
@@ -181,7 +179,7 @@ An edit to a page or a deleted page also changes the stamp.
 
 An empty or missing folder has a real stamp, for example the hash of an empty list. So a task can skip when its folder is still empty.
 
-A prefix returns `null` from `stamp()` when it cannot tell what is under it. Then each task that uses that prefix runs on each build. The base class `Prefix` returns `null`. `IdPrefix` uses the base class, because an id string cannot list its children. A skip could then hide a change, so the task runs. `SqliteTablePrefix` also returns `null`.
+A prefix returns `null` from `stamp()` when it cannot tell what is under it. Then each task that uses that prefix runs on each build. The base class `Prefix` returns `null`. `IdPrefix` uses the base class, because an id string cannot list its children. A skip could then hide a change, so the task runs.
 
 To write your own prefix with a stamp, extend `Prefix` and override `stamp()`. List the children, and hash each child id with its stamp. Sort the lines first, so that the order of the list has no effect. [Section 5](#outputs-with-unknown-names) has an example.
 
@@ -189,7 +187,7 @@ To write your own prefix with a stamp, extend `Prefix` and override `stamp()`. L
 
 ### Prefix layouts
 
-A **region** is a ref that stands for many ids: a plain prefix, or a prefix artifact such as `directory()` or `SqliteTableArtifact`. Regions with different ids may overlap. dapat does not reject them. (Two tasks that declare the same id are still rejected as a duplicate output.) But two layouts make tasks run again with no edits, and dapat gives no warning:
+A **region** is a ref that stands for many ids: a plain prefix, or a prefix artifact such as `directory()`. Regions with different ids may overlap. dapat does not reject them. (Two tasks that declare the same id are still rejected as a duplicate output.) But two layouts make tasks run again with no edits, and dapat gives no warning:
 
 - **A task writes into a folder that it reads.** For example, a task reads `pathPrefix("pages/")` or `directory("pages/")` and writes `pages/index.html`. With the default `"time"` stamp, the task runs on every build. Put `index.html` next to `pages/`, not in it.
 - **Two tasks write into one folder.** For example, `split` writes `pathPrefix("out/")`, and `index` writes `out/index.html`. The writers, and a task that reads `out/`, run again on later builds. In some layouts they run on every build. Give each writer its own folder, for example `out/pages/` for `split`.
@@ -250,7 +248,7 @@ covers(other: Artifact): boolean {
 }
 ```
 
-`DirectoryArtifact` and `SqliteTableArtifact` use these overrides.
+`DirectoryArtifact` uses these overrides.
 
 ## 5. Tasks and dependencies
 
@@ -751,18 +749,6 @@ Write an adapter for the AWS SDK or for your own HTTP client. The adapter must o
 | `S3ObjectArtifact(client, bucket, key)` | `etag` | `Uint8Array` |
 | `S3Prefix(client, bucket, keyPrefix)` | SHA-256 of each key under the prefix and its `etag` | none (plain prefix) |
 
-### 10.3 SQLite: `SqliteRowArtifact`, `SqliteTableArtifact`, `SqliteTablePrefix`
-
-These classes take a `bun:sqlite` `Database`. Table and column names must match `[A-Za-z_][A-Za-z0-9_]*`. Other names cause a throw.
-
-| Class | Stamp | `read()` returns |
-| --- | --- | --- |
-| `SqliteRowArtifact({ db, table, pkColumn, pk })` | SHA-256 of the column values | the row as an object |
-| `SqliteTableArtifact({ db, table, pkColumn })` | SHA-256 of the hashes of all rows | the primary keys |
-| `SqliteTablePrefix(table)` | `null`, so a task that uses it runs on each build | none (plain prefix) |
-
-`SqliteTableArtifact` is a prefix artifact. Each row is a file in the folder `sqlite:table/`.
-
 ## 11. Recipes
 
 ### 11.1 Force tasks to run again
@@ -834,7 +820,7 @@ A new checkout changes the modification time of each file. With the default `sta
 ## 12. Limits
 
 - **A task that skips sends no `produced` or `deleted` events.** This applies to its prefix outputs and to its declared outputs. A subscriber gets only the `promised` events of that task on the next build.
-- **A task with an `IdPrefix` input or output runs on each build.** An `IdPrefix` cannot list what is under it, so its stamp is `null`. A skip could hide a change under it. `SqliteTablePrefix` is the same. To let the task skip, use a prefix that can stamp, for example `PathPrefix` or `S3Prefix`, or write a prefix subclass with a `stamp()` method.
+- **A task with an `IdPrefix` input or output runs on each build.** An `IdPrefix` cannot list what is under it, so its stamp is `null`. A skip could hide a change under it. To let the task skip, use a prefix that can stamp, for example `PathPrefix` or `S3Prefix`, or write a prefix subclass with a `stamp()` method.
 - **A `"time"` stamp misses an edit that keeps the size and the modification time.** Then the task skips. These cases do that:
   - Tools that copy the old modification time: `cp -p`, `rsync -t` (also `rsync -a`), and tar extraction.
   - File systems with coarse times: HFS+ keeps 1 second, and FAT and some network file systems keep 2 seconds. An edit inside that time that keeps the size is not seen. Most Linux file systems keep a few milliseconds or better.
@@ -1127,52 +1113,6 @@ new MemoryS3()
 ```
 
 Keeps objects in a `Map`. `put` sets the `etag` to the SHA-256 of the body. `put` also sets `lastModified` to a value that increases by at least 1 ms on each call. `get` throws for a missing object. `list` returns `{ key, etag }` for each object, sorted by key.
-
-## SQLite (`dapat/contrib`)
-
-### `class SqliteRowArtifact extends Artifact<Record<string, unknown>>` and `sqliteRow(opts)`
-
-```ts
-sqliteRow(opts: {
-  db: Database
-  table: string
-  pkColumn: string
-  pk: string | number
-}): SqliteRowArtifact
-```
-
-| Member | Value |
-| --- | --- |
-| `table`, `pkColumn` | The validated names |
-| `pk` | The primary key as a string |
-| `id` | `sqlite:<table>/<pkColumn>/<pk>` |
-| `stamp()` | SHA-256 of the sorted `column=value` lines, without `rowid`. `null` if the row is missing. |
-| `read()` | The row without `rowid`. Throws if the row is missing. |
-
-### `class SqliteTableArtifact extends Artifact<string[]>` and `sqliteTable(opts)`
-
-```ts
-sqliteTable(opts: {
-  db: Database
-  table: string
-  pkColumn: string
-}): SqliteTableArtifact
-```
-
-| Member | Value |
-| --- | --- |
-| `id` | `sqlite:<table>/` |
-| `covers(other)`, `coversOthers` | Covers every row id of the table |
-| `stamp()` | SHA-256 of the sorted `<pk>=<row hash>` lines. `null` if the table does not exist. |
-| `read()` | Every primary key as a string. Throws if the table does not exist. |
-
-### `class SqliteTablePrefix extends Prefix` and `sqliteTablePrefix(table)`
-
-```ts
-sqliteTablePrefix(table: string): SqliteTablePrefix
-```
-
-`id` is `sqlite:<table>/`. `stamp()` is the base `Prefix.stamp()`, which returns `null`. So a task that uses a `SqliteTablePrefix` runs on each build.
 
 ## Stores (`dapat/contrib`)
 
