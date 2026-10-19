@@ -383,7 +383,7 @@ Some more results of the rule:
 - You touch an input, but its bytes do not change. `FileArtifact` uses a hash of the bytes as its stamp, so the stamp does not change. The task skips.
 - An input is missing on two builds in a row. Its stamp is `null` both times. The stamps are equal, so this input does not make the task run.
 - The task has no artifact inputs and no artifact outputs. Examples are a task with only prefix outputs, a deploy task with no inputs and no outputs, and a task with only a plain prefix input. dapat has nothing to compare, so the task runs on each build.
-- A task deletes one of its declared artifact outputs and calls `ctx.deleted`. That output is then missing, so the task runs on each build. To delete an artifact and still skip, declare its folder as a prefix output. Call `ctx.deleted` on each run, also when the artifact is already gone. If you do not, dapat sends a `produced` event for the missing output after the task returns.
+- A task deletes one of its declared artifact outputs and calls `ctx.deleted`. That output is then missing, so the task runs on each build. To delete an artifact and still skip, declare its folder as a prefix output. This works only when the task also has an artifact input or an artifact output, because a task with nothing to compare always runs. Call `ctx.deleted` on each run, also when the artifact is already gone. If you do not, dapat sends a `produced` event for the missing output after the task returns.
 
 dapat does not compare modification times. Older versions of dapat skipped a task when its outputs were newer than its inputs, as `make` does. That check is gone. Without a store record, a task runs.
 

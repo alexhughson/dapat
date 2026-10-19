@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test"
 import { Database } from "bun:sqlite"
-import { mkdtemp, rm, writeFile } from "node:fs/promises"
+import { mkdtemp, readdir, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import path from "node:path"
 import { Build, Task } from "../../src/index"
@@ -169,5 +169,67 @@ describe("stores", () => {
     expect(second.skipped.length).toBe(1)
     expect(runs).toBe(1)
     db.close()
+  })
+
+  test("JsonStore get reads whole files while set writes", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "dapat-json-"))
+    temps.push(dir)
+    const store = new JsonStore(path.join(dir, "state.json"))
+    await store.set("first", sample)
+    const rounds = 300
+    let parseErrors = 0
+
+    const writer = async () => {
+      for (let i = 0; i < rounds; i++) {
+        const state: TaskState = {
+          inputStamps: { [`file:/tmp/${i}`]: "a".repeat(64) },
+          outputStamps: {},
+        }
+        await store.set(`task-${i}`, state)
+      }
+    }
+    const reader = async () => {
+      for (let i = 0; i < rounds; i++) {
+        try {
+          await store.get("first")
+        } catch {
+          parseErrors += 1
+        }
+      }
+    }
+
+    await Promise.all([writer(), reader()])
+    expect(parseErrors).toBe(0)
+    expect(await store.get("first")).toEqual(sample)
+  })
+
+  test("JsonStore keeps ids that match inherited keys", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "dapat-json-"))
+    temps.push(dir)
+    const statePath = path.join(dir, "state.json")
+    const store = new JsonStore(statePath)
+
+    expect(await store.get("constructor")).toBeNull()
+    await store.set("__proto__", sample)
+    const reopened = new JsonStore(statePath)
+    expect(await reopened.get("__proto__")).toEqual(sample)
+    expect(await reopened.get("constructor")).toBeNull()
+  })
+
+  test("a failed JsonStore write does not stop the writes queued after it", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "dapat-json-"))
+    temps.push(dir)
+    const store = new JsonStore(path.join(dir, "state.json"))
+    // JSON.stringify throws on a bigint, so this write fails.
+    const bad = { inputStamps: { "file:/tmp/a": 1n }, outputStamps: {} }
+    const failing = store.set("bad", bad as unknown as TaskState)
+    const following = store.set("good", sample)
+
+    await expect(failing).rejects.toThrow()
+    await following
+    expect(await store.get("good")).toEqual(sample)
+    expect(await store.get("bad")).toBeNull()
+    // The failed write leaves no temp file.
+    expect(await readdir(dir)).toEqual(["state.json"])
   })
 })
