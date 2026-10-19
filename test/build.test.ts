@@ -1416,6 +1416,28 @@ describe("the skip rule", () => {
     expect(third.executed).toEqual(["compile"])
   })
 
+  test("a record keyed by bare ids, as PR 7 wrote it, makes the task run once and then skip", async () => {
+    const src = new Mem("mem:src", "a")
+    const out = new Mem("mem:out", "obj")
+    const store = new MemoryStore()
+    const runs = { count: 0 }
+    const bareRecord: TaskState = {
+      inputStamps: { "mem:src": "a" },
+      outputStamps: { "mem:out": "obj" },
+    }
+    await store.set("compile", bareRecord)
+
+    const first = await runOnce(compile([src], out, runs), store)
+    expect(first.executed).toEqual(["compile"])
+    expect(await store.get("compile")).toEqual({
+      inputStamps: { "artifact mem:src": "a" },
+      outputStamps: { "artifact mem:out": "obj" },
+    })
+    const second = await runOnce(compile([src], out, runs), store)
+    expect(second.skipped).toEqual(["compile"])
+    expect(runs.count).toBe(1)
+  })
+
   test("a record whose stamp maps are arrays counts as no record", async () => {
     // The input id "0" matches the array index, so only the shape check stops a skip.
     const src = new Mem("0", "a")

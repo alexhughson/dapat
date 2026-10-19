@@ -189,12 +189,14 @@ To write your own prefix with a stamp, extend `Prefix` and override `stamp()`. L
 
 ### Prefix layouts
 
-A prefix stamp includes every file under the prefix. So `build.add()` rejects two layouts that would never settle. In these layouts, a task changes a stamp that a record holds, so the task runs on every build.
+A **region** is a ref that stands for many ids: a plain prefix, or a prefix artifact such as `directory()` or `SqliteTableArtifact`. dapat rejects two layouts of regions:
 
-- **A prefix input covers an output of the same task.** For example, a task reads `pathPrefix("pages/")` and writes `pages/index.html`. Each run adds or changes `index.html`, so the input stamp changes. Put `index.html` next to `pages/`, not in it.
-- **A prefix output covers or overlaps an output of another task.** For example, `split` writes `pathPrefix("out/")` and `index` writes `out/index.html`. The record of `split` holds a stamp of `out/` that includes `index.html`, so each run of `index` changes it. Give each writer its own folder, for example `out/pages/` for `split`. Two prefix outputs of different tasks must not overlap too.
+- **A region input overlaps an output of the same task.** For example, a task reads `pathPrefix("pages/")` or `directory("pages/")` and writes `pages/index.html`. Each run changes `index.html`, so the input stamp changes, and the task runs on every build. The reverse is rejected too: an input `pages/sub/` with the output `pathPrefix("pages/")`. Put `index.html` next to `pages/`, not in it.
+- **A region output overlaps an output of another task.** For example, `split` writes `pathPrefix("out/")` or `directory("out/")`, and `index` writes `out/index.html`. Two tasks then write into one region, and neither owns it. With stamped prefixes, the record of `split` holds a stamp of `out/` that includes `index.html`, so each run of `index` makes `split` run. Give each writer its own folder, for example `out/pages/` for `split`. Two region outputs of different tasks must not overlap either.
 
-`build.add()` throws an error that names both tasks and both ids. It changes nothing first. A task can still read a prefix that other tasks write into.
+The rule is the same for every class, also for `IdPrefix` and `SqliteTablePrefix`, whose stamps are `null`, and also for a build with no store. The reason is the overlap, not the stamp.
+
+`build.add()`, `setTasks`, and `ctx.add()` all reject these layouts. They throw an error that names the tasks and the ids, and they change nothing first. A `ctx.add()` that throws fails the task that called it. A task can still read a region that other tasks write into.
 
 ### Write your own artifact
 
@@ -308,7 +310,7 @@ A prefix artifact input does **not** wait for a plain prefix output in a subfold
 
 An input that no task writes is a **source**, for example `in.txt` in section 3. dapat does not wait for a source.
 
-Only one task can declare a given artifact as an output. `build.add()` throws `duplicate output '<id>'` when a second task declares the same output id. One task also cannot declare the same output two times. A prefix output must not cover or overlap an output of another task, and a prefix input must not cover an output of its own task ([Prefix layouts](#prefix-layouts)).
+Only one task can declare a given artifact as an output. `build.add()` throws `duplicate output '<id>'` when a second task declares the same output id. One task also cannot declare the same output two times. A region output, for example a prefix or a `directory()`, must not overlap an output of another task. A region input must not overlap an output of its own task ([Prefix layouts](#prefix-layouts)).
 
 A waiting task finds its producers again each time a task is added, removed, or completed. When a producer finishes, the waiting task continues in this way:
 
@@ -694,7 +696,7 @@ Each of the three classes takes the option `stamp: "time" | "hash"`. The factory
 - `"time"`: the stamp of a file is its modification time in nanoseconds and its size. dapat reads no bytes.
 - `"hash"`: the stamp of a file is the SHA-256 of its bytes. dapat reads each file in full.
 
-The folder classes follow symlinks. A link to a file counts as that file, with the stamp of its target. A link to a folder is walked. A link back to a folder above it is not walked again. A broken link adds no file.
+The folder classes follow symlinks. A link to a file counts as that file, with the stamp of its target. A link to a folder is walked. A link back to a folder above it is not walked again. A link that cannot resolve adds no file: a broken link, a link to itself, two links that point at each other, or a link through a file. If the folder of the prefix itself cannot resolve, `stamp()` throws.
 
 `"time"` stats up to 256 files at the same time. `"hash"` reads up to 8 files at the same time, and streams a file of 1 MB or more into the hash, so a large file does not fill the memory.
 
@@ -840,6 +842,8 @@ A new checkout changes the modification time of each file. With the default `sta
   - File systems with coarse times: HFS+ keeps 1 second, and FAT and some network file systems keep 2 seconds. An edit inside that time that keeps the size is not seen. Most Linux file systems keep a few milliseconds or better.
 
   `stamp: "hash"` sees all of these edits. Use it for files that such tools write, and for files that a program edits during the build.
+- **A link to a folder above the prefix pulls that folder into the stamp.** If that folder holds the store file or the outputs of the task, the task runs on every build. The layout check does not see links.
+- **Many links to one folder are walked one time for each path.** The stamp then reads that folder many times. Only a link back to a folder above it is not walked again.
 - **A prefix input that covers the store file runs on every build.** For example, a task reads `pathPrefix(".")`, and the store is `.dapat/state.json`. Each build writes the store, so the stamp of the prefix changes. Put the store outside the folders that tasks read, or read a narrower prefix.
 - **A prefix artifact input does not wait for a plain prefix output in a subfolder.** See [section 5](#how-dapat-finds-dependencies).
 - **Only a missing path counts as missing.** The file classes return `null` (or an empty stamp for `PathPrefix`) only for `ENOENT`. Every other error makes `stamp()` throw, so the task fails with that error, for example a permission error, or a file where a folder must be. In `"time"` mode, dapat reads only the metadata of a file. A file that the task cannot read still gets a stamp, and `read()` fails later.
@@ -864,7 +868,7 @@ new Build(opts?: { store?: Store; sendLimit?: number })
 
 | Member | Description |
 | --- | --- |
-| `add(task: Task): void` | Adds a task. If a task with the same id exists, replaces it (see [section 8](#replacement)). If `run()` has started, sends a `promised` event for each declared output, and the task starts at once. Does not throw when a subscriber throws ([section 9](#subscriber-errors)). Throws if another task already declares one of its exact outputs, if the task declares one output twice, if another owner holds that id ([section 5](#5-tasks-and-dependencies)), if one of its prefix outputs covers or overlaps an output of another task, or if one of its prefix inputs covers one of its own outputs ([Prefix layouts](#prefix-layouts)). Throws before it changes anything. |
+| `add(task: Task): void` | Adds a task. If a task with the same id exists, replaces it (see [section 8](#replacement)). If `run()` has started, sends a `promised` event for each declared output, and the task starts at once. Does not throw when a subscriber throws ([section 9](#subscriber-errors)). Throws if another task already declares one of its exact outputs, if the task declares one output twice, if another owner holds that id ([section 5](#5-tasks-and-dependencies)), if one of its region outputs (a prefix or a `directory()`) overlaps an output of another task, or if one of its region inputs overlaps one of its own outputs ([Prefix layouts](#prefix-layouts)). Throws before it changes anything. |
 | `remove(id: string): void` | Removes a task. Aborts it if it is running and sends a `withdrawn` event for each declared output. Does not throw when a subscriber throws. Starts to delete its store record. Does not wait for the delete, but `run()` does. A delete error goes into `result.errors`. Does nothing if the id is not known. The other tasks of the same owner stay. |
 | `subscribe(listener: (event: ArtifactEvent) => void): void` | From `Emitter`. Calls `listener` synchronously for each artifact event, in the order of the event queue. Does not replay earlier events. See [section 9](#9-subscribe-to-artifact-events). |
 | `protected setTasks(owner: string, tasks: readonly Task[]): void` | Makes `tasks` the tasks of `owner` ([section 5](#5-tasks-and-dependencies)). Adds each new id, replaces each known id, and removes each id that `owner` gave before and does not give now. Changes all state first, then puts the events on the queue: all `withdrawn` events of the call first, then the `promised` events, by id in list order. A dropped task ends as `cancelled` with the reason `"removed"` if it had not finished. Throws and changes nothing if another owner has one of the ids, if `tasks` has one id two times, or if two tasks declare one exact output. `add(task)` calls `setTasks("add:" + task.id, [task])`. Rules will call it; your code does not. |
@@ -1106,7 +1110,7 @@ s3Prefix(client: S3Client, bucket: string, keyPrefix: string): S3Prefix
 
 `id` is `s3://<bucket>/<keyPrefix>/`. The constructor adds the trailing `/` if `keyPrefix` is not empty and does not end with `/`.
 
-`stamp()` calls `client.list` one time for the objects under `<keyPrefix>/`. It returns the SHA-256 of the sorted lines `<key>=<etag>`. An empty prefix has the stamp of an empty list. Older versions took no `client`.
+`stamp()` calls `client.list` one time for the objects under `<keyPrefix>/`. It returns the SHA-256 of the sorted lines `<key>=<etag>`. An empty prefix has the stamp of an empty list. It throws if `list` returns an entry without a string `key` and a string `etag`, for example the plain keys of an adapter for the older interface. Older versions took no `client`.
 
 ### `class MemoryS3 implements S3Client`
 

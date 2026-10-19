@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import { MemoryS3, S3ObjectArtifact, S3Prefix } from "../../contrib/s3"
+import type { S3Client } from "../../contrib/s3"
 import { MemoryStore } from "../../contrib/store"
 import { Build, Task } from "../../src/index"
 
@@ -146,5 +147,28 @@ describe("S3 artifacts", () => {
     const stamp = await prefix.stamp()
     expect(stamp).not.toBeNull()
     expect(await new S3Prefix(s3, "other", "none").stamp()).toBe(stamp)
+  })
+
+  test("an S3Prefix throws when list returns plain keys, as an older adapter does", async () => {
+    const s3 = new MemoryS3()
+    await s3.put("bucket", "pages/a.md", encode("A"))
+    // An adapter for the older interface: list returns string[].
+    const oldAdapter = {
+      head: (bucket: string, key: string) => s3.head(bucket, key),
+      get: (bucket: string, key: string) => s3.get(bucket, key),
+      put: (bucket: string, key: string, body: Uint8Array) => s3.put(bucket, key, body),
+      list: async (bucket: string, prefix: string) => {
+        const entries = await s3.list(bucket, prefix)
+        const keys: string[] = []
+        for (const entry of entries) {
+          keys.push(entry.key)
+        }
+        return keys
+      },
+    } as unknown as S3Client
+    const prefix = new S3Prefix(oldAdapter, "bucket", "pages")
+    expect(prefix.stamp()).rejects.toThrow(
+      'S3Client.list must return { key, etag } objects, not "pages/a.md" (s3://bucket/pages/)',
+    )
   })
 })

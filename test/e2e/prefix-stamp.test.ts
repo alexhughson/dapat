@@ -264,8 +264,33 @@ describe("prefix layouts that never settle are rejected", () => {
       run: async () => {},
     })
     expect(() => build.add(task)).toThrow(
-      `task 'index' has the prefix input 'file:${root}/pages/', which covers its own output ` +
-        `'file:${root}/pages/index.html'`,
+      `task 'index': input 'file:${root}/pages/' overlaps its output ` +
+        `'file:${root}/pages/index.html'; put the output outside the input`,
+    )
+  })
+
+  test("a directory() input must not cover an output of the same task", () => {
+    const root = "/tmp/dapat-layout"
+    const build = new Build()
+    const task = new Task({
+      id: "index",
+      inputs: [directory(path.join(root, "pages"))],
+      outputs: [file(path.join(root, "pages", "index.html"))],
+      run: async () => {},
+    })
+    expect(() => build.add(task)).toThrow(`input 'file:${root}/pages/' overlaps its output`)
+  })
+
+  test("an input inside a prefix output of the same task is rejected too", () => {
+    const build = new Build()
+    const task = new Task({
+      id: "grow",
+      inputs: [pathPrefix("/tmp/dapat-layout/pages/sub")],
+      outputs: [pathPrefix("/tmp/dapat-layout/pages")],
+      run: async () => {},
+    })
+    expect(() => build.add(task)).toThrow(
+      "input 'file:/tmp/dapat-layout/pages/sub/' overlaps its output 'file:/tmp/dapat-layout/pages/'",
     )
   })
 
@@ -277,7 +302,7 @@ describe("prefix layouts that never settle are rejected", () => {
       outputs: [new IdPrefix("mem:pages/new/")],
       run: async () => {},
     })
-    expect(() => build.add(task)).toThrow("covers its own output 'mem:pages/new/'")
+    expect(() => build.add(task)).toThrow("overlaps its output 'mem:pages/new/'")
   })
 
   test("a prefix output must not cover an exact output of another task, in either order", () => {
@@ -292,8 +317,8 @@ describe("prefix layouts that never settle are rejected", () => {
       run: async () => {},
     })
     const message =
-      "output 'file:/tmp/dapat-layout/out/index.html' of task 'index' overlaps output " +
-      "'file:/tmp/dapat-layout/out/' of task 'split'"
+      "two tasks write into one region: outputs 'file:/tmp/dapat-layout/out/index.html' of task " +
+      "'index' and 'file:/tmp/dapat-layout/out/' of task 'split' overlap"
 
     const first = new Build()
     first.add(split)
@@ -301,7 +326,7 @@ describe("prefix layouts that never settle are rejected", () => {
 
     const second = new Build()
     second.add(index)
-    expect(() => second.add(split)).toThrow("Give each writer its own folder")
+    expect(() => second.add(split)).toThrow("give each writer its own folder")
   })
 
   test("two prefix outputs of different tasks must not overlap", () => {
@@ -310,9 +335,50 @@ describe("prefix layouts that never settle are rejected", () => {
     const same = new Task({ id: "b", outputs: [new IdPrefix("mem:out/")], run: async () => {} })
     const nested = new Task({ id: "c", outputs: [new IdPrefix("mem:out/sub/")], run: async () => {} })
     const outer = new Task({ id: "d", outputs: [new IdPrefix("mem:")], run: async () => {} })
-    expect(() => build.add(same)).toThrow("of task 'b' overlaps output 'mem:out/' of task 'a'")
-    expect(() => build.add(nested)).toThrow("of task 'c' overlaps output 'mem:out/' of task 'a'")
-    expect(() => build.add(outer)).toThrow("of task 'd' overlaps output 'mem:out/' of task 'a'")
+    expect(() => build.add(same)).toThrow("of task 'b' and 'mem:out/' of task 'a' overlap")
+    expect(() => build.add(nested)).toThrow("of task 'c' and 'mem:out/' of task 'a' overlap")
+    expect(() => build.add(outer)).toThrow("of task 'd' and 'mem:out/' of task 'a' overlap")
+  })
+
+  test("a directory() output must not cover an output of another task, in either order", () => {
+    const all = new Task({
+      id: "all",
+      outputs: [directory("/tmp/dapat-layout/out")],
+      run: async () => {},
+    })
+    const one = new Task({
+      id: "one",
+      outputs: [file("/tmp/dapat-layout/out/z.html")],
+      run: async () => {},
+    })
+    const first = new Build()
+    first.add(all)
+    expect(() => first.add(one)).toThrow("of task 'one' and 'file:/tmp/dapat-layout/out/' of task 'all'")
+    const second = new Build()
+    second.add(one)
+    expect(() => second.add(all)).toThrow("two tasks write into one region")
+    // A directory() output next to a prefix output inside it.
+    const third = new Build()
+    third.add(all)
+    const sub = new Task({ id: "sub", outputs: [pathPrefix("/tmp/dapat-layout/out/sub")], run: async () => {} })
+    expect(() => third.add(sub)).toThrow("two tasks write into one region")
+  })
+
+  test("ctx.add rejects a clashing task, and the task that called it fails", async () => {
+    const build = new Build()
+    build.add(
+      new Task({
+        id: "parent",
+        outputs: [new IdPrefix("mem:out/")],
+        run: async (ctx) => {
+          ctx.add(new Task({ id: "child", outputs: [new IdPrefix("mem:out/child/")], run: async () => {} }))
+        },
+      }),
+    )
+    const result = await build.run()
+    const error = result.failed.get([...result.failed.keys()][0]!)!
+    expect(ids([...result.failed.keys()])).toEqual(["parent"])
+    expect(error.message).toContain("two tasks write into one region")
   })
 
   test("a rejected add changes nothing, and a replacement can move its own prefix", async () => {
@@ -323,7 +389,7 @@ describe("prefix layouts that never settle are rejected", () => {
     })
     build.add(new Task({ id: "a", outputs: [new IdPrefix("mem:out/")], run: async () => {} }))
     const clash = new Task({ id: "b", outputs: [new IdPrefix("mem:out/x/")], run: async () => {} })
-    expect(() => build.add(clash)).toThrow("overlaps")
+    expect(() => build.add(clash)).toThrow("two tasks write into one region")
     // The same task id may change its own prefix output. Only other tasks count.
     build.add(new Task({ id: "a", outputs: [new IdPrefix("mem:out/x/")], run: async () => {} }))
     const result = await build.run()
@@ -472,6 +538,27 @@ describe("folder walks", () => {
     const addedInLinkedFolder = await runOnce()
     expect(ids(addedInLinkedFolder.executed)).toEqual(["count"])
     expect(await readFile(path.join(root, "count.txt"), "utf8")).toBe("3")
+  })
+
+  test("links that cannot resolve are skipped like broken links; the root still throws", async () => {
+    const root = await tempDir()
+    const pagesDir = path.join(root, "pages")
+    await mkdir(pagesDir)
+    await writeFile(path.join(pagesDir, "a.md"), "A")
+    await writeFile(path.join(root, "plain.txt"), "p")
+    await symlink(path.join(pagesDir, "self"), path.join(pagesDir, "self"))
+    await symlink(path.join(pagesDir, "pong"), path.join(pagesDir, "ping"))
+    await symlink(path.join(pagesDir, "ping"), path.join(pagesDir, "pong"))
+    await symlink(path.join(root, "plain.txt", "inside"), path.join(pagesDir, "through-file"))
+
+    const listing = await directory(pagesDir).read()
+    expect(listing).toEqual([path.join(pagesDir, "a.md")])
+    expect(await pathPrefix(pagesDir).stamp()).not.toBeNull()
+
+    // The prefix root itself is a link loop. That is an error, not a missing folder.
+    const loopRoot = path.join(root, "loop-root")
+    await symlink(loopRoot, loopRoot)
+    expect(pathPrefix(loopRoot).stamp()).rejects.toThrow("ELOOP")
   })
 
   test('stamp "hash" streams a large file and gets the same hash as the bytes', async () => {

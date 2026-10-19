@@ -153,8 +153,9 @@ async function walkInto(
       try {
         target = await stat(full)
       } catch (error) {
-        // A broken link points at nothing, so it adds no file.
-        if (isMissing(error)) continue
+        // A link that cannot resolve adds no file: a broken link, a link to itself,
+        // two links that point at each other, or a link through a file.
+        if (isUnresolvedLink(error)) continue
         throw error
       }
       if (target.isFile()) {
@@ -169,7 +170,7 @@ async function walkInto(
     try {
       childReal = await realpath(full)
     } catch (error) {
-      if (isMissing(error)) continue
+      if (isUnresolvedLink(error)) continue
       throw error
     }
     if (below.has(childReal)) continue
@@ -180,6 +181,19 @@ async function walkInto(
 }
 
 function isMissing(error: unknown): boolean {
-  if (typeof error !== "object" || error === null) return false
-  return (error as { code?: unknown }).code === "ENOENT"
+  return errorCode(error) === "ENOENT"
+}
+
+/** True for the errors of a link inside the walk that points at nothing. Only used below the root. */
+function isUnresolvedLink(error: unknown): boolean {
+  const code = errorCode(error)
+  if (code === "ENOENT") return true
+  if (code === "ELOOP") return true
+  if (code === "ENOTDIR") return true
+  return false
+}
+
+function errorCode(error: unknown): unknown {
+  if (typeof error !== "object" || error === null) return undefined
+  return (error as { code?: unknown }).code
 }
