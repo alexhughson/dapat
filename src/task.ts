@@ -16,6 +16,7 @@ export interface Context {
   add(task: Task): void
   remove(id: string): void
   produced(artifact: Artifact): void
+  deleted(artifact: Artifact): void
 }
 
 export interface TaskInit {
