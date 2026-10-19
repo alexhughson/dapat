@@ -1,6 +1,5 @@
 import { Database } from "bun:sqlite"
 import type { Store, TaskState } from "../../src/store"
-import { decodeState, encodeState, type EncodedTaskState } from "./codec"
 
 export class SqliteStore implements Store {
   private readonly db: Database
@@ -27,12 +26,11 @@ export class SqliteStore implements Store {
       .query(`SELECT payload FROM dapat_task_state WHERE task_id = ?`)
       .get(taskId) as { payload: string } | null
     if (!row) return null
-    const encoded = JSON.parse(row.payload) as EncodedTaskState
-    return decodeState(encoded)
+    return JSON.parse(row.payload) as TaskState
   }
 
   async set(taskId: string, state: TaskState): Promise<void> {
-    const payload = JSON.stringify(encodeState(state))
+    const payload = JSON.stringify(state)
     this.db
       .query(
         `INSERT INTO dapat_task_state (task_id, payload) VALUES (?, ?)

@@ -5,20 +5,13 @@ export class Mem extends Artifact<string> {
   constructor(
     readonly id: string,
     public value: string | null = null,
-    public order: bigint | null = null,
-    public content: string | null = null,
   ) {
     super()
   }
 
-  async orderStamp(): Promise<bigint | null> {
-    if (this.value === null) return null
-    return this.order
-  }
-
-  async contentStamp(): Promise<string | null> {
-    if (this.value === null) return null
-    return this.content
+  /** The value is the stamp. null when the value is missing. */
+  async stamp(): Promise<string | null> {
+    return this.value
   }
 
   async read(): Promise<string> {
@@ -28,10 +21,8 @@ export class Mem extends Artifact<string> {
     return this.value
   }
 
-  write(value: string, order: bigint, content: string | null): void {
+  write(value: string): void {
     this.value = value
-    this.order = order
-    this.content = content
   }
 }
 
@@ -57,17 +48,8 @@ export class MemDir extends Artifact<string[]> {
     return other.id.startsWith(this.region)
   }
 
-  async orderStamp(): Promise<bigint | null> {
-    let max: bigint | null = null
-    for (const child of this.children) {
-      const order = await child.orderStamp()
-      if (order === null) continue
-      if (max === null || order > max) max = order
-    }
-    return max
-  }
-
-  async contentStamp(): Promise<string | null> {
+  /** The sorted ids of the children that have a value. null when no child has one. */
+  async stamp(): Promise<string | null> {
     const names: string[] = []
     for (const child of this.children) {
       if (child.value === null) continue

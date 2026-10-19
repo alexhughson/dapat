@@ -3,7 +3,6 @@ import { Artifact } from "../../src/artifact"
 import { Prefix } from "../../src/prefix"
 import { hashRow, sha256Hex } from "./hash"
 import { sqliteIdent, tableId } from "./ident"
-import { SqliteRowArtifact } from "./row"
 
 export class SqliteTablePrefix extends Prefix {
   readonly id: string
@@ -18,20 +17,17 @@ export class SqliteTableArtifact extends Artifact<string[]> {
   readonly id: string
   readonly table: string
   readonly pkColumn: string
-  readonly orderColumn: string | undefined
   private readonly db: Database
 
   constructor(opts: {
     db: Database
     table: string
     pkColumn: string
-    orderColumn?: string
   }) {
     super()
     this.db = opts.db
     this.table = sqliteIdent(opts.table)
     this.pkColumn = sqliteIdent(opts.pkColumn)
-    this.orderColumn = opts.orderColumn ? sqliteIdent(opts.orderColumn) : undefined
     this.id = tableId(this.table)
   }
 
@@ -44,20 +40,8 @@ export class SqliteTableArtifact extends Artifact<string[]> {
     return other.id.startsWith(this.id)
   }
 
-  async orderStamp(): Promise<bigint | null> {
-    const pks = this.primaryKeys()
-    if (pks === null) return null
-    let max: bigint | null = null
-    for (const pk of pks) {
-      const row = this.row(pk)
-      const order = await row.orderStamp()
-      if (order === null) continue
-      if (max === null || order > max) max = order
-    }
-    return max
-  }
-
-  async contentStamp(): Promise<string | null> {
+  /** The SHA-256 of the sorted `<pk>=<row hash>` lines. */
+  async stamp(): Promise<string | null> {
     const pks = this.primaryKeys()
     if (pks === null) return null
     const lines: string[] = []
@@ -96,16 +80,6 @@ export class SqliteTableArtifact extends Artifact<string[]> {
     const sql = `SELECT rowid, * FROM ${this.table} WHERE ${this.pkColumn} = ?`
     return (this.db.query(sql).get(pk) as Record<string, unknown> | null) ?? null
   }
-
-  private row(pk: string): SqliteRowArtifact {
-    return new SqliteRowArtifact({
-      db: this.db,
-      table: this.table,
-      pkColumn: this.pkColumn,
-      pk,
-      orderColumn: this.orderColumn,
-    })
-  }
 }
 
 export function sqliteTablePrefix(table: string): SqliteTablePrefix {
@@ -116,7 +90,6 @@ export function sqliteTable(opts: {
   db: Database
   table: string
   pkColumn: string
-  orderColumn?: string
 }): SqliteTableArtifact {
   return new SqliteTableArtifact(opts)
 }

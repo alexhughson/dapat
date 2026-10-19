@@ -1,4 +1,4 @@
-import { readFile, stat } from "node:fs/promises"
+import { readFile } from "node:fs/promises"
 import { Artifact } from "../../src/artifact"
 import { sha256Hex } from "./hash"
 import { fileId, resolveFilePath } from "./id"
@@ -13,17 +13,8 @@ export class FileArtifact extends Artifact<Uint8Array> {
     this.id = fileId(this.path)
   }
 
-  async orderStamp(): Promise<bigint | null> {
-    try {
-      const info = await stat(this.path, { bigint: true })
-      if (!info.isFile()) return null
-      return info.mtimeNs
-    } catch {
-      return null
-    }
-  }
-
-  async contentStamp(): Promise<string | null> {
+  /** The SHA-256 hex of the bytes. */
+  async stamp(): Promise<string | null> {
     try {
       const bytes = await readFile(this.path)
       return sha256Hex(bytes)

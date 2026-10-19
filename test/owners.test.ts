@@ -23,7 +23,7 @@ function writer(id: string, outputs: Mem[]): Task {
     outputs,
     run: async () => {
       for (const output of outputs) {
-        output.write(id, 1n, id)
+        output.write(id)
       }
     },
   })
@@ -251,7 +251,7 @@ describe("task owners", () => {
         outputs: [o],
         run: async () => {
           await new Promise((resolve) => setTimeout(resolve, 10))
-          o.write("from b", 1n, "b")
+          o.write("from b")
         },
       }),
     ])
