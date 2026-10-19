@@ -294,6 +294,19 @@ describe("prefix layouts that never settle are rejected", () => {
     )
   })
 
+  test("a prefix input inside a directory() output of the same task is rejected", () => {
+    const build = new Build()
+    const task = new Task({
+      id: "grow",
+      inputs: [pathPrefix("/tmp/dapat-layout/out/sub")],
+      outputs: [directory("/tmp/dapat-layout/out")],
+      run: async () => {},
+    })
+    expect(() => build.add(task)).toThrow(
+      "input 'file:/tmp/dapat-layout/out/sub/' overlaps its output 'file:/tmp/dapat-layout/out/'",
+    )
+  })
+
   test("a prefix input must not overlap a prefix output of the same task", () => {
     const build = new Build()
     const task = new Task({

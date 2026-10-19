@@ -804,7 +804,12 @@ function isRegion(ref: Ref): boolean {
 /** True when the region `region` and `ref` share an id: one covers the other. */
 function overlap(region: Ref, ref: Ref): boolean {
   if (isPrefix(region) && isPrefix(ref)) return region.overlaps(ref)
-  if (isPrefix(region)) return region.covers(ref as Artifact)
+  if (isPrefix(region)) {
+    const artifact = ref as Artifact
+    if (region.covers(artifact)) return true
+    // A prefix inside a region artifact, such as pathPrefix("out/sub/") inside directory("out/").
+    return artifact.coversOthers && region.id.startsWith(artifact.id)
+  }
   const regionArtifact = region as Artifact
   if (isPrefix(ref)) {
     // A prefix inside the region artifact, or a prefix that covers it.
