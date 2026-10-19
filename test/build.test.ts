@@ -1679,7 +1679,7 @@ describe("promised and withdrawn events", () => {
     test("the constructor rejects a send limit that is not a positive integer", () => {
       expect(() => new Build({ sendLimit: 0 })).toThrow("sendLimit must be a positive integer, not 0")
       expect(() => new Build({ sendLimit: -1 })).toThrow("sendLimit must be a positive integer, not -1")
-      expect(() => new Build({ sendLimit: Number.NaN })).toThrow("sendLimit must be a positive integer, not null")
+      expect(() => new Build({ sendLimit: Number.NaN })).toThrow("sendLimit must be a positive integer, not NaN")
       expect(() => new Build({ sendLimit: 1.5 })).toThrow("sendLimit must be a positive integer, not 1.5")
       // A string from untyped code shows its quotes.
       const fromConfig = JSON.parse('{"sendLimit": "10"}') as { sendLimit: number }

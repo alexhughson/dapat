@@ -64,7 +64,11 @@ export class Build extends Emitter<ArtifactEvent> {
     this.store = opts?.store
     const sendLimit = opts?.sendLimit ?? SEND_LIMIT
     if (!Number.isInteger(sendLimit) || sendLimit < 1) {
-      throw new Error(`sendLimit must be a positive integer, not ${JSON.stringify(sendLimit)}`)
+      let shown = String(sendLimit)
+      if (typeof sendLimit === "string") {
+        shown = JSON.stringify(sendLimit)
+      }
+      throw new Error(`sendLimit must be a positive integer, not ${shown}`)
     }
     this.sendLimit = sendLimit
   }
