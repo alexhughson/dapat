@@ -8,6 +8,7 @@ import { Outcome, Result } from "./result"
 export type ArtifactEvent =
   | { kind: "promised"; output: Ref; taskId: string }
   | { kind: "produced"; artifact: Artifact; taskId: string }
+  | { kind: "deleted"; artifact: Artifact; taskId: string }
   | { kind: "withdrawn"; output: Ref; taskId: string }
 
 type Phase = "pending" | "running" | "completed"
@@ -19,7 +20,7 @@ class Slot {
   launched = 0
   phase: Phase = "pending"
   abort: AbortController | null = null
-  // The ids that this run reported with ctx.produced.
+  // The ids that this run reported with ctx.produced or ctx.deleted.
   reported = new Set<string>()
   outcome: Outcome | null = null
   // The first listener error from a send that this task caused. The task fails with it.
@@ -43,7 +44,7 @@ export class Build extends Emitter<ArtifactEvent> {
   private started = false
   private runningCount = 0
   private workCount = 0
-  // The running task that is inside ctx.add, ctx.remove, ctx.produced, or the
+  // The running task that is inside ctx.add, ctx.remove, ctx.produced, ctx.deleted, or the
   // send of its declared outputs. A listener error then goes to that task.
   // When it is null, a listener error goes to `errors`.
   private caller: Slot | null = null
@@ -61,7 +62,7 @@ export class Build extends Emitter<ArtifactEvent> {
 
     const slot = new Slot(task)
     if (existing) {
-      // A running task sees the new generation, so its later ctx.produced does nothing.
+      // A running task sees the new generation, so its later ctx.produced and ctx.deleted do nothing.
       existing.generation += 1
       this.unindex(existing.task)
       if (existing.phase === "pending") {
@@ -87,7 +88,7 @@ export class Build extends Emitter<ArtifactEvent> {
     const slot = this.slots.get(id)
     if (!slot) return
 
-    // A running task sees the new generation, so its later ctx.produced does nothing.
+    // A running task sees the new generation, so its later ctx.produced and ctx.deleted do nothing.
     slot.generation += 1
     this.unindex(slot.task)
     const wasRunning = slot.phase === "running"
@@ -422,19 +423,26 @@ export class Build extends Emitter<ArtifactEvent> {
       },
       produced: (artifact: Artifact) => {
         if (generation !== slot.generation) return
-        this.asTask(slot, () => this.announce(slot, artifact))
+        this.asTask(slot, () => this.report(slot, "produced", artifact))
+      },
+      deleted: (artifact: Artifact) => {
+        if (generation !== slot.generation) return
+        this.asTask(slot, () => this.report(slot, "deleted", artifact))
       },
     }
   }
 
-  private announce(slot: Slot, artifact: Artifact): void {
+  private report(slot: Slot, kind: "produced" | "deleted", artifact: Artifact): void {
     if (!this.outputCovers(slot.task, artifact)) {
       throw new Error(
-        `task '${slot.task.id}' produced '${artifact.id}', which no output covers`,
+        `task '${slot.task.id}' ${kind} '${artifact.id}', which no output covers`,
       )
     }
+    // A reported id gets no produced event after the task returns. The subscriber
+    // already has the last report for it, so the last report wins.
     slot.reported.add(artifact.id)
-    this.sendAll([{ kind: "produced", artifact, taskId: slot.task.id }])
+    const event: ArtifactEvent = { kind, artifact, taskId: slot.task.id }
+    this.sendAll([event])
   }
 
   private outputCovers(task: Task, artifact: Artifact): boolean {

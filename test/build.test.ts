@@ -3,9 +3,11 @@ import { Build, IdPrefix, MemoryStore, Task, isPrefix } from "../src/index"
 import type { Artifact, ArtifactEvent, Ref } from "../src/index"
 import { Mem, MemDir } from "./mem"
 
-/** "<kind> <id>": the artifact id of a produced event, or the declared output id. */
+/** "<kind> <id>": the artifact id of a produced or deleted event, or the declared output id. */
 function describeEvent(event: ArtifactEvent): string {
-  if (event.kind === "produced") return `produced ${event.artifact.id}`
+  if (event.kind === "produced" || event.kind === "deleted") {
+    return `${event.kind} ${event.artifact.id}`
+  }
   return `${event.kind} ${event.output.id}`
 }
 
@@ -1667,7 +1669,7 @@ describe("promised and withdrawn events", () => {
     })
     const build = new Build()
     build.subscribe((event) => {
-      if (event.kind === "produced") return
+      if (event.kind === "produced" || event.kind === "deleted") return
       const kind = isPrefix(event.output) ? "prefix" : "artifact"
       log.push(`${event.kind} ${kind} ${event.output.id}`)
     })
@@ -1691,6 +1693,333 @@ describe("promised and withdrawn events", () => {
       "promised prefix mem:out/",
       "promised prefix mem:two/",
     ])
+  })
+})
+
+describe("deleted events", () => {
+  test("ctx.deleted sends a deleted event to each subscriber before it returns", async () => {
+    const child = new Mem("mem:d/1")
+    const kept = new Mem("mem:kept")
+    const events: ArtifactEvent[] = []
+    const log: string[] = []
+
+    const build = new Build()
+    build.subscribe((event) => {
+      events.push(event)
+      log.push(`${describeEvent(event)} by ${event.taskId}`)
+    })
+    build.add(
+      new Task({
+        id: "prune",
+        outputs: [new IdPrefix("mem:d/"), kept],
+        run: async (ctx) => {
+          ctx.deleted(child)
+          log.push("deleted returned")
+          kept.write("k", 1n, "k")
+        },
+      }),
+    )
+
+    const result = await build.run()
+    expect(result.success).toBe(true)
+    expect(log).toEqual([
+      "promised mem:d/ by prune",
+      "promised mem:kept by prune",
+      "deleted mem:d/1 by prune",
+      "deleted returned",
+      "produced mem:kept by prune",
+    ])
+    expect(events[2]).toEqual({ kind: "deleted", artifact: child, taskId: "prune" })
+  })
+
+  test("ctx.deleted throws when no output covers the artifact", async () => {
+    const other = new Mem("mem:other")
+    const log: string[] = []
+    const build = new Build()
+    build.subscribe((event) => {
+      log.push(describeEvent(event))
+    })
+    build.add(
+      new Task({
+        id: "prune",
+        outputs: [new IdPrefix("mem:d/")],
+        run: async (ctx) => {
+          ctx.deleted(other)
+        },
+      }),
+    )
+
+    const result = await build.run()
+    expect(result.success).toBe(false)
+    const messages: string[] = []
+    for (const error of result.failed.values()) {
+      messages.push(error.message)
+    }
+    expect(messages).toEqual(["task 'prune' deleted 'mem:other', which no output covers"])
+    expect(log).toEqual(["promised mem:d/"])
+  })
+
+  test("a subscriber error on deleted fails the task, even if the task catches it", async () => {
+    const child = new Mem("mem:d/1")
+    const store = new MemoryStore()
+    let caughtMessage = ""
+    const build = new Build({ store })
+    build.subscribe((event) => {
+      if (event.kind === "deleted") {
+        throw new Error(`listener broke on ${event.artifact.id}`)
+      }
+    })
+    build.add(
+      new Task({
+        id: "prune",
+        outputs: [new IdPrefix("mem:d/")],
+        run: async (ctx) => {
+          try {
+            ctx.deleted(child)
+          } catch (error) {
+            caughtMessage = String(error)
+          }
+        },
+      }),
+    )
+
+    const result = await build.run()
+    expect(result.success).toBe(false)
+    expect(result.executed).toEqual([])
+    expect(result.errors).toEqual([])
+    const messages: string[] = []
+    for (const error of result.failed.values()) {
+      messages.push(error.message)
+    }
+    expect(messages).toEqual(["listener broke on mem:d/1"])
+    expect(caughtMessage).toBe("Error: listener broke on mem:d/1")
+    expect(await store.get("prune")).toBeNull()
+  })
+
+  test("the last report for an id wins, and a deleted declared output gets no produced event after the task returns", async () => {
+    const gone = new Mem("mem:gone", "old", 1n, "old")
+    const back = new Mem("mem:back", "old", 1n, "old")
+    const regone = new Mem("mem:regone", "old", 1n, "old")
+    // The input is newer than the outputs, so the task does not skip by order.
+    const src = new Mem("mem:src", "a", 2n, "a")
+    const log: string[] = []
+
+    const build = new Build()
+    build.subscribe((event) => {
+      log.push(describeEvent(event))
+    })
+    build.add(
+      new Task({
+        id: "t",
+        inputs: [src],
+        outputs: [gone, back, regone],
+        run: async (ctx) => {
+          gone.value = null
+          ctx.deleted(gone)
+          back.value = null
+          ctx.deleted(back)
+          back.write("new", 2n, "new")
+          ctx.produced(back)
+          regone.write("new", 2n, "new")
+          ctx.produced(regone)
+          regone.value = null
+          ctx.deleted(regone)
+        },
+      }),
+    )
+
+    const result = await build.run()
+    expect(result.success).toBe(true)
+    expect(log).toEqual([
+      "promised mem:gone",
+      "promised mem:back",
+      "promised mem:regone",
+      "deleted mem:gone",
+      "deleted mem:back",
+      "produced mem:back",
+      "produced mem:regone",
+      "deleted mem:regone",
+    ])
+  })
+
+  test("a stopped task's ctx.deleted does nothing", async () => {
+    const child = new Mem("mem:d/1")
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    let started!: () => void
+    const reached = new Promise<void>((resolve) => {
+      started = resolve
+    })
+    const log: string[] = []
+    let threw = false
+
+    const build = new Build()
+    build.subscribe((event) => {
+      log.push(describeEvent(event))
+    })
+    build.add(
+      new Task({
+        id: "prune",
+        outputs: [new IdPrefix("mem:d/")],
+        run: async (ctx) => {
+          started()
+          await gate
+          try {
+            ctx.deleted(child)
+          } catch {
+            threw = true
+          }
+        },
+      }),
+    )
+
+    const running = build.run()
+    await reached
+    build.remove("prune")
+    release()
+    const result = await running
+
+    expect(result.success).toBe(true)
+    expect(result.cancelled.map((task) => task.id)).toEqual(["prune"])
+    expect(threw).toBe(false)
+    expect(log).toEqual(["promised mem:d/", "withdrawn mem:d/"])
+  })
+
+  test("a task that deletes a declared output runs again on the next build; a deletion under a prefix output does not stop a skip", async () => {
+    // The input is newer than the output, so the first run does not skip by order.
+    const src = new Mem("mem:src", "a", 2n, "a")
+    const out = new Mem("mem:out", "old", 1n, "old")
+    const child = new Mem("mem:d/1", "old", 1n, "old")
+    const store = new MemoryStore()
+    const runs: string[] = []
+
+    const makeTasks = () => [
+      new Task({
+        id: "clean-out",
+        inputs: [src],
+        outputs: [out],
+        run: async (ctx) => {
+          runs.push("clean-out")
+          out.value = null
+          ctx.deleted(out)
+        },
+      }),
+      new Task({
+        id: "clean-dir",
+        inputs: [src],
+        outputs: [new IdPrefix("mem:d/")],
+        run: async (ctx) => {
+          runs.push("clean-dir")
+          child.value = null
+          ctx.deleted(child)
+        },
+      }),
+    ]
+
+    const first = new Build({ store })
+    for (const task of makeTasks()) first.add(task)
+    const r1 = await first.run()
+    expect(r1.success).toBe(true)
+    expect(runs.toSorted()).toEqual(["clean-dir", "clean-out"])
+    // The record keeps an empty stamp for the deleted output.
+    expect(await store.get("clean-out")).toEqual({
+      inputStamps: { "mem:src": { order: 2n, content: "a" } },
+      outputStamps: { "mem:out": {} },
+    })
+
+    const second = new Build({ store })
+    for (const task of makeTasks()) second.add(task)
+    const r2 = await second.run()
+    expect(r2.success).toBe(true)
+    expect(r2.executed.map((task) => task.id)).toEqual(["clean-out"])
+    expect(r2.skipped.map((task) => task.id)).toEqual(["clean-dir"])
+    expect(runs.toSorted()).toEqual(["clean-dir", "clean-out", "clean-out"])
+  })
+
+  test("for each output, promised comes before deleted, and nothing comes after withdrawn", async () => {
+    const child = new Mem("mem:p/1")
+    const declared = new Mem("mem:x", "old", 1n, "old")
+    const src = new Mem("mem:src", "a", 2n, "a")
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    let started!: () => void
+    const reached = new Promise<void>((resolve) => {
+      started = resolve
+    })
+    const log: string[] = []
+    const problems: string[] = []
+    // The outputs of each task id that are promised and not withdrawn.
+    const live = new Map<string, Ref[]>()
+
+    const build = new Build()
+    build.subscribe((event) => {
+      const line = `${describeEvent(event)} by ${event.taskId}`
+      log.push(line)
+      const outputs = live.get(event.taskId) ?? []
+      if (event.kind === "promised") {
+        outputs.push(event.output)
+        live.set(event.taskId, outputs)
+        return
+      }
+      if (event.kind === "withdrawn") {
+        const found = findOutput(outputs, event.output.id)
+        if (found === null) {
+          problems.push(`not promised: ${line}`)
+          return
+        }
+        outputs.splice(outputs.indexOf(found), 1)
+        return
+      }
+      if (!coveredBy(outputs, event.artifact)) problems.push(`not promised: ${line}`)
+    })
+    build.add(
+      new Task({
+        id: "split",
+        inputs: [src],
+        outputs: [new IdPrefix("mem:p/"), declared],
+        run: async (ctx) => {
+          ctx.deleted(child)
+          declared.value = null
+          ctx.deleted(declared)
+        },
+      }),
+    )
+    build.add(
+      new Task({
+        id: "slow",
+        outputs: [new IdPrefix("mem:s/")],
+        run: async (ctx) => {
+          started()
+          await gate
+          ctx.deleted(new Mem("mem:s/1"))
+        },
+      }),
+    )
+
+    const running = build.run()
+    await reached
+    build.remove("slow")
+    release()
+    const result = await running
+    build.remove("split")
+
+    expect(result.success).toBe(true)
+    expect(problems).toEqual([])
+    const bySplit = log.filter((line) => line.endsWith(" by split"))
+    expect(bySplit).toEqual([
+      "promised mem:p/ by split",
+      "promised mem:x by split",
+      "deleted mem:p/1 by split",
+      "deleted mem:x by split",
+      "withdrawn mem:p/ by split",
+      "withdrawn mem:x by split",
+    ])
+    const bySlow = log.filter((line) => line.endsWith(" by slow"))
+    expect(bySlow).toEqual(["promised mem:s/ by slow", "withdrawn mem:s/ by slow"])
   })
 })
 
