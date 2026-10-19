@@ -15,6 +15,12 @@ type Phase = "pending" | "running" | "completed"
 
 type WaitResult = "ok" | "failed" | "cancelled" | "deadlock"
 
+/** The default number of events that subscribers can cause during one drain of the event queue. */
+export const SEND_LIMIT = 10_000
+
+// The outputs of no task. Shared, and never changed.
+const NO_OUTPUTS: ReadonlyMap<string, Ref> = new Map()
+
 class Slot {
   generation = 1
   launched = 0
@@ -23,8 +29,6 @@ class Slot {
   // The ids that this run reported with ctx.produced or ctx.deleted.
   reported = new Set<string>()
   outcome: Outcome | null = null
-  // The first listener error from a send that this task caused. The task fails with it.
-  listenerError: Error | null = null
 
   constructor(
     public task: Task,
@@ -35,6 +39,7 @@ class Slot {
 
 export class Build extends Emitter<ArtifactEvent> {
   private readonly store: Store | undefined
+  private readonly sendLimit: number
   private readonly slots = new Map<string, Slot>()
   // For each owner, the ids of the tasks that it gave. Slot.owner is the reverse.
   private readonly owners = new Map<string, Set<string>>()
@@ -42,24 +47,30 @@ export class Build extends Emitter<ArtifactEvent> {
   private readonly prefixOutputs: { prefix: Prefix; taskId: string }[] = []
   private readonly outcomes = new Map<Task, Outcome>()
   private readonly errors: Error[] = []
-  // For each task id, the outputs that subscribers were last told about, by refKey.
-  // After a top-level add, remove, setTasks, or run() returns, each entry equals the
-  // current outputs of that task id, or is gone when no task has that id.
-  private readonly told = new Map<string, Map<string, Ref>>()
+  // The events that wait to go to the subscribers, oldest first.
+  private queue: ArtifactEvent[] = []
+  private draining = false
+  // The first subscriber error or send-limit error. Each later run() rejects with it.
+  private fatal: Error | null = null
 
   private started = false
   private runningCount = 0
   private workCount = 0
-  // The running task that is inside ctx.add, ctx.remove, ctx.produced, ctx.deleted, or the
-  // send of its declared outputs. A listener error then goes to that task.
-  // When it is null, a listener error goes to `errors`.
-  private caller: Slot | null = null
   private waiters: Array<() => void> = []
   private idleWaiters: Array<() => void> = []
 
-  constructor(opts?: { store?: Store }) {
+  constructor(opts?: { store?: Store; sendLimit?: number }) {
     super()
     this.store = opts?.store
+    const sendLimit = opts?.sendLimit ?? SEND_LIMIT
+    if (!Number.isInteger(sendLimit) || sendLimit < 1) {
+      let shown = String(sendLimit)
+      if (typeof sendLimit === "string") {
+        shown = JSON.stringify(sendLimit)
+      }
+      throw new Error(`sendLimit must be a positive integer, not ${shown}`)
+    }
+    this.sendLimit = sendLimit
   }
 
   add(task: Task): void {
@@ -95,26 +106,37 @@ export class Build extends Emitter<ArtifactEvent> {
 
   /**
    * Adds or replaces each task in `tasks` and removes each slot in `dropped`.
-   * It changes all state first, and then sends the events.
+   * It changes the state, puts the events on the queue, and then ends the stopped tasks.
+   * It drains the queue last.
    */
   private change(owner: string, tasks: readonly Task[], dropped: readonly Slot[]): void {
     const replaced: Slot[] = []
+    // All withdrawn events of the call go before any promised event. Thus an output
+    // that moves from one task to another in one call is withdrawn before it is promised.
+    const withdrawn: ArtifactEvent[] = []
+    const promised: ArtifactEvent[] = []
     // In both loops below, a stopped task sees the new generation, so its later
     // ctx.produced and ctx.deleted do nothing.
     for (const slot of dropped) {
       slot.generation += 1
       this.unindex(slot.task)
       this.slots.delete(slot.task.id)
+      addOutputEvents(withdrawn, "withdrawn", slot.task.id, outputsByKey(slot.task), NO_OUTPUTS)
     }
     for (const task of tasks) {
+      let before = NO_OUTPUTS
       const existing = this.slots.get(task.id)
       if (existing) {
         existing.generation += 1
         this.unindex(existing.task)
         replaced.push(existing)
+        before = outputsByKey(existing.task)
       }
       this.slots.set(task.id, new Slot(task, owner))
       this.index(task)
+      const after = outputsByKey(task)
+      addOutputEvents(withdrawn, "withdrawn", task.id, before, after)
+      addOutputEvents(promised, "promised", task.id, after, before)
     }
 
     const ids = new Set(this.owners.get(owner))
@@ -129,6 +151,9 @@ export class Build extends Emitter<ArtifactEvent> {
     } else {
       this.owners.set(owner, ids)
     }
+    // An abort listener below can change tasks too. Its events must come after these.
+    this.push(withdrawn)
+    this.push(promised)
 
     // finish wakes the waiting tasks, and abort() runs the task's abort listeners
     // at once, so the state must be whole first.
@@ -136,7 +161,7 @@ export class Build extends Emitter<ArtifactEvent> {
     for (const slot of dropped) {
       if (slot.phase === "running") running.push(slot)
       if (this.store) {
-        void this.store.delete(slot.task.id)
+        void this.deleteRecord(this.store, slot.task.id)
       }
       if (slot.phase !== "completed") {
         this.finish(slot, { type: "cancelled", reason: "removed" })
@@ -153,94 +178,107 @@ export class Build extends Emitter<ArtifactEvent> {
     for (const slot of running) {
       if (slot.abort) slot.abort.abort()
     }
-
     this.wake()
-    const changedIds: string[] = []
-    for (const slot of dropped) {
-      changedIds.push(slot.task.id)
-    }
-    for (const task of tasks) {
-      changedIds.push(task.id)
-    }
-    this.tell(changedIds)
+    this.drain()
   }
 
+  /** Starts to delete the record of a task. run() waits for it. A delete error goes to `errors`. */
+  private async deleteRecord(store: Store, id: string): Promise<void> {
+    this.workCount += 1
+    try {
+      // Inside the try, a delete that throws at once also goes to `errors`.
+      await store.delete(id)
+    } catch (error) {
+      this.errors.push(toError(error))
+    } finally {
+      this.workCount -= 1
+      this.maybeIdle()
+    }
+  }
+
+  /** Rejects with the first subscriber error or send-limit error of the build. */
   async run(): Promise<Result> {
     if (!this.started) {
       this.started = true
       // Tells subscribers about the tasks that were added before the first run().
-      this.tell([...this.slots.keys()])
+      const events: ArtifactEvent[] = []
+      for (const slot of this.slots.values()) {
+        addOutputEvents(events, "promised", slot.task.id, outputsByKey(slot.task), NO_OUTPUTS)
+      }
+      this.push(events)
+      this.drain()
     }
+    if (this.fatal !== null) throw this.fatal
     for (const slot of this.slots.values()) {
       this.kick(slot)
     }
     await this.idle()
+    if (this.fatal !== null) throw this.fatal
     return new Result(this.outcomes, this.errors)
   }
 
-  /**
-   * Sends withdrawn and promised events until the subscribers know the current
-   * outputs of each task id in `ids`. Before the first run(), it sends nothing.
-   */
-  private tell(ids: readonly string[]): void {
+  /** Puts `events` at the end of the queue. Before the first run(), the build sends no events. */
+  private push(events: readonly ArtifactEvent[]): void {
     if (!this.started) return
-    this.sendAll(this.outputChanges(ids))
+    // After a fatal error, the build sends no more events.
+    if (this.fatal !== null) return
+    for (const event of events) {
+      this.queue.push(event)
+    }
   }
 
   /**
-   * Yields one event at a time. Each event comes from the state at the time
-   * that sendAll asks for it, so a subscriber that changes a task during a
-   * send never gets a stale event.
+   * Sends the queue, one event at a time to every subscriber, until it is empty.
+   * A subscriber that changes tasks during a send only pushes events, and this drain
+   * sends them after the current event reached every subscriber.
    */
-  private *outputChanges(ids: readonly string[]): Generator<ArtifactEvent> {
-    // The first pass sends only withdrawn events. Thus an output that moves from one
-    // task to another in one call is withdrawn before it is promised again.
-    for (const id of ids) {
-      let event = this.nextOutputChange(id, true)
-      while (event !== null) {
-        yield event
-        event = this.nextOutputChange(id, true)
-      }
+  private drain(): void {
+    if (this.draining) return
+    this.draining = true
+    try {
+      this.sendQueue()
+    } finally {
+      this.draining = false
     }
-    for (const id of ids) {
-      let event = this.nextOutputChange(id, false)
-      while (event !== null) {
-        yield event
-        event = this.nextOutputChange(id, false)
+  }
+
+  private sendQueue(): void {
+    // The limit counts only the events that subscribers cause, not the events that started the drain.
+    const initial = this.queue.length
+    let sent = 0
+    while (this.queue.length > 0) {
+      const event = this.queue.shift()!
+      try {
+        this.send(event)
+      } catch (error) {
+        this.fail(toError(error))
+        return
+      }
+      sent += 1
+      const caused = sent - initial
+      if (caused >= this.sendLimit && this.queue.length > 0) {
+        const message =
+          `send limit: subscribers caused ${caused} events in one drain, and more wait; ` +
+          `the last sent was '${eventLine(event)}'`
+        this.fail(new Error(message))
+        return
       }
     }
   }
 
-  /** Updates `told` by one output, and returns the event for it. Withdrawn comes first. */
-  private nextOutputChange(id: string, withdrawnOnly: boolean): ArtifactEvent | null {
-    let told = this.told.get(id)
-    if (told === undefined) {
-      told = new Map<string, Ref>()
-      this.told.set(id, told)
+  /**
+   * Keeps the first fatal error, clears the queue, and aborts every running task.
+   * The build then starts no task and sends no event, and run() rejects with the error.
+   */
+  private fail(error: Error): void {
+    if (this.fatal !== null) return
+    this.fatal = error
+    this.queue = []
+    for (const slot of this.slots.values()) {
+      if (slot.phase === "running" && slot.abort) slot.abort.abort()
     }
-    const current = new Map<string, Ref>()
-    const slot = this.slots.get(id)
-    if (slot !== undefined) {
-      for (const output of slot.task.outputs) {
-        current.set(refKey(output), output)
-      }
-    }
-
-    for (const [key, output] of told) {
-      if (current.has(key)) continue
-      told.delete(key)
-      return { kind: "withdrawn", output, taskId: id }
-    }
-    if (withdrawnOnly) return null
-    for (const [key, output] of current) {
-      if (told.has(key)) continue
-      told.set(key, output)
-      return { kind: "promised", output, taskId: id }
-    }
-    if (told.size === 0) {
-      this.told.delete(id)
-    }
-    return null
+    // Wakes the waiting tasks, so that they see the error and stop.
+    this.wake()
   }
 
   /** Throws if `setTasks(owner, tasks)` would break a rule of the build. */
@@ -387,6 +425,7 @@ export class Build extends Emitter<ArtifactEvent> {
   }
 
   private kick(slot: Slot): void {
+    if (this.fatal !== null) return
     if (slot.launched === slot.generation) return
     if (slot.phase !== "pending") return
     slot.launched = slot.generation
@@ -399,6 +438,9 @@ export class Build extends Emitter<ArtifactEvent> {
 
   private async execute(slot: Slot): Promise<void> {
     const generation = slot.generation
+    // Lets the code that added the task finish first. Thus a producer that the same
+    // synchronous code adds later is in the build when the task looks for its producers.
+    await Promise.resolve()
     const wait = await this.waitForInputs(slot, generation)
     if (generation !== slot.generation) return
     if (wait === "cancelled") return
@@ -419,6 +461,7 @@ export class Build extends Emitter<ArtifactEvent> {
 
     const skip = await this.decideSkip(slot.task)
     if (generation !== slot.generation) return
+    if (this.fatal !== null) return
     if (skip) {
       this.finish(slot, { type: "skipped", reason: skip })
       return
@@ -432,32 +475,19 @@ export class Build extends Emitter<ArtifactEvent> {
     try {
       await slot.task.run(ctx)
       if (this.endIfStopped(slot, generation)) return
-      if (slot.listenerError === null) {
-        await this.recordSuccess(slot, generation)
-      }
+      await this.recordSuccess(slot, generation)
       if (this.endIfStopped(slot, generation)) return
-      if (slot.listenerError !== null) {
-        this.finish(slot, { type: "failed", error: slot.listenerError })
-        return
-      }
       this.finish(slot, { type: "executed" })
     } catch (error) {
-      const err = toError(error)
       if (generation !== slot.generation) {
         // A stopped task often throws because ctx.signal aborted. That is not an error.
         if (!isAbort(error, slot.abort.signal)) {
-          this.addError(err)
+          this.errors.push(toError(error))
         }
         this.endIfStopped(slot, generation)
         return
       }
-      // A listener error fails the task even if the task caught it.
-      // The task's own error, if it threw another one, goes to `errors`.
-      const listenerError = slot.listenerError
-      if (listenerError !== null && listenerError !== err) {
-        this.addError(err)
-      }
-      this.finish(slot, { type: "failed", error: listenerError ?? err })
+      this.finish(slot, { type: "failed", error: toError(error) })
     }
   }
 
@@ -470,16 +500,13 @@ export class Build extends Emitter<ArtifactEvent> {
     if (slot.phase !== "completed") {
       this.finish(slot, { type: "cancelled", reason: "replaced" })
     }
-    // A cancelled task does not own its listener error, so the error goes to `errors`.
-    if (slot.listenerError !== null) {
-      this.addError(slot.listenerError)
-    }
     return true
   }
 
   private async waitForInputs(slot: Slot, generation: number): Promise<WaitResult> {
     while (true) {
       if (generation !== slot.generation) return "cancelled"
+      if (this.fatal !== null) return "cancelled"
       const producers = this.producersOf(slot.task)
       const unfinished: string[] = []
       for (const id of producers) {
@@ -505,18 +532,18 @@ export class Build extends Emitter<ArtifactEvent> {
     return {
       signal: slot.abort!.signal,
       add: (task: Task) => {
-        this.asTask(slot, () => this.add(task))
+        this.add(task)
       },
       remove: (id: string) => {
-        this.asTask(slot, () => this.remove(id))
+        this.remove(id)
       },
       produced: (artifact: Artifact) => {
         if (generation !== slot.generation) return
-        this.asTask(slot, () => this.report(slot, "produced", artifact))
+        this.report(slot, "produced", artifact)
       },
       deleted: (artifact: Artifact) => {
         if (generation !== slot.generation) return
-        this.asTask(slot, () => this.report(slot, "deleted", artifact))
+        this.report(slot, "deleted", artifact)
       },
     }
   }
@@ -531,7 +558,8 @@ export class Build extends Emitter<ArtifactEvent> {
     // already has the last report for it, so the last report wins.
     slot.reported.add(artifact.id)
     const event: ArtifactEvent = { kind, artifact, taskId: slot.task.id }
-    this.sendAll([event])
+    this.push([event])
+    this.drain()
   }
 
   private outputCovers(task: Task, artifact: Artifact): boolean {
@@ -545,89 +573,33 @@ export class Build extends Emitter<ArtifactEvent> {
   private async recordSuccess(slot: Slot, generation: number): Promise<void> {
     for (const output of slot.task.outputs) {
       // A subscriber can remove or replace this task. Then it sends no more events.
+      // Each event is sent alone, so that the next check sees the change.
       if (generation !== slot.generation) return
       if (!isArtifact(output)) continue
       if (slot.reported.has(output.id)) continue
       const event: ArtifactEvent = { kind: "produced", artifact: output, taskId: slot.task.id }
-      try {
-        this.asTask(slot, () => this.sendAll([event]))
-      } catch {
-        // sendAll kept the error in slot.listenerError, and execute fails the task with it.
-      }
+      this.push([event])
+      this.drain()
     }
 
     if (generation !== slot.generation) return
-    if (slot.listenerError !== null) return
+    // Subscribers did not get every event, so the build keeps no record.
+    if (this.fatal !== null) return
     if (!this.store) return
     const inputStamps = await this.stampMap(this.artifactRefs(slot.task.inputs))
     const outputStamps = await this.stampMap(this.artifactRefs(slot.task.outputs))
     if (generation !== slot.generation) return
+    // A fatal error can come during the stamp reads above.
+    if (this.fatal !== null) return
     const state: TaskState = { inputStamps, outputStamps }
     await this.store.set(slot.task.id, state)
   }
 
-  private asTask(slot: Slot, call: () => void): void {
-    const previous = this.caller
-    // A task that already completed owns no error; its listener errors go to `errors`.
-    if (slot.phase === "running") {
-      this.caller = slot
-    } else {
-      this.caller = null
-    }
-    try {
-      call()
-    } finally {
-      this.caller = previous
-    }
-  }
-
   /**
-   * Sends every event, even after a listener throws. With a caller task,
-   * each error goes to that task, and the first one is thrown after the loop.
-   * Without one, each error goes to `errors`.
+   * Gets the rejection of a promise that a subscriber returned. The send already failed
+   * the build with the first error. This override only keeps the rejection from being unhandled.
    */
-  private sendAll(events: Iterable<ArtifactEvent>): void {
-    const slot = this.caller
-    let first: Error | null = null
-    for (const event of events) {
-      try {
-        this.send(event)
-      } catch (error) {
-        const err = toError(error)
-        if (slot === null) {
-          this.addError(err)
-          continue
-        }
-        if (first === null) {
-          first = err
-        }
-        this.blame(slot, err)
-      }
-    }
-    if (first !== null) {
-      throw first
-    }
-  }
-
-  private blame(slot: Slot, error: Error): void {
-    if (slot.listenerError === null) {
-      slot.listenerError = error
-      return
-    }
-    // A nested send already reported this error, and it came back up through a listener.
-    if (slot.listenerError === error) return
-    this.addError(error)
-  }
-
-  private addError(error: Error): void {
-    if (this.errors.includes(error)) return
-    this.errors.push(error)
-  }
-
-  /** Errors that reach the build after the send returned, such as an async subscriber's rejection. */
-  protected override rejected(reason: unknown): void {
-    this.addError(toError(reason))
-  }
+  protected override rejected(): void {}
 
   private async decideSkip(task: Task): Promise<"content" | "order" | null> {
     const inputs = this.artifactRefs(task.inputs)
@@ -794,6 +766,37 @@ function ordersFresh(
 function refKey(ref: Ref): string {
   if (isPrefix(ref)) return `prefix ${ref.id}`
   return `artifact ${ref.id}`
+}
+
+/** The outputs of `task` by refKey. An output that the task declares two times is here one time. */
+function outputsByKey(task: Task): Map<string, Ref> {
+  const outputs = new Map<string, Ref>()
+  for (const output of task.outputs) {
+    outputs.set(refKey(output), output)
+  }
+  return outputs
+}
+
+/** Adds a `kind` event for each output in `outputs` whose key is not in `except`. */
+function addOutputEvents(
+  events: ArtifactEvent[],
+  kind: "promised" | "withdrawn",
+  taskId: string,
+  outputs: ReadonlyMap<string, Ref>,
+  except: ReadonlyMap<string, Ref>,
+): void {
+  for (const [key, output] of outputs) {
+    if (except.has(key)) continue
+    events.push({ kind, output, taskId })
+  }
+}
+
+/** "<kind> <id> by <task id>", for error messages. */
+function eventLine(event: ArtifactEvent): string {
+  if (event.kind === "produced" || event.kind === "deleted") {
+    return `${event.kind} ${event.artifact.id} by ${event.taskId}`
+  }
+  return `${event.kind} ${event.output.id} by ${event.taskId}`
 }
 
 function toError(value: unknown): Error {

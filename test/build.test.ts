@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { Build, IdPrefix, MemoryStore, Task, isPrefix } from "../src/index"
+import { Build, IdPrefix, MemoryStore, SEND_LIMIT, Task, isPrefix } from "../src/index"
 import type { Artifact, ArtifactEvent, Ref } from "../src/index"
 import { Mem, MemDir } from "./mem"
 
@@ -335,12 +335,9 @@ describe("Build", () => {
     ])
   })
 
-  test("a listener error in ctx.produced fails that task, even if the task catches it", async () => {
+  test("a subscriber error in ctx.produced rejects run(), and ctx.produced does not throw", async () => {
     const foo = new Mem("mem:out/foo")
-    const caught = new Mem("mem:caught/foo")
-    const later = new Mem("mem:later/foo")
-    let caughtMessage = ""
-    let laterMessage = ""
+    let returned = false
     const build = new Build()
     build.subscribe((event) => {
       if (event.kind === "produced") {
@@ -354,61 +351,16 @@ describe("Build", () => {
         run: async (ctx) => {
           foo.write("x", 1n, "x")
           ctx.produced(foo)
-        },
-      }),
-    )
-    build.add(
-      new Task({
-        id: "catches",
-        outputs: [new IdPrefix("mem:caught/")],
-        run: async (ctx) => {
-          caught.write("x", 1n, "x")
-          try {
-            ctx.produced(caught)
-          } catch (error) {
-            caughtMessage = String(error)
-          }
-        },
-      }),
-    )
-    // Calls ctx.produced from a timer callback, outside the promise chain of run.
-    build.add(
-      new Task({
-        id: "callback",
-        outputs: [new IdPrefix("mem:later/")],
-        run: async (ctx) => {
-          await new Promise<void>((resolve) => {
-            setTimeout(() => {
-              try {
-                ctx.produced(later)
-              } catch (error) {
-                laterMessage = String(error)
-              }
-              resolve()
-            }, 1)
-          })
+          returned = true
         },
       }),
     )
 
-    const result = await build.run()
-    expect(result.success).toBe(false)
-    expect(result.errors).toEqual([])
-    expect(result.executed).toEqual([])
-    const failed: Record<string, string> = {}
-    for (const [task, error] of result.failed) {
-      failed[task.id] = error.message
-    }
-    expect(failed).toEqual({
-      write: "listener broke on mem:out/foo",
-      catches: "listener broke on mem:caught/foo",
-      callback: "listener broke on mem:later/foo",
-    })
-    expect(caughtMessage).toBe("Error: listener broke on mem:caught/foo")
-    expect(laterMessage).toBe("Error: listener broke on mem:later/foo")
+    await expect(build.run()).rejects.toThrow("listener broke on mem:out/foo")
+    expect(returned).toBe(true)
   })
 
-  test("a listener error on a declared output fails that task", async () => {
+  test("a subscriber error on a declared output rejects run() and keeps no store record", async () => {
     const out = new Mem("mem:out")
     const store = new MemoryStore()
     const build = new Build({ store })
@@ -425,19 +377,12 @@ describe("Build", () => {
       }),
     )
 
-    const result = await build.run()
-    expect(result.success).toBe(false)
-    expect(result.executed).toEqual([])
-    expect(result.failed.size).toBe(1)
-    for (const error of result.failed.values()) {
-      expect(error.message).toBe("listener broke")
-    }
-    expect(result.errors).toEqual([])
+    await expect(build.run()).rejects.toThrow("listener broke")
     expect(await store.get("write")).toBeNull()
   })
 
   for (const how of ["remove", "replace"]) {
-    test(`a listener error on a withdrawn event from build.${how} goes to result.errors`, async () => {
+    test(`a subscriber error on a withdrawn event from build.${how} rejects run()`, async () => {
       const out = new Mem("mem:out")
       const other = new Mem("mem:other")
       const withdrawn: string[] = []
@@ -493,15 +438,13 @@ describe("Build", () => {
         )
       }
       release()
-      const result = await running
 
+      await expect(running).rejects.toThrow("listener broke")
       expect(withdrawn).toEqual(["mem:out"])
-      expect(result.failed.size).toBe(0)
-      expect(result.success).toBe(false)
-      expect(result.errors.length).toBe(1)
-      expect(result.errors[0]!.message).toBe("listener broke")
     })
   }
+
+
 
   test("produced throws when no output covers the child", async () => {
     const foo = new Mem("mem:other/foo")
@@ -665,7 +608,7 @@ describe("Build", () => {
     }
   })
 
-  test("ctx.remove with a throwing withdrawn listener fails the caller and removes the task", async () => {
+  test("ctx.remove with a throwing withdrawn subscriber removes the task and drops the later events", async () => {
     const a = new Mem("mem:p/a")
     const b = new Mem("mem:p/b")
     const withdrawn: string[] = []
@@ -685,40 +628,30 @@ describe("Build", () => {
         },
       }),
     )
-    let removeMessage = ""
+    let removeReturned = false
     build.add(
       new Task({
         id: "remover",
         inputs: [a, b],
         run: async (ctx) => {
-          try {
-            ctx.remove("write")
-          } catch (error) {
-            removeMessage = String(error)
-          }
+          ctx.remove("write")
+          removeReturned = true
         },
       }),
     )
 
-    const result = await build.run()
-    expect(withdrawn).toEqual(["mem:p/a by write", "mem:p/b by write"])
-    expect(removeMessage).toBe("Error: withdraw broke on mem:p/a")
-    expect(result.success).toBe(false)
-    const failed: Record<string, string> = {}
-    for (const [task, error] of result.failed) {
-      failed[task.id] = error.message
-    }
-    // The first error fails the caller. The second error has no other owner.
-    expect(failed).toEqual({ remover: "withdraw broke on mem:p/a" })
-    expect(result.errors.map((error) => error.message)).toEqual(["withdraw broke on mem:p/b"])
+    // The first error clears the queue, so "withdrawn mem:p/b" is never sent.
+    await expect(build.run()).rejects.toThrow("withdraw broke on mem:p/a")
+    expect(removeReturned).toBe(true)
+    expect(withdrawn).toEqual(["mem:p/a by write"])
 
     // The task is gone: a second remove sends nothing, and its output id is free.
     build.remove("write")
-    expect(withdrawn.length).toBe(2)
+    expect(withdrawn.length).toBe(1)
     build.add(new Task({ id: "again", outputs: [a], run: async () => {} }))
   })
 
-  test("ctx.add that replaces a completed task fails the caller and keeps the replacement", async () => {
+  test("ctx.add that replaces a completed task with a throwing subscriber rejects run(), and the replacement does not run", async () => {
     const old = new Mem("mem:old")
     const next = new Mem("mem:next")
     const executed: string[] = []
@@ -756,19 +689,11 @@ describe("Build", () => {
       }),
     )
 
-    const result = await build.run()
-    expect(executed).toEqual(["old t", "replacer", "new t"])
-    expect(result.success).toBe(false)
-    expect(result.errors).toEqual([])
-    const failedIds: string[] = []
-    for (const [task, error] of result.failed) {
-      failedIds.push(task.id)
-      expect(error.message).toBe("withdraw broke")
-    }
-    expect(failedIds).toEqual(["replacer"])
+    await expect(build.run()).rejects.toThrow("withdraw broke")
+    expect(executed).toEqual(["old t", "replacer"])
   })
 
-  test("build.add and build.remove inside a task without ctx put errors in result.errors", async () => {
+  test("build.add and build.remove inside a task reject run() on a subscriber error, as ctx.add and ctx.remove do", async () => {
     const one = new Mem("mem:one")
     const two = new Mem("mem:two")
     const build = new Build()
@@ -788,14 +713,11 @@ describe("Build", () => {
       }),
     )
 
-    const result = await build.run()
-    expect(result.failed.size).toBe(0)
-    expect(result.success).toBe(false)
-    const messages = result.errors.map((error) => error.message)
-    expect(messages).toEqual(["withdraw broke on mem:one", "withdraw broke on mem:two"])
+    // Only the first error is kept. The build sends no events after it.
+    await expect(build.run()).rejects.toThrow("withdraw broke on mem:one")
   })
 
-  test("the withdrawn events of a task that build.add replaces while it runs go to result.errors", async () => {
+  test("a subscriber error on the withdrawn events of a running task that build.add replaces rejects run()", async () => {
     const out = new Mem("mem:out/a")
     let release!: () => void
     const gate = new Promise<void>((resolve) => {
@@ -825,15 +747,10 @@ describe("Build", () => {
     await reached
     build.add(new Task({ id: "t", run: async () => {} }))
     release()
-    const result = await running
-
-    expect(result.cancelled.length).toBe(1)
-    expect(result.failed.size).toBe(0)
-    expect(result.success).toBe(false)
-    expect(result.errors.map((error) => error.message)).toEqual(["withdraw broke"])
+    await expect(running).rejects.toThrow("withdraw broke")
   })
 
-  test("build.remove sends every withdrawn event and reports each listener error", async () => {
+  test("a subscriber error outside run() makes each later run() reject at once", async () => {
     const a = new Mem("mem:a")
     const b = new Mem("mem:b")
     const withdrawn: string[] = []
@@ -847,14 +764,16 @@ describe("Build", () => {
     const first = await build.run()
     expect(first.success).toBe(true)
 
+    // build.remove does not throw. The first error clears the queue, so mem:b gets no event.
     build.remove("write")
-    expect(withdrawn).toEqual(["mem:a", "mem:b"])
-    // An error after run() returns appears in the next result.
-    const second = await build.run()
-    expect(second.success).toBe(false)
-    const messages = second.errors.map((error) => error.message)
-    expect(messages).toEqual(["withdraw broke on mem:a", "withdraw broke on mem:b"])
+    expect(withdrawn).toEqual(["mem:a"])
+    await expect(build.run()).rejects.toThrow("withdraw broke on mem:a")
+    await expect(build.run()).rejects.toThrow("withdraw broke on mem:a")
   })
+
+
+
+
 
   test("a subscriber added during a send gets the next event only", async () => {
     const a = new Mem("mem:p/a")
@@ -886,54 +805,53 @@ describe("Build", () => {
     expect(late).toEqual(["produced mem:p/a", "produced mem:p/b"])
   })
 
-  test("a listener error goes to the task that caused it, not to another running task", async () => {
+  test("a subscriber error in one task's ctx.produced rejects run() and aborts the other running task", async () => {
     const bad = new Mem("mem:bad/1")
-    const good = new Mem("mem:good/1")
+    let finished = false
+    let started!: () => void
+    const reached = new Promise<void>((resolve) => {
+      started = resolve
+    })
     const build = new Build()
     build.subscribe((event) => {
       if (event.kind !== "produced") return
       if (event.artifact === bad) throw new Error("listener broke on bad")
     })
-    const tick = () => new Promise<void>((resolve) => setTimeout(resolve, 1))
     build.add(
       new Task({
         id: "bad",
         outputs: [new IdPrefix("mem:bad/")],
         run: async (ctx) => {
-          await tick()
+          await reached
           ctx.produced(bad)
         },
       }),
     )
+    // Waits for its signal to abort, and then works a little longer.
     build.add(
       new Task({
-        id: "good",
-        outputs: [new IdPrefix("mem:good/")],
+        id: "other",
         run: async (ctx) => {
-          ctx.produced(good)
-          await tick()
-          await tick()
-          ctx.produced(good)
+          await new Promise<void>((resolve) => {
+            ctx.signal.addEventListener("abort", () => resolve())
+            started()
+          })
+          await new Promise<void>((resolve) => setTimeout(resolve, 10))
+          finished = true
         },
       }),
     )
 
-    const result = await build.run()
-    expect(result.executed.map((task) => task.id)).toEqual(["good"])
-    const failedIds: string[] = []
-    for (const [task, error] of result.failed) {
-      failedIds.push(task.id)
-      expect(error.message).toBe("listener broke on bad")
-    }
-    expect(failedIds).toEqual(["bad"])
-    expect(result.errors).toEqual([])
+    // run() rejects only after the aborted task returned.
+    await expect(build.run()).rejects.toThrow("listener broke on bad")
+    expect(finished).toBe(true)
   })
 
-  test("a subscriber that returns a promise fails the task that caused the send", async () => {
+  test("a subscriber that returns a promise rejects run(), and the promise's rejection is dropped", async () => {
     const out = new Mem("mem:out")
     const build = new Build()
     build.subscribe((event) => {
-      if (event.kind === "produced") return Promise.resolve()
+      if (event.kind === "produced") return Promise.reject(new Error("async subscriber broke"))
     })
     build.add(
       new Task({
@@ -943,14 +861,13 @@ describe("Build", () => {
       }),
     )
 
-    const result = await build.run()
-    expect(result.success).toBe(false)
-    for (const error of result.failed.values()) {
-      expect(error.message).toBe("subscriber returned a promise; subscribers must be synchronous")
-    }
-    expect(result.failed.size).toBe(1)
-    expect(result.errors).toEqual([])
+    const message = "subscriber returned a promise; subscribers must be synchronous"
+    await expect(build.run()).rejects.toThrow(message)
+    // The rejection came after the first error, so the build keeps the first one.
+    await new Promise<void>((resolve) => setTimeout(resolve, 1))
+    await expect(build.run()).rejects.toThrow(message)
   })
+
 
   test("a replacement with the same outputs sends no promised or withdrawn events", async () => {
     const a = new Mem("mem:a")
@@ -994,7 +911,7 @@ describe("Build", () => {
     expect(events).toEqual(["promised mem:a", "produced mem:a", "produced mem:a", "withdrawn mem:a"])
   })
 
-  test("a task that catches a listener error and throws its own fails with the listener error", async () => {
+  test("a task's own error after a subscriber error does not replace it", async () => {
     const out = new Mem("mem:out/a")
     const build = new Build()
     build.subscribe((event) => {
@@ -1005,22 +922,13 @@ describe("Build", () => {
         id: "t",
         outputs: [new IdPrefix("mem:out/")],
         run: async (ctx) => {
-          try {
-            ctx.produced(out)
-          } catch {
-            throw new Error("task gave up")
-          }
+          ctx.produced(out)
+          throw new Error("task gave up")
         },
       }),
     )
 
-    const result = await build.run()
-    expect(result.success).toBe(false)
-    for (const error of result.failed.values()) {
-      expect(error.message).toBe("listener broke")
-    }
-    expect(result.failed.size).toBe(1)
-    expect(result.errors.map((error) => error.message)).toEqual(["task gave up"])
+    await expect(build.run()).rejects.toThrow("listener broke")
   })
 
   test("a subscriber that removes the writer on its declared output stops its record", async () => {
@@ -1092,22 +1000,6 @@ describe("Build", () => {
     expect(events).toEqual(["promised mem:a", "produced mem:a", "withdrawn mem:a"])
   })
 
-  test("the rejection of an async subscriber goes to result.errors", async () => {
-    const out = new Mem("mem:out")
-    const build = new Build()
-    build.subscribe((event) => {
-      if (event.kind === "produced") return Promise.reject(new Error("async subscriber broke"))
-    })
-    build.add(new Task({ id: "t", outputs: [out], run: async () => {} }))
-
-    const result = await build.run()
-    expect(result.success).toBe(false)
-    for (const error of result.failed.values()) {
-      expect(error.message).toBe("subscriber returned a promise; subscribers must be synchronous")
-    }
-    expect(result.failed.size).toBe(1)
-    expect(result.errors.map((error) => error.message)).toEqual(["async subscriber broke"])
-  })
 
   test("replacing a running task withdraws the outputs the new task does not declare, at once", async () => {
     const a = new Mem("mem:a")
@@ -1212,6 +1104,88 @@ describe("Build", () => {
       }
     })
   }
+
+  test("run() waits for a store delete, and a delete that rejects goes to result.errors", async () => {
+    class SlowBrokenDeleteStore extends MemoryStore {
+      override async delete(id: string): Promise<void> {
+        await new Promise<void>((resolve) => setTimeout(resolve, 20))
+        throw new Error(`delete broke on ${id}`)
+      }
+    }
+    const build = new Build({ store: new SlowBrokenDeleteStore() })
+    build.add(new Task({ id: "victim", inputs: [new Mem("mem:never")], outputs: [new Mem("mem:v")], run: async () => {} }))
+    build.add(
+      new Task({
+        id: "remover",
+        run: async (ctx) => {
+          ctx.remove("victim")
+        },
+      }),
+    )
+
+    const result = await build.run()
+    expect(result.success).toBe(false)
+    expect(result.errors.map((error) => error.message)).toEqual(["delete broke on victim"])
+  })
+
+  test("a store delete that throws at once does not stop build.remove", async () => {
+    class ThrowingDeleteStore extends MemoryStore {
+      override delete(): Promise<void> {
+        throw new Error("delete broke at once")
+      }
+    }
+    const events: string[] = []
+    const build = new Build({ store: new ThrowingDeleteStore() })
+    build.subscribe((event) => {
+      events.push(describeEvent(event))
+    })
+    build.add(new Task({ id: "t", outputs: [new Mem("mem:a")], run: async () => {} }))
+    await build.run()
+
+    build.remove("t")
+    expect(events).toEqual(["promised mem:a", "produced mem:a", "withdrawn mem:a"])
+    const second = await build.run()
+    expect(second.errors.map((error) => error.message)).toEqual(["delete broke at once"])
+  })
+
+  test("a fatal error during the stamp reads of a task stops its store record", async () => {
+    /** An artifact whose order stamp takes time to read, after the task wrote it. */
+    class SlowStamp extends Mem {
+      override async orderStamp(): Promise<bigint | null> {
+        if (this.value === null) return null
+        await new Promise<void>((resolve) => setTimeout(resolve, 30))
+        return this.order
+      }
+    }
+    const store = new MemoryStore()
+    const slow = new SlowStamp("mem:slow")
+    const build = new Build({ store })
+    build.subscribe((event) => {
+      if (event.kind === "produced" && event.taskId === "b") throw new Error("late fatal")
+    })
+    build.add(
+      new Task({
+        id: "a",
+        outputs: [slow],
+        run: async () => {
+          slow.write("a", 1n, "a")
+        },
+      }),
+    )
+    // Its produced event comes while "a" reads its stamps.
+    build.add(
+      new Task({
+        id: "b",
+        outputs: [new Mem("mem:b")],
+        run: async () => {
+          await new Promise<void>((resolve) => setTimeout(resolve, 10))
+        },
+      }),
+    )
+
+    await expect(build.run()).rejects.toThrow("late fatal")
+    expect(await store.get("a")).toBeNull()
+  })
 
   test("task can add another task during run", async () => {
     const done = new Mem("mem:done")
@@ -1330,7 +1304,7 @@ describe("promised and withdrawn events", () => {
     expect(log).toEqual(["withdrawn mem:a by t", "withdrawn mem:p/ by t"])
   })
 
-  test("a task removed before its promised events are sent sends no events", async () => {
+  test("a task removed before run() sends no events; a task removed during the first sends gets promised, then withdrawn", async () => {
     const a = new Mem("mem:a")
     const b = new Mem("mem:b")
     const log: string[] = []
@@ -1348,7 +1322,13 @@ describe("promised and withdrawn events", () => {
     const result = await build.run()
     expect(result.success).toBe(true)
     expect(result.cancelled.map((task) => task.id)).toEqual(["gone", "doomed"])
-    expect(log).toEqual(["promised mem:b by first", "produced mem:b by first"])
+    // The promised event of "doomed" was already in the queue, and its withdrawn event comes after it.
+    expect(log).toEqual([
+      "promised mem:b by first",
+      "promised mem:a by doomed",
+      "withdrawn mem:a by doomed",
+      "produced mem:b by first",
+    ])
   })
 
   test("replacement sends withdrawn and promised only for the outputs that changed", async () => {
@@ -1385,10 +1365,11 @@ describe("promised and withdrawn events", () => {
     expect(log).toEqual(["promised mem:b by t"])
   })
 
-  test("a subscriber error on promised at the start of run() goes to result.errors", async () => {
+  test("a subscriber error on promised at the start of run() rejects run(), and no task runs", async () => {
     const a = new Mem("mem:a")
     const b = new Mem("mem:b")
     const heard: string[] = []
+    let ran = false
     const build = new Build()
     build.subscribe((event) => {
       if (event.kind !== "promised") return
@@ -1397,21 +1378,26 @@ describe("promised and withdrawn events", () => {
     build.subscribe((event) => {
       heard.push(describeEvent(event))
     })
-    build.add(new Task({ id: "t", outputs: [a, b], run: async () => {} }))
+    build.add(
+      new Task({
+        id: "t",
+        outputs: [a, b],
+        run: async () => {
+          ran = true
+        },
+      }),
+    )
 
-    const result = await build.run()
-    expect(result.success).toBe(false)
-    expect(result.failed.size).toBe(0)
-    expect(result.executed.map((task) => task.id)).toEqual(["t"])
-    const messages = result.errors.map((error) => error.message)
-    expect(messages).toEqual(["promise broke on mem:a", "promise broke on mem:b"])
-    // A throw stops that event for later subscribers, but not the other events.
-    expect(heard).toEqual(["produced mem:a", "produced mem:b"])
+    await expect(build.run()).rejects.toThrow("promise broke on mem:a")
+    expect(ran).toBe(false)
+    // The throw stops that event for later subscribers, and the queue is cleared.
+    expect(heard).toEqual([])
   })
 
-  test("a subscriber error on promised from ctx.add fails the task that called it", async () => {
+  test("a subscriber error on promised from ctx.add rejects run(), and the new task does not run", async () => {
     const c = new Mem("mem:c")
-    let addMessage = ""
+    let addReturned = false
+    let childRan = false
     const build = new Build()
     build.subscribe((event) => {
       if (event.kind === "promised" && event.taskId === "child") throw new Error("promise broke")
@@ -1420,26 +1406,24 @@ describe("promised and withdrawn events", () => {
       new Task({
         id: "parent",
         run: async (ctx) => {
-          try {
-            ctx.add(new Task({ id: "child", outputs: [c], run: async () => {} }))
-          } catch (error) {
-            addMessage = String(error)
-          }
+          const child = new Task({
+            id: "child",
+            outputs: [c],
+            run: async () => {
+              childRan = true
+            },
+          })
+          ctx.add(child)
+          addReturned = true
         },
       }),
     )
 
-    const result = await build.run()
-    expect(addMessage).toBe("Error: promise broke")
-    const failed: Record<string, string> = {}
-    for (const [task, error] of result.failed) {
-      failed[task.id] = error.message
-    }
-    expect(failed).toEqual({ parent: "promise broke" })
-    expect(result.errors).toEqual([])
-    // The build added the child before it sent the event.
-    expect(result.executed.map((task) => task.id)).toEqual(["child"])
+    await expect(build.run()).rejects.toThrow("promise broke")
+    expect(addReturned).toBe(true)
+    expect(childRan).toBe(false)
   })
+
 
   test("for each output, promised comes before produced, and nothing comes after withdrawn", async () => {
     const one = new Mem("mem:p/1")
@@ -1529,6 +1513,9 @@ describe("promised and withdrawn events", () => {
     expect(problems).toEqual([])
     expect(log).toEqual([
       "promised mem:p/ by split",
+      // The second subscriber removed "doomed" during the first event. Its promised event was already queued.
+      "promised mem:doomed by doomed",
+      "withdrawn mem:doomed by doomed",
       "produced mem:p/1 by split",
       "promised mem:out/1 by use:1",
       "produced mem:p/2 by split",
@@ -1540,124 +1527,278 @@ describe("promised and withdrawn events", () => {
     ])
   })
 
-  describe("a subscriber that changes the same task id during its events gets no stale event", () => {
-    test("a replacement during the withdrawn events of a replacement", async () => {
+  describe("the event queue", () => {
+    test("two subscribers get every event in one order, and a stale event is followed by its correction", async () => {
+      const x = new Mem("mem:x")
+      const y = new Mem("mem:y")
+      const logs: string[][] = [[], []]
+      // For each output id, the task that promised it, as each subscriber sees it.
+      const promisers = [new Map<string, string>(), new Map<string, string>()]
+      let replaced = false
+      const build = new Build()
+      for (let i = 0; i < 2; i++) {
+        const log = logs[i]!
+        const promiser = promisers[i]!
+        build.subscribe((event) => {
+          log.push(`${describeEvent(event)} by ${event.taskId}`)
+          if (event.kind === "promised") promiser.set(event.output.id, event.taskId)
+          if (event.kind === "withdrawn") promiser.delete(event.output.id)
+          // Subscriber 1 replaces t during the first "promised mem:x by t".
+          if (i !== 0 || replaced) return
+          if (event.kind !== "promised" || event.output.id !== "mem:x") return
+          replaced = true
+          build.add(new Task({ id: "t", outputs: [y], run: async () => {} }))
+        })
+      }
+      build.add(new Task({ id: "t", outputs: [x], run: async () => {} }))
+
+      const result = await build.run()
+      expect(result.success).toBe(true)
+      const expected = [
+        "promised mem:x by t",
+        "withdrawn mem:x by t",
+        "promised mem:y by t",
+        "produced mem:y by t",
+      ]
+      expect(logs[0]).toEqual(expected)
+      expect(logs[1]).toEqual(expected)
+      // Subscriber 2 got "promised mem:x" after t no longer declared it, and then its withdrawn event.
+      // Each subscriber applied the events in order and ends with the true state.
+      const truth = new Map<string, string>([["mem:y", "t"]])
+      expect(promisers[0]).toEqual(truth)
+      expect(promisers[1]).toEqual(truth)
+    })
+
+    test("a subscriber that changes tasks during a send gets the new events after the current event reached every subscriber", async () => {
+      const a = new Mem("mem:a")
       const log: string[] = []
-      let done = false
       const build = new Build()
       build.subscribe((event) => {
-        log.push(`${describeEvent(event)} by ${event.taskId}`)
+        log.push(`1: ${describeEvent(event)}`)
+        if (event.kind === "produced") build.remove("t")
       })
       build.subscribe((event) => {
-        if (done || event.kind !== "withdrawn" || event.output.id !== "mem:a") return
-        done = true
-        build.add(new Task({ id: "x", outputs: [new Mem("mem:a")], run: async () => {} }))
+        log.push(`2: ${describeEvent(event)}`)
       })
-      build.add(new Task({ id: "x", outputs: [new Mem("mem:a")], run: async () => {} }))
-      const running = build.run()
-      build.add(new Task({ id: "x", outputs: [new Mem("mem:b")], run: async () => {} }))
-      await running
+      build.add(new Task({ id: "t", outputs: [a], run: async () => {} }))
 
-      // The nested add promised mem:a again, so the outer add must not promise mem:b.
+      const result = await build.run()
+      expect(result.cancelled.map((task) => task.id)).toEqual(["t"])
       expect(log).toEqual([
-        "promised mem:a by x",
-        "withdrawn mem:a by x",
-        "promised mem:a by x",
-        "produced mem:a by x",
+        "1: promised mem:a",
+        "2: promised mem:a",
+        "1: produced mem:a",
+        "2: produced mem:a",
+        "1: withdrawn mem:a",
+        "2: withdrawn mem:a",
       ])
     })
 
-    test("a remove during the promised events at the start of run()", async () => {
-      const log: string[] = []
+    test("a subscriber error during a top-level build.add after a run rejects the next run(), which runs nothing", async () => {
+      const a = new Mem("mem:a")
+      let ran = false
       const build = new Build()
+      const first = await build.run()
+      expect(first.success).toBe(true)
       build.subscribe((event) => {
-        log.push(`${describeEvent(event)} by ${event.taskId}`)
+        if (event.kind === "promised") throw new Error("promise broke")
       })
-      build.subscribe((event) => {
-        if (event.kind === "promised" && event.output.id === "mem:a1") build.remove("a")
-      })
-      build.add(
-        new Task({ id: "a", outputs: [new Mem("mem:a1"), new Mem("mem:a2")], run: async () => {} }),
-      )
-      const result = await build.run()
 
-      expect(log).toEqual(["promised mem:a1 by a", "withdrawn mem:a1 by a"])
-      expect(result.cancelled.map((task) => task.id)).toEqual(["a"])
+      build.add(
+        new Task({
+          id: "t",
+          outputs: [a],
+          run: async () => {
+            ran = true
+          },
+        }),
+      )
+      await expect(build.run()).rejects.toThrow("promise broke")
+      // Gives a task that started at add time the chance to run.
+      await new Promise<void>((resolve) => setTimeout(resolve, 1))
+      expect(ran).toBe(false)
     })
 
-    test("a replacement during the promised events at the start of run()", async () => {
+    test("a subscriber that undoes every change stops at the send limit", async () => {
+      const x = new Mem("mem:x")
+      const make = () => new Task({ id: "t", outputs: [x], run: () => new Promise<void>(() => {}) })
+      const build = new Build()
+      build.subscribe((event) => {
+        if (event.kind === "promised") build.remove("t")
+        if (event.kind === "withdrawn") build.add(make())
+      })
+      build.add(make())
+
+      // The first event started the drain. The subscriber caused each later one.
+      await expect(build.run()).rejects.toThrow(
+        `send limit: subscribers caused ${SEND_LIMIT} events in one drain, and more wait; ` +
+          "the last sent was 'promised mem:x by t'",
+      )
+    })
+
+    test("the sendLimit option sets the limit", async () => {
+      let sent = 0
+      const build = new Build({ sendLimit: 5 })
+      build.subscribe((event) => {
+        sent += 1
+        if (event.kind === "promised") build.remove("t")
+        if (event.kind === "withdrawn") build.add(new Task({ id: "t", outputs: [new Mem("mem:x")], run: async () => {} }))
+      })
+      build.add(new Task({ id: "t", outputs: [new Mem("mem:x")], run: async () => {} }))
+
+      await expect(build.run()).rejects.toThrow(
+        "send limit: subscribers caused 5 events in one drain, and more wait; the last sent was 'withdrawn mem:x by t'",
+      )
+      expect(sent).toBe(6)
+    })
+
+    test("the send limit does not count the events of the call that started the drain", async () => {
+      const build = new Build({ sendLimit: 3 })
+      for (let i = 0; i < 10; i++) {
+        build.add(new Task({ id: `t${i}`, outputs: [new Mem(`mem:${i}`)], run: async () => {} }))
+      }
+      const first = await build.run()
+      expect(first.executed.length).toBe(10)
+
+      class Owner extends Build {
+        give(tasks: Task[]): void {
+          this.setTasks("owner", tasks)
+        }
+      }
+      const owner = new Owner({ sendLimit: 3 })
+      await owner.run()
+      const tasks: Task[] = []
+      for (let i = 0; i < 10; i++) {
+        tasks.push(new Task({ id: `t${i}`, outputs: [new Mem(`mem:${i}`)], run: async () => {} }))
+      }
+      owner.give(tasks)
+      const second = await owner.run()
+      expect(second.executed.length).toBe(10)
+    })
+
+    test("the constructor rejects a send limit that is not a positive integer", () => {
+      expect(() => new Build({ sendLimit: 0 })).toThrow("sendLimit must be a positive integer, not 0")
+      expect(() => new Build({ sendLimit: -1 })).toThrow("sendLimit must be a positive integer, not -1")
+      expect(() => new Build({ sendLimit: Number.NaN })).toThrow("sendLimit must be a positive integer, not NaN")
+      expect(() => new Build({ sendLimit: 1.5 })).toThrow("sendLimit must be a positive integer, not 1.5")
+      // A string from untyped code shows its quotes.
+      const fromConfig = JSON.parse('{"sendLimit": "10"}') as { sendLimit: number }
+      expect(() => new Build(fromConfig)).toThrow('sendLimit must be a positive integer, not "10"')
+    })
+
+    test("the events of an abort listener that changes tasks come after the events of the change that aborted it", async () => {
+      const a = new Mem("mem:a")
+      const b = new Mem("mem:b")
+      const c = new Mem("mem:c")
       const log: string[] = []
-      let done = false
+      const promiser = new Map<string, string>()
+      let started!: () => void
+      const reached = new Promise<void>((resolve) => {
+        started = resolve
+      })
       const build = new Build()
       build.subscribe((event) => {
         log.push(`${describeEvent(event)} by ${event.taskId}`)
-      })
-      build.subscribe((event) => {
-        if (done || event.kind !== "promised" || event.output.id !== "mem:a1") return
-        done = true
-        build.add(new Task({ id: "a", outputs: [new Mem("mem:z")], run: async () => {} }))
+        if (event.kind === "promised") promiser.set(event.output.id, event.taskId)
+        if (event.kind === "withdrawn") promiser.delete(event.output.id)
       })
       build.add(
-        new Task({ id: "a", outputs: [new Mem("mem:a1"), new Mem("mem:a2")], run: async () => {} }),
+        new Task({
+          id: "t",
+          outputs: [a],
+          run: async (ctx) => {
+            // Clean-up code that declares t again, with another output.
+            ctx.signal.addEventListener("abort", () => {
+              ctx.add(new Task({ id: "t", outputs: [c], run: () => new Promise<void>(() => {}) }))
+            })
+            started()
+            await new Promise<void>((resolve) => ctx.signal.addEventListener("abort", () => resolve()))
+          },
+        }),
       )
+
+      const running = build.run()
+      await reached
+      build.add(new Task({ id: "t", outputs: [b], run: async () => {} }))
+      expect(log).toEqual([
+        "promised mem:a by t",
+        "withdrawn mem:a by t",
+        "promised mem:b by t",
+        "withdrawn mem:b by t",
+        "promised mem:c by t",
+      ])
+      expect(promiser).toEqual(new Map([["mem:c", "t"]]))
+      build.remove("t")
+      await running
+    })
+  })
+
+  describe("a task added after run() started", () => {
+    test("waits for a producer that the same synchronous code adds later", async () => {
+      const dep = new Mem("mem:dep")
+      const log: string[] = []
+      const build = new Build()
       await build.run()
 
-      expect(log).toEqual([
-        "promised mem:a1 by a",
-        "withdrawn mem:a1 by a",
-        "promised mem:z by a",
-        "produced mem:z by a",
-      ])
-    })
-
-    test("a remove during the promised events of an add after run() started", async () => {
-      const log: string[] = []
-      const build = new Build()
-      build.subscribe((event) => {
-        log.push(`${describeEvent(event)} by ${event.taskId}`)
-      })
-      build.subscribe((event) => {
-        if (event.kind === "promised" && event.output.id === "mem:x1") build.remove("x")
-      })
-      const running = build.run()
       build.add(
-        new Task({ id: "x", outputs: [new Mem("mem:x1"), new Mem("mem:x2")], run: async () => {} }),
+        new Task({
+          id: "consumer",
+          inputs: [dep],
+          run: async () => {
+            log.push(`consumer reads ${dep.value}`)
+          },
+        }),
       )
-      await running
-
-      expect(log).toEqual(["promised mem:x1 by x", "withdrawn mem:x1 by x"])
+      build.add(
+        new Task({
+          id: "producer",
+          outputs: [dep],
+          run: async () => {
+            await new Promise<void>((resolve) => setTimeout(resolve, 10))
+            dep.write("v", 1n, "v")
+            log.push("producer wrote")
+          },
+        }),
+      )
+      const result = await build.run()
+      expect(result.success).toBe(true)
+      expect(log).toEqual(["producer wrote", "consumer reads v"])
     })
 
-    test("an add of the same id during the withdrawn events of a remove", async () => {
+    test("waits for a producer that a subscriber adds in the same cascade", async () => {
+      const dep = new Mem("mem:dep")
       const log: string[] = []
-      let done = false
       const build = new Build()
+      // Adds the producer when it hears about the consumer.
       build.subscribe((event) => {
-        log.push(`${describeEvent(event)} by ${event.taskId}`)
-      })
-      build.subscribe((event) => {
-        if (done || event.kind !== "withdrawn" || event.output.id !== "mem:x1") return
-        done = true
+        if (event.kind !== "promised" || event.taskId !== "consumer") return
         build.add(
-          new Task({ id: "x", outputs: [new Mem("mem:x1"), new Mem("mem:x2")], run: async () => {} }),
+          new Task({
+            id: "producer",
+            outputs: [dep],
+            run: async () => {
+              await new Promise<void>((resolve) => setTimeout(resolve, 10))
+              dep.write("v", 1n, "v")
+              log.push("producer wrote")
+            },
+          }),
         )
       })
-      build.add(
-        new Task({ id: "x", outputs: [new Mem("mem:x1"), new Mem("mem:x2")], run: async () => {} }),
-      )
-      const running = build.run()
-      build.remove("x")
-      await running
+      await build.run()
 
-      // mem:x2 was never withdrawn, so the new task does not promise it again.
-      expect(log).toEqual([
-        "promised mem:x1 by x",
-        "promised mem:x2 by x",
-        "withdrawn mem:x1 by x",
-        "promised mem:x1 by x",
-        "produced mem:x1 by x",
-        "produced mem:x2 by x",
-      ])
+      build.add(
+        new Task({
+          id: "consumer",
+          inputs: [dep],
+          outputs: [new Mem("mem:out")],
+          run: async () => {
+            log.push(`consumer reads ${dep.value}`)
+          },
+        }),
+      )
+      const result = await build.run()
+      expect(result.success).toBe(true)
+      expect(log).toEqual(["producer wrote", "consumer reads v"])
     })
   })
 
@@ -1759,10 +1900,10 @@ describe("deleted events", () => {
     expect(log).toEqual(["promised mem:d/"])
   })
 
-  test("a subscriber error on deleted fails the task, even if the task catches it", async () => {
+  test("a subscriber error on deleted rejects run(), and ctx.deleted does not throw", async () => {
     const child = new Mem("mem:d/1")
     const store = new MemoryStore()
-    let caughtMessage = ""
+    let returned = false
     const build = new Build({ store })
     build.subscribe((event) => {
       if (event.kind === "deleted") {
@@ -1774,25 +1915,14 @@ describe("deleted events", () => {
         id: "prune",
         outputs: [new IdPrefix("mem:d/")],
         run: async (ctx) => {
-          try {
-            ctx.deleted(child)
-          } catch (error) {
-            caughtMessage = String(error)
-          }
+          ctx.deleted(child)
+          returned = true
         },
       }),
     )
 
-    const result = await build.run()
-    expect(result.success).toBe(false)
-    expect(result.executed).toEqual([])
-    expect(result.errors).toEqual([])
-    const messages: string[] = []
-    for (const error of result.failed.values()) {
-      messages.push(error.message)
-    }
-    expect(messages).toEqual(["listener broke on mem:d/1"])
-    expect(caughtMessage).toBe("Error: listener broke on mem:d/1")
+    await expect(build.run()).rejects.toThrow("listener broke on mem:d/1")
+    expect(returned).toBe(true)
     expect(await store.get("prune")).toBeNull()
   })
 
