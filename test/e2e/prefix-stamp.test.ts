@@ -253,161 +253,148 @@ describe("prefix stamps", () => {
   })
 })
 
-describe("prefix layouts that never settle are rejected", () => {
-  test("a prefix input must not cover an output of the same task", () => {
-    const root = "/tmp/dapat-layout"
-    const build = new Build()
-    const task = new Task({
-      id: "index",
-      inputs: [pathPrefix(path.join(root, "pages"))],
-      outputs: [file(path.join(root, "pages", "index.html"))],
-      run: async () => {},
-    })
-    expect(() => build.add(task)).toThrow(
-      `task 'index': input 'file:${root}/pages/' overlaps its output ` +
-        `'file:${root}/pages/index.html'; put the output outside the input`,
-    )
+describe("prefix layouts that overlap", () => {
+  test("a task that reads pages/ and writes pages/index.html runs on every build", async () => {
+    const root = await tempDir()
+    const pagesDir = path.join(root, "pages")
+    const indexPath = path.join(pagesDir, "index.html")
+    await mkdir(pagesDir)
+    await writeFile(path.join(pagesDir, "a.md"), "A")
+    const store = new JsonStore(path.join(root, "state.json"))
+    let runs = 0
+
+    const runOnce = async () => {
+      const build = new Build({ store })
+      build.add(
+        new Task({
+          id: "index",
+          inputs: [pathPrefix(pagesDir)],
+          outputs: [file(indexPath)],
+          run: async () => {
+            runs += 1
+            const names = await readdir(pagesDir)
+            names.sort()
+            await writeFile(indexPath, names.join(","))
+          },
+        }),
+      )
+      return build.run()
+    }
+
+    const first = await runOnce()
+    expect(first.success).toBe(true)
+    expect(ids(first.executed)).toEqual(["index"])
+    expect(runs).toBe(1)
+    expect(await readFile(indexPath, "utf8")).toBe("a.md")
+
+    // No edits. The last run wrote index.html into pages/, so the input stamp changed.
+    const second = await runOnce()
+    expect(ids(second.executed)).toEqual(["index"])
+    expect(runs).toBe(2)
+    expect(await readFile(indexPath, "utf8")).toBe("a.md,index.html")
+    const third = await runOnce()
+    expect(ids(third.executed)).toEqual(["index"])
+    expect(runs).toBe(3)
   })
 
-  test("a directory() input must not cover an output of the same task", () => {
-    const root = "/tmp/dapat-layout"
-    const build = new Build()
-    const task = new Task({
-      id: "index",
-      inputs: [directory(path.join(root, "pages"))],
-      outputs: [file(path.join(root, "pages", "index.html"))],
-      run: async () => {},
-    })
-    expect(() => build.add(task)).toThrow(`input 'file:${root}/pages/' overlaps its output`)
+  test("a directory() input that covers the output of its own task also runs on every build", async () => {
+    const root = await tempDir()
+    const pagesDir = path.join(root, "pages")
+    const indexPath = path.join(pagesDir, "index.html")
+    await mkdir(pagesDir)
+    await writeFile(path.join(pagesDir, "a.md"), "A")
+    const store = new JsonStore(path.join(root, "state.json"))
+
+    const runOnce = async () => {
+      const pages = directory(pagesDir)
+      const build = new Build({ store })
+      build.add(
+        new Task({
+          id: "index",
+          inputs: [pages],
+          outputs: [file(indexPath)],
+          run: async () => {
+            const files = await pages.read()
+            await writeFile(indexPath, String(files.length))
+          },
+        }),
+      )
+      return build.run()
+    }
+
+    await runOnce()
+    const second = await runOnce()
+    expect(ids(second.executed)).toEqual(["index"])
+    const third = await runOnce()
+    expect(ids(third.executed)).toEqual(["index"])
   })
 
-  test("an input inside a prefix output of the same task is rejected too", () => {
-    const build = new Build()
-    const task = new Task({
-      id: "grow",
-      inputs: [pathPrefix("/tmp/dapat-layout/pages/sub")],
-      outputs: [pathPrefix("/tmp/dapat-layout/pages")],
-      run: async () => {},
-    })
-    expect(() => build.add(task)).toThrow(
-      "input 'file:/tmp/dapat-layout/pages/sub/' overlaps its output 'file:/tmp/dapat-layout/pages/'",
-    )
-  })
+  test("two tasks that write into out/ and a reader of out/ run on every build", async () => {
+    const root = await tempDir()
+    const outDir = path.join(root, "out")
+    const pagePath = path.join(outDir, "page.html")
+    const indexPath = path.join(outDir, "index.html")
+    const listPath = path.join(root, "list.txt")
+    await writeFile(path.join(root, "book.txt"), "one")
+    const store = new JsonStore(path.join(root, ".dapat", "state.json"))
+    let runs: string[] = []
 
-  test("a prefix input inside a directory() output of the same task is rejected", () => {
-    const build = new Build()
-    const task = new Task({
-      id: "grow",
-      inputs: [pathPrefix("/tmp/dapat-layout/out/sub")],
-      outputs: [directory("/tmp/dapat-layout/out")],
-      run: async () => {},
-    })
-    expect(() => build.add(task)).toThrow(
-      "input 'file:/tmp/dapat-layout/out/sub/' overlaps its output 'file:/tmp/dapat-layout/out/'",
-    )
-  })
+    const runOnce = async () => {
+      runs = []
+      const build = new Build({ store })
+      // split owns the whole folder. index writes one file in it, and reads the page that split wrote.
+      build.add(
+        new Task({
+          id: "split",
+          inputs: [file(path.join(root, "book.txt"))],
+          outputs: [pathPrefix(outDir)],
+          run: async () => {
+            runs.push("split")
+            await mkdir(outDir, { recursive: true })
+            await writeFile(pagePath, "one")
+          },
+        }),
+      )
+      build.add(
+        new Task({
+          id: "index",
+          inputs: [file(pagePath)],
+          outputs: [file(indexPath)],
+          run: async () => {
+            runs.push("index")
+            await writeFile(indexPath, "page.html")
+          },
+        }),
+      )
+      build.add(
+        new Task({
+          id: "list",
+          inputs: [pathPrefix(outDir)],
+          outputs: [file(listPath)],
+          run: async () => {
+            runs.push("list")
+            const names = await readdir(outDir)
+            names.sort()
+            await writeFile(listPath, names.join(","))
+          },
+        }),
+      )
+      return build.run()
+    }
 
-  test("a prefix input must not overlap a prefix output of the same task", () => {
-    const build = new Build()
-    const task = new Task({
-      id: "grow",
-      inputs: [new IdPrefix("mem:pages/")],
-      outputs: [new IdPrefix("mem:pages/new/")],
-      run: async () => {},
-    })
-    expect(() => build.add(task)).toThrow("overlaps its output 'mem:pages/new/'")
-  })
+    const first = await runOnce()
+    expect(first.success).toBe(true)
+    // index waits for split, and list waits for both.
+    expect(runs).toEqual(["split", "index", "list"])
+    expect(await readFile(listPath, "utf8")).toBe("index.html,page.html")
 
-  test("a prefix output must not cover an exact output of another task, in either order", () => {
-    const split = new Task({
-      id: "split",
-      outputs: [pathPrefix("/tmp/dapat-layout/out")],
-      run: async () => {},
-    })
-    const index = new Task({
-      id: "index",
-      outputs: [file("/tmp/dapat-layout/out/index.html")],
-      run: async () => {},
-    })
-    const message =
-      "two tasks write into one region: outputs 'file:/tmp/dapat-layout/out/index.html' of task " +
-      "'index' and 'file:/tmp/dapat-layout/out/' of task 'split' overlap"
-
-    const first = new Build()
-    first.add(split)
-    expect(() => first.add(index)).toThrow(message)
-
-    const second = new Build()
-    second.add(index)
-    expect(() => second.add(split)).toThrow("give each writer its own folder")
-  })
-
-  test("two prefix outputs of different tasks must not overlap", () => {
-    const build = new Build()
-    build.add(new Task({ id: "a", outputs: [new IdPrefix("mem:out/")], run: async () => {} }))
-    const same = new Task({ id: "b", outputs: [new IdPrefix("mem:out/")], run: async () => {} })
-    const nested = new Task({ id: "c", outputs: [new IdPrefix("mem:out/sub/")], run: async () => {} })
-    const outer = new Task({ id: "d", outputs: [new IdPrefix("mem:")], run: async () => {} })
-    expect(() => build.add(same)).toThrow("of task 'b' and 'mem:out/' of task 'a' overlap")
-    expect(() => build.add(nested)).toThrow("of task 'c' and 'mem:out/' of task 'a' overlap")
-    expect(() => build.add(outer)).toThrow("of task 'd' and 'mem:out/' of task 'a' overlap")
-  })
-
-  test("a directory() output must not cover an output of another task, in either order", () => {
-    const all = new Task({
-      id: "all",
-      outputs: [directory("/tmp/dapat-layout/out")],
-      run: async () => {},
-    })
-    const one = new Task({
-      id: "one",
-      outputs: [file("/tmp/dapat-layout/out/z.html")],
-      run: async () => {},
-    })
-    const first = new Build()
-    first.add(all)
-    expect(() => first.add(one)).toThrow("of task 'one' and 'file:/tmp/dapat-layout/out/' of task 'all'")
-    const second = new Build()
-    second.add(one)
-    expect(() => second.add(all)).toThrow("two tasks write into one region")
-    // A directory() output next to a prefix output inside it.
-    const third = new Build()
-    third.add(all)
-    const sub = new Task({ id: "sub", outputs: [pathPrefix("/tmp/dapat-layout/out/sub")], run: async () => {} })
-    expect(() => third.add(sub)).toThrow("two tasks write into one region")
-  })
-
-  test("ctx.add rejects a clashing task, and the task that called it fails", async () => {
-    const build = new Build()
-    build.add(
-      new Task({
-        id: "parent",
-        outputs: [new IdPrefix("mem:out/")],
-        run: async (ctx) => {
-          ctx.add(new Task({ id: "child", outputs: [new IdPrefix("mem:out/child/")], run: async () => {} }))
-        },
-      }),
-    )
-    const result = await build.run()
-    const error = result.failed.get([...result.failed.keys()][0]!)!
-    expect(ids([...result.failed.keys()])).toEqual(["parent"])
-    expect(error.message).toContain("two tasks write into one region")
-  })
-
-  test("a rejected add changes nothing, and a replacement can move its own prefix", async () => {
-    const build = new Build()
-    const events: string[] = []
-    build.subscribe((event) => {
-      events.push(event.kind)
-    })
-    build.add(new Task({ id: "a", outputs: [new IdPrefix("mem:out/")], run: async () => {} }))
-    const clash = new Task({ id: "b", outputs: [new IdPrefix("mem:out/x/")], run: async () => {} })
-    expect(() => build.add(clash)).toThrow("two tasks write into one region")
-    // The same task id may change its own prefix output. Only other tasks count.
-    build.add(new Task({ id: "a", outputs: [new IdPrefix("mem:out/x/")], run: async () => {} }))
-    const result = await build.run()
-    expect(ids(result.executed)).toEqual(["a"])
-    expect(events).toEqual(["promised"])
+    // No edits. The record of split holds a stamp of out/ from before index wrote index.html.
+    // So split runs, which rewrites page.html, so index runs, and so list runs.
+    const second = await runOnce()
+    expect(ids(second.executed).toSorted()).toEqual(["index", "list", "split"])
+    expect(runs).toEqual(["split", "index", "list"])
+    const third = await runOnce()
+    expect(ids(third.executed).toSorted()).toEqual(["index", "list", "split"])
   })
 
   test("the split and index example settles when each writer has its own folder", async () => {

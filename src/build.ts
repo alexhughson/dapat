@@ -319,55 +319,6 @@ export class Build extends Emitter<ArtifactEvent> {
         }
       }
     }
-    this.assertRegionsApart(owner, tasks)
-  }
-
-  /**
-   * Throws if a region input of a task overlaps an output of the same task, or if a region
-   * output overlaps an output of another task. A region is a prefix or an artifact that
-   * covers others, such as a directory. Only regions are compared, so a build of plain
-   * files pays almost nothing.
-   */
-  private assertRegionsApart(owner: string, tasks: readonly Task[]): void {
-    const newOutputs: OutputEntry[] = []
-    const newRegions: OutputEntry[] = []
-    for (const task of tasks) {
-      for (const input of task.inputs) {
-        if (!isRegion(input)) continue
-        for (const output of task.outputs) {
-          if (!overlap(input, output)) continue
-          const fix = "put the output outside the input, for example index.html next to pages/"
-          throw new Error(`task '${task.id}': input '${input.id}' overlaps its output '${output.id}'; ${fix}`)
-        }
-      }
-      for (const output of task.outputs) {
-        const entry = { output, taskId: task.id }
-        newOutputs.push(entry)
-        if (isRegion(output)) newRegions.push(entry)
-      }
-    }
-    // The tasks of this owner are all replaced or removed, so only other owners count.
-    const replaced = this.owners.get(owner) ?? new Set<string>()
-    for (const old of this.regionOutputs) {
-      if (replaced.has(old.taskId)) continue
-      for (const entry of newOutputs) {
-        assertOutputsApart(old, entry)
-      }
-    }
-    if (newRegions.length === 0) return
-    // Each new region against every output, new and old.
-    const allOutputs = [...newOutputs]
-    for (const slot of this.slots.values()) {
-      if (replaced.has(slot.task.id)) continue
-      for (const output of slot.task.outputs) {
-        allOutputs.push({ output, taskId: slot.task.id })
-      }
-    }
-    for (const region of newRegions) {
-      for (const entry of allOutputs) {
-        assertOutputsApart(region, entry)
-      }
-    }
   }
 
   private index(task: Task): void {
@@ -799,34 +750,6 @@ function sameStamps(recorded: StampMap, current: StampMap): boolean {
 function isRegion(ref: Ref): boolean {
   if (isPrefix(ref)) return true
   return ref.coversOthers
-}
-
-/** True when the region `region` and `ref` share an id: one covers the other. */
-function overlap(region: Ref, ref: Ref): boolean {
-  if (isPrefix(region) && isPrefix(ref)) return region.overlaps(ref)
-  if (isPrefix(region)) {
-    const artifact = ref as Artifact
-    if (region.covers(artifact)) return true
-    // A prefix inside a region artifact, such as pathPrefix("out/sub/") inside directory("out/").
-    return artifact.coversOthers && region.id.startsWith(artifact.id)
-  }
-  const regionArtifact = region as Artifact
-  if (isPrefix(ref)) {
-    // A prefix inside the region artifact, or a prefix that covers it.
-    if (ref.id.startsWith(regionArtifact.id)) return true
-    return ref.covers(regionArtifact)
-  }
-  if (regionArtifact.covers(ref)) return true
-  return ref.coversOthers && ref.covers(regionArtifact)
-}
-
-/** Throws if `region` and `entry` belong to different tasks and overlap. */
-function assertOutputsApart(region: OutputEntry, entry: OutputEntry): void {
-  if (region.taskId === entry.taskId) return
-  if (!overlap(region.output, entry.output)) return
-  const fix = "give each writer its own folder, for example out/pages/ and out/index/"
-  const both = `'${entry.output.id}' of task '${entry.taskId}' and '${region.output.id}' of task '${region.taskId}'`
-  throw new Error(`two tasks write into one region: outputs ${both} overlap; ${fix}`)
 }
 
 /** True when each value is a string or null. A stamp map from an older record is not. */
