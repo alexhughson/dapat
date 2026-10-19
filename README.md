@@ -4,7 +4,7 @@ dapat is a build tool for TypeScript on Bun. As in `make`, you declare tasks, an
 
 Inspired by [doit](https://github.com/pydoit/doit)
 
-Inputs and outputs can be files. They can also be S3 objects, database rows, or values in memory. dapat wraps each input and output in a subclass of `Artifact`. The subclass gives dapat a stamp: a string that changes when the thing changes, for example a hash. dapat includes artifact classes for files, S3 objects, and SQLite rows and tables. For anything else, write a small subclass.
+Inputs and outputs can be files. They can also be S3 objects, database rows, or values in memory. dapat wraps each input and output in a subclass of `Artifact`. The subclass gives dapat a stamp: a string that changes when the thing changes, for example a hash. dapat includes artifact classes for files and S3 objects. For anything else, write a small subclass.
 
 When you run a build, dapat does these things:
 
@@ -108,7 +108,7 @@ if (!result.success) {
 | Import          | Contents                                                                                                                                  |
 | --------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
 | `dapat`         | the engine: `Build`, `Task`, `Artifact`, `Prefix`, `MemoryStore`, `Result`, `Emitter`                                                     |
-| `dapat/contrib` | `FileArtifact`, `DirectoryArtifact`, `S3ObjectArtifact`, `SqliteRowArtifact`, `SqliteTableArtifact`. Stores that write to JSON or SQLite. |
+| `dapat/contrib` | `FileArtifact`, `DirectoryArtifact`, `S3ObjectArtifact`. Stores that write to JSON or SQLite. |
 
 
 

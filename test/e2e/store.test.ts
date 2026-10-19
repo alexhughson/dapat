@@ -183,6 +183,50 @@ describe("stores", () => {
     db.close()
   })
 
+  test("a SqliteStore opened again from its file lets a task skip, and an input change makes it run", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "dapat-sqlstore-"))
+    temps.push(dir)
+    const storePath = path.join(dir, "state.sqlite")
+    const src = new FileArtifact(path.join(dir, "src.txt"))
+    const out = new FileArtifact(path.join(dir, "out.txt"))
+    await writeFile(src.path, "hello")
+    let runs = 0
+
+    const runOnce = async () => {
+      const store = new SqliteStore(storePath)
+      const build = new Build({ store })
+      build.add(
+        new Task({
+          id: "upper",
+          inputs: [src],
+          outputs: [out],
+          run: async () => {
+            runs += 1
+            const text = new TextDecoder().decode(await src.read())
+            await writeFile(out.path, text.toUpperCase())
+          },
+        }),
+      )
+      const result = await build.run()
+      store.close()
+      return result
+    }
+
+    const first = await runOnce()
+    expect(first.executed.length).toBe(1)
+    expect(await Bun.file(out.path).text()).toBe("HELLO")
+
+    const second = await runOnce()
+    expect(second.skipped.length).toBe(1)
+    expect(runs).toBe(1)
+
+    await writeFile(src.path, "hi")
+    const third = await runOnce()
+    expect(third.executed.length).toBe(1)
+    expect(runs).toBe(2)
+    expect(await Bun.file(out.path).text()).toBe("HI")
+  })
+
   test("JsonStore get reads whole files while set writes", async () => {
     const dir = await mkdtemp(path.join(tmpdir(), "dapat-json-"))
     temps.push(dir)
