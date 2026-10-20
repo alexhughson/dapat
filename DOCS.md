@@ -825,7 +825,7 @@ If `Templates` sends `gone` for `{ lang: "fr" }`, `build.each` removes `page:fr/
 
 - A **shared var name** is a var name that two matchers both have. In the example, `lang`.
 - A **joined set** has one matched artifact of each matcher. Each shared var name has the same value in all of them. Every matcher must have a match in the set, unless it is not in `required` ([`required`](#required-matchers-that-a-set-can-do-without)). A page with no template of its `lang` is in no set.
-- `vars` of a joined set holds all the vars of all its matched artifacts. The order is the order of the names in `matchersByName`, and then the `varNames` order of each matcher. A var name comes one time, at its first place.
+- `vars` of a joined set holds all the vars of all its matched artifacts. The order is the order of the names in `matchersByName`, and then the `varNames` order of each matcher. A var name comes one time, at its first place. A var of a matcher that is not required is not in `vars` when the set has no match of it ([`required`](#required-matchers-that-a-set-can-do-without)).
 - `matched.<name>` is the matched artifact of the matcher `<name>`, with the data type of that matcher. It is `undefined` for a matcher that is not required and has no match in the set.
 - Each joined set has one task group. Its label is `build.each <number> <var name>=<var value> ...`, in the order of `vars`.
 
@@ -849,54 +849,93 @@ A matcher event that comes while `build.each` handles another one waits. It come
 
 ### `required`: matchers that a set can do without
 
-By default, a joined set needs a match of each matcher. Sometimes a task can use a thing when it exists, and work without it when it does not. For example, a page uses a review when one exists. Put the names of the matchers that each set must have in `required`:
+By default, a joined set needs a match of each matcher. Sometimes a task can use a thing when it exists, and work without it when it does not. For example, a page uses its reviews when they exist. Put the names of the matchers that each set must have in `required`:
 
 ```ts
 build.each({
-  matchersByName: { page: new Pages(), template: new Templates(), review: new Reviews() },
-  required: ["page", "template"],
+  matchersByName: { page: new Pages(), review: new Reviews() },
+  required: ["page"],
   *tasks(vars, matched) {
-    const inputs: Ref[] = [matched.page.data, matched.template.data]
+    const name = `${vars.lang}/${vars.slug}.${vars.reviewer ?? "nobody"}`
+    const inputs: Ref[] = [matched.page.data]
     if (matched.review !== undefined) {
       inputs.push(matched.review.data)
     }
-    yield new Task({ id: `page:${vars.lang}/${vars.slug}`, inputs, outputs: [new FileArtifact(`site/${vars.lang}/${vars.slug}.html`)], run: async () => {} })
+    yield new Task({ id: `page:${name}`, inputs, outputs: [new FileArtifact(`site/${name}.html`)], run: async () => {} })
   },
 })
 ```
 
-`Pages` and `Templates` are the matchers of [the first example](#example-pages-joined-to-a-template). `Reviews` is a matcher like `Templates`, with the `varNames` `lang` and `slug`, that finds `reviews/<lang>/<slug>.json`. With these files:
+`Pages` is the matcher of [the first example](#example-pages-joined-to-a-template), with the `varNames` `lang` and `slug`. `Reviews` is a matcher like `Templates`, with the `varNames` `lang`, `slug`, and `reviewer`, that finds `reviews/<lang>/<slug>/<reviewer>.json`. `review` is not required. It joins each page like a LEFT JOIN in SQL:
+
+- A page with reviews has one joined set for each of its reviews.
+- A page with no review has one joined set. In it, `matched.review` is `undefined`, and `vars.reviewer` is `undefined`.
+
+With these files:
 
 ```
-content/en/hello.md
 content/en/about.md
-templates/en.html
-reviews/en/hello.json
+content/en/hello.md
+reviews/en/about/ann.json
+reviews/en/about/bob.json
 ```
 
-`build.each` makes two joined sets:
+`build.each` makes three joined sets:
 
-| Joined set | `matched.page` | `matched.template` | `matched.review` |
+| Joined set | `vars` | `matched.page` | `matched.review` |
 | --- | --- | --- | --- |
-| `build.each 1 lang=en slug=hello` | `content/en/hello.md` | `templates/en.html` | `reviews/en/hello.json` |
-| `build.each 1 lang=en slug=about` | `content/en/about.md` | `templates/en.html` | `undefined` |
+| `build.each 1 lang=en slug=about reviewer=ann` | `{ lang: "en", slug: "about", reviewer: "ann" }` | `content/en/about.md` | `reviews/en/about/ann.json` |
+| `build.each 1 lang=en slug=about reviewer=bob` | `{ lang: "en", slug: "about", reviewer: "bob" }` | `content/en/about.md` | `reviews/en/about/bob.json` |
+| `build.each 1 lang=en slug=hello` | `{ lang: "en", slug: "hello" }` | `content/en/hello.md` | `undefined` |
 
-Without `required`, `about` has no review, so it has no set and no task. With `required`, it has a set, and `matched.review` is `undefined`.
+Each set has its own task group, and the label has each var that has a value. Two sets cannot give one task id, so put `vars.reviewer` in the task id, as the example does.
+
+Without `required`, `hello` has no review, so it has no set and no task.
+
+The sets change when the reviews change. Start with `content/en/hello.md` and no review:
+
+1. The set `lang=en slug=hello` has `matched.review === undefined`.
+2. `Reviews` sends `found` for `{ lang: "en", slug: "hello", reviewer: "ann" }`. `build.each` removes the set with no review, and its tasks. Then it adds the set `reviewer=ann`.
+3. `Reviews` sends `found` for `reviewer: "bob"`. `build.each` adds the set `reviewer=bob`. The set `reviewer=ann` does not change.
+4. `Reviews` sends `gone` for `reviewer: "bob"`. `build.each` removes the set `reviewer=bob`.
+5. `Reviews` sends `gone` for `reviewer: "ann"`. `build.each` removes the set `reviewer=ann`, and adds the set with no review again.
+
+A review of a page that does not exist makes no set. It waits, and joins the page when the page is found.
+
+A matcher that is not required and has only var names that the required matchers have is simpler. Each set has one match of it, or none. Its found and gone keep the set, and replace its tasks in the same task group. For example, a `branch` matcher with only `lang` gives each page the branch of its `lang`, or `undefined`. A matcher with no var names is in every set.
 
 On the first run, `tasks` can run more than one time for one set, for example when the scan finds the page before its review. Each set ends with one task list, and no task starts before the scans finish.
 
-If `Reviews` sends `found` for `{ lang: "en", slug: "about" }`, the review joins the `about` set. `build.each` calls `tasks` again for that set, and replaces its tasks. The `hello` set does not change. If `Reviews` then sends `gone` for it, `matched.review` is `undefined` again, and `build.each` replaces the tasks of the `about` set again. The set stays, because its required matchers still have their matches.
+#### Several matchers that are not required: the order of the names
 
-These are the rules:
+The matchers that are not required join one after the other, in the order of their names in `matchersByName`, like SQL with several LEFT JOINs. Each one joins on every var that the set already has: the vars of the required matchers, and the vars of the earlier matchers that have a match in the set. Each of its matches that agrees makes one set. If no match agrees, it is `undefined` in the set, and it adds no var.
+
+When two of them have different var names of their own, the sets are each pair of their matches. A page with 2 reviews (`reviewer`) and 2 comments (`commenter`) has 4 sets. A page with 2 reviews and no comment has 2 sets, with `matched.comment === undefined`.
+
+When two of them share a var name that no required matcher has, the order of the names changes the sets. Example: `review` and `rating` both have `lang`, `slug`, and `reviewer`. `en/about` has a review from ann and a rating from bob. It has no rating from ann.
+
+| Names in `matchersByName` | Joined sets of `en/about` |
+| --- | --- |
+| `{ page, review, rating }` | one set: `reviewer=ann`, `matched.review` is the review of ann, `matched.rating` is `undefined` |
+| `{ page, rating, review }` | one set: `reviewer=bob`, `matched.rating` is the rating of bob, `matched.review` is `undefined` |
+
+In the first order, `review` joins first and sets `reviewer` to `ann`. The rating of bob does not agree. In the second order, `rating` joins first and sets `reviewer` to `bob`. **So if you change the order of the names, the tasks can change.** Put the matcher that sets the var first.
+
+#### The rules
 
 - **If you leave `required` out, every matcher is required.** This is the behavior of a `build.each` with no `required`.
-- **A matcher that is not required can use only var names that a required matcher has.** So each joined set has one match of it, or none. It never adds a set. `Reviews` with the var `author` in the example above is an error, because no required matcher has `author`. A matcher with no var names is valid: every set gets its one match.
-- **The required matchers must form one connected group by shared var names.** A matcher that is not required does not connect them. In the example, `page` and `template` share `lang`.
+- **The required matchers must form one connected group by shared var names.** A matcher that is not required does not connect them.
 - **`required` must name at least one matcher, and each name must be a name in `matchersByName`.** A set needs a required match, so `required: []` is an error.
 
-TypeScript knows which matched artifacts can be `undefined`, when `required` is one literal list. `matched.page` is a `MatchedArtifact`. `matched.review` is a `MatchedArtifact` or `undefined`, so you must check it before you read `matched.review.data`. If `required` has a wider type, for example `cond ? ["page", "review"] : ["page"]` or a variable of type `("page" | "review")[]`, TypeScript treats every name in that type as required. Then check for `undefined` yourself. TypeScript does not check the var name rule or an empty list. `build.each` checks them when you call it.
+#### Types
 
-`build.each` keeps an index of the joined sets for each matcher that is not required, by its var names. A found or gone of such a match looks up its sets in that index, and changes only those sets. A matcher that is not required and has no var names is in every set, so each of its found and gone events changes every set.
+The `vars` argument of `tasks` has the type `Readonly<Record<string, string | undefined>>`. A var of a matcher that is not required is `undefined` in a set with no match of it. TypeScript does not know the var names, so **a var of a required matcher also needs a check or `!`**, for example `vars.lang!`. In a template string, as in `` `page:${vars.slug}` ``, you need no check.
+
+TypeScript knows which matched artifacts can be `undefined`, when `required` is one literal list. `matched.page` is a `MatchedArtifact`. `matched.review` is a `MatchedArtifact` or `undefined`, so you must check it before you read `matched.review.data`. If `required` has a wider type, for example `cond ? ["page", "review"] : ["page"]` or a variable of type `("page" | "review")[]`, TypeScript treats every name in that type as required. Then check for `undefined` yourself. TypeScript does not check an empty list. `build.each` checks it when you call it.
+
+#### Cost
+
+`build.each` keeps an index of the required joins for each matcher that is not required, by the var names that it shares with the required matchers. A found or gone of such a match looks up its required joins in that index. For each one, it runs the left joins again over the matches of that join only, and changes only the sets that are different. A matcher that is not required and has no var names is in every set, so each of its found and gone events changes every set.
 
 ### Example with one matcher
 
@@ -1125,7 +1164,6 @@ An error in `build.each` is fatal for the build, as a subscriber error is. The `
 | `build.each` | the required matchers do not form one connected group by shared var names | `build.each` throws, and names the matchers that do not connect |
 | `build.each` | `required` is `[]` | `build.each` throws |
 | `build.each` | `required` has a name that is not in `matchersByName` | `build.each` throws, and names it |
-| `build.each` | a matcher that is not required has a var name that no required matcher has | `build.each` throws, and names the matcher and those var names |
 | `build.each` | one matcher object is under two names | `build.each` throws |
 | `build.each` | you call it after `build.run()` | `build.each` throws |
 | `build.each` | one of its matchers is used by another `Build` | `build.each` throws, and names the matcher |
@@ -1335,7 +1373,7 @@ new Build(opts?: { store?: Store; sendLimit?: number })
 | `remove(id: string): void` | Removes a task. Aborts it if it is running and sends a `withdrawn` event for each declared output. Does not throw when a subscriber throws. Starts to delete its store record. Does not wait for the delete, but `run()` does. A delete error goes into `result.errors`. Does nothing if the id is not known. The other tasks of the same task group stay. |
 | `subscribe(listener: (event: ArtifactEvent) => void): void` | From `Emitter`. Calls `listener` synchronously for each artifact event, in the order of the event queue. Does not replay earlier events. See [section 9](#9-subscribe-to-artifact-events). |
 | `protected setTasks(group: TaskGroup, tasks: readonly Task[]): void` | Makes `tasks` the tasks of `group` ([Task groups](#task-groups)). Adds each new id, replaces each known id, and removes each id that `group` had before and does not get now. Changes all state first, then puts the events on the queue: all `withdrawn` events of the call first, then the `promised` events, by id in list order. A dropped task ends as `cancelled` with the reason `"removed"` if it had not finished. Throws and changes nothing if another group has one of the ids, if `tasks` has one id two times, or if two tasks declare one exact output. `add(task)` calls it with one group for each task id. `build.each` calls it with one group for each match. A subclass of `Build` can call it with its own `new TaskGroup(label)`. |
-| `each<M extends Record<string, AnyMatcher>, const R extends keyof M & string = keyof M & string>(config: TaskMaterializerConfig<M, R>): void` | Makes tasks for each joined set of matched artifacts ([section 10](#10-buildeach-tasks-for-each-matched-artifact)). TypeScript gets `R` from `required`. Subscribes to each matcher in `matchersByName`, joins their matches on shared var names, and gives the tasks of each joined set through `setTasks`, with one task group for each set, labeled `build.each <number> <var name>=<var value> ...`. The build sends each artifact event to `matcher.receiveArtifactEvent`, one time for each matcher. An error in `tasks` or in a matched artifact is fatal for the build, like a subscriber error. Throws if `matchersByName` has no matcher, if one matcher object is under two names, if `required` is empty or has a name that is not in `matchersByName`, if a matcher that is not required has a var name that no required matcher has, if its required matchers do not form one connected group by shared var names, if `run()` has started, or if another `Build` uses a matcher. |
+| `each<M extends Record<string, AnyMatcher>, const R extends keyof M & string = keyof M & string>(config: TaskMaterializerConfig<M, R>): void` | Makes tasks for each joined set of matched artifacts ([section 10](#10-buildeach-tasks-for-each-matched-artifact)). TypeScript gets `R` from `required`. Subscribes to each matcher in `matchersByName`, joins their matches on shared var names, and gives the tasks of each joined set through `setTasks`, with one task group for each set, labeled `build.each <number> <var name>=<var value> ...`. The build sends each artifact event to `matcher.receiveArtifactEvent`, one time for each matcher. An error in `tasks` or in a matched artifact is fatal for the build, like a subscriber error. Throws if `matchersByName` has no matcher, if one matcher object is under two names, if `required` is empty or has a name that is not in `matchersByName`, if its required matchers do not form one connected group by shared var names, if `run()` has started, or if another `Build` uses a matcher. |
 | `run(): Promise<Result>` | The first time, sends a `promised` event for each output of each task that is in the build, and then runs the scan of each matcher and waits for all of them. A call during the scans waits for the same scans. Then starts every task and resolves when every started task has finished. Does not reject when a task fails. Rejects with the first subscriber error, `build.each` error, scan error, or send-limit error of the build, at once if that error happened before the call ([section 9](#subscriber-errors)). After a scan error, no task starts. |
 
 ### `class TaskGroup`
@@ -1543,7 +1581,7 @@ The vars of a matched artifact are its key. A `found` with known vars and new da
 type TaskMaterializerConfig<M extends Record<string, AnyMatcher>, R extends keyof M & string = keyof M & string> = {
   matchersByName: M
   required?: readonly R[]
-  tasks: (vars: Vars, matched: MatchedByName<M, R>) => Iterable<Task>
+  tasks: (vars: Readonly<Record<string, string | undefined>>, matched: MatchedByName<M, R>) => Iterable<Task>
 }
 
 type MatchedByName<M extends Record<string, AnyMatcher>, R extends keyof M & string = keyof M & string> = {
@@ -1551,9 +1589,9 @@ type MatchedByName<M extends Record<string, AnyMatcher>, R extends keyof M & str
 }
 ```
 
-`R` is the names in `required`. If you leave `required` out, `R` is every name, so no matched artifact is `undefined`. A matcher that is not in `R` can be `undefined` in `matched`, and it can use only var names that a matcher in `R` has. `required` must name at least one matcher. See [`required`](#required-matchers-that-a-set-can-do-without).
+`R` is the names in `required`. If you leave `required` out, `R` is every name, so no matched artifact is `undefined`. A matcher that is not in `R` can be `undefined` in `matched`. It left-joins onto the matchers in `R`, after the earlier matchers that are not in `R`, in name order. Each of its matches that agrees makes its own joined set. `required` must name at least one matcher. See [`required`](#required-matchers-that-a-set-can-do-without).
 
-`AnyMatcher` is `Matcher<any>`: a matcher of any data type. Each matched artifact has the data type of its own matcher: `DataOf` reads `D` from the matcher type. `matchersByName` must have at least one entry, and its required matchers must form one connected group by shared var names. `tasks` gets the vars of one joined set, which hold the vars of all its matches, and each matched artifact under its matcher's name. See [The `build.each` config](#the-buildeach-config).
+`AnyMatcher` is `Matcher<any>`: a matcher of any data type. Each matched artifact has the data type of its own matcher: `DataOf` reads `D` from the matcher type. `matchersByName` must have at least one entry, and its required matchers must form one connected group by shared var names. `tasks` gets the vars of one joined set, which hold the vars of all its matches (a var of a matcher with no match in the set is `undefined`), and each matched artifact under its matcher's name. See [The `build.each` config](#the-buildeach-config).
 
 ## Filesystem (`dapat/contrib`)
 

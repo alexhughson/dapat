@@ -1,7 +1,7 @@
 import type { Artifact } from "./artifact"
 import type { AnyMatcher, DataOf } from "./matcher"
 import type { MatchedArtifact, MatchedArtifactEvent, MatchedData, Vars } from "./matched-artifact"
-import { JoinIndex, MatchTable, joinFrom, planJoins, type JoinStep, type JoinedSet, type StoredMatch } from "./match-join"
+import { JoinIndex, MatchTable, joinFrom, planJoins, type BaseSet, type JoinStep, type JoinedSet, type StoredMatch } from "./match-join"
 import type { Task } from "./task"
 import { TaskGroup } from "./task-group"
 
@@ -18,18 +18,38 @@ export type TaskMaterializerConfig<M extends Record<string, AnyMatcher>, R exten
   matchersByName: M
   /**
    * The matchers that each joined set must have a match of. Left out: every matcher.
-   * Each other matcher can use only var names of these, and is undefined in a set where it has no match.
+   * Each other matcher left-joins onto them, in name order, and is undefined in a set where it has no match.
    */
   required?: readonly R[]
-  /** Gives the tasks for one joined set of matches. It can give any number of tasks. */
-  tasks: (vars: Vars, matched: MatchedByName<M, R>) => Iterable<Task>
+  /**
+   * Gives the tasks for one joined set of matches. It can give any number of tasks.
+   * A var of a matcher that is not required is undefined when the set has no match of it.
+   */
+  tasks: (vars: Readonly<Record<string, string | undefined>>, matched: MatchedByName<M, R>) => Iterable<Task>
 }
 
 type SetTasks = (group: TaskGroup, tasks: readonly Task[]) => void
 
+/** A matcher that is not required, and how it finds the base sets that its matches can join. */
+type OptionalMatcher = {
+  table: MatchTable
+  // Its var names that a required matcher has, in its varNames order.
+  sharedVarNames: readonly string[]
+  // Every base set, by the values of sharedVarNames. A base set is here also while this matcher has no match for it.
+  baseIndex: JoinIndex<BaseSet>
+}
+
+/** One branch of the chain of left joins of a base set. */
+type Branch = {
+  vars: Record<string, string>
+  optionalMembersByName: Map<string, StoredMatch>
+}
+
 /**
  * A materialized view of the matches: listens to the found and gone events of its matchers,
  * joins their matches on shared var names, and keeps one task list in the build for each joined set.
+ * The required matchers join to base sets. The matchers that are not required left-join onto
+ * each base set, one after the other in name order, so a base set can have several joined sets.
  * Each joined set has one task group, so `setTasks` replaces the tasks
  * of a set that changes and removes the tasks of a set that is gone.
  * The build never calls `hear` while another `hear` runs (see build.each).
@@ -38,9 +58,8 @@ export class TaskMaterializer<M extends Record<string, AnyMatcher>, R extends ke
   private readonly tablesByName = new Map<string, MatchTable>()
   // For each required matcher: the join steps from one of its matches to the other required matchers.
   private readonly joinStepsByName: Map<string, JoinStep[]>
-  // For each matcher that is not required: every joined set, by the values of that matcher's var names.
-  // A set is here also while that matcher has no match for it, so a later found finds the set.
-  private readonly setIndexesByOptionalName = new Map<string, JoinIndex<JoinedSet>>()
+  // In name order.
+  private readonly optionalMatchersByName = new Map<string, OptionalMatcher>()
   // The var names of all matchers: in name order, then varNames order, each one time.
   private readonly unionVarNames: string[] = []
 
@@ -87,33 +106,25 @@ export class TaskMaterializer<M extends Record<string, AnyMatcher>, R extends ke
         optionalTables.push(table)
       }
     }
-    // A matcher that is not required has no var of its own, so it has at most one match for
-    // each joined set, and it never adds sets. A matcher with no var has the same match for every set.
     for (const table of optionalTables) {
-      const extraVarNames: string[] = []
+      const sharedVarNames: string[] = []
       for (const varName of table.varNames) {
-        if (!requiredVarNames.has(varName)) extraVarNames.push(varName)
+        if (requiredVarNames.has(varName)) sharedVarNames.push(varName)
       }
-      if (extraVarNames.length > 0) {
-        throw new Error(
-          `build.each ${number}: matcher '${table.name}' is not required, so it can use only var names of the required matchers; ` +
-            `it also has [${extraVarNames.join(", ")}]`,
-        )
-      }
-      table.addIndex(table.varNames)
-      this.setIndexesByOptionalName.set(table.name, new JoinIndex(table.varNames))
+      table.addIndex(sharedVarNames)
+      this.optionalMatchersByName.set(table.name, { table, sharedVarNames, baseIndex: new JoinIndex(sharedVarNames) })
     }
     this.joinStepsByName = planJoins(requiredTables, number)
   }
 
   hear(matcherName: string, event: MatchedArtifactEvent): void {
     const table = this.tablesByName.get(matcherName)!
-    const optionalSetIndex = this.setIndexesByOptionalName.get(matcherName)
+    const optional = this.optionalMatchersByName.get(matcherName)
     if (event.kind === "gone") {
-      if (optionalSetIndex === undefined) {
+      if (optional === undefined) {
         this.hearGone(table, event.vars)
       } else {
-        this.hearOptionalGone(table, event.vars)
+        this.hearOptionalGone(optional, event.vars)
       }
       return
     }
@@ -132,73 +143,153 @@ export class TaskMaterializer<M extends Record<string, AnyMatcher>, R extends ke
     }
     const stored: StoredMatch = { matched: found, artifactIds, sets: new Set() }
     table.put(stored)
-    if (optionalSetIndex !== undefined) {
-      // The sets exist without this match. It joins each of them.
-      for (const set of optionalSetIndex.lookup(found.vars)) {
-        set.membersByName.set(matcherName, stored)
-        stored.sets.add(set)
-        this.giveTasks(set)
+    if (optional !== undefined) {
+      for (const base of optional.baseIndex.lookup(found.vars)) {
+        base.optionalMatchesByName.get(matcherName)!.add(stored)
+        this.refreshJoinedSets(base)
       }
       return
     }
     const joinSteps = this.joinStepsByName.get(matcherName)!
     for (const joined of joinFrom(table, stored, joinSteps)) {
-      const varEntries: [string, string][] = []
-      for (const varName of this.unionVarNames) {
-        varEntries.push([varName, joined.vars[varName]!])
+      const vars: Vars = joined.vars
+      const base: BaseSet = {
+        vars,
+        requiredMembersByName: joined.membersByName,
+        optionalMatchesByName: new Map(),
+        joinedSetsByVarsKey: new Map(),
       }
-      // fromEntries makes each var an own property, also a var named __proto__.
-      const vars: Vars = Object.fromEntries(varEntries)
-      const set: JoinedSet = { vars, membersByName: joined.membersByName, group: new TaskGroup(this.labelOf(vars)) }
-      for (const [optionalName, setIndex] of this.setIndexesByOptionalName) {
-        setIndex.add(vars, set)
-        const optionalTable = this.tablesByName.get(optionalName)!
-        for (const optionalMatch of optionalTable.lookup(optionalTable.varNames, vars)) {
-          set.membersByName.set(optionalName, optionalMatch)
+      for (const [optionalName, optionalMatcher] of this.optionalMatchersByName) {
+        optionalMatcher.baseIndex.add(vars, base)
+        const matches = optionalMatcher.table.lookup(optionalMatcher.sharedVarNames, vars)
+        base.optionalMatchesByName.set(optionalName, new Set(matches))
+      }
+      this.refreshJoinedSets(base)
+    }
+  }
+
+  /** Forgets the match of a required matcher and removes each base set that holds it, with its joined sets. */
+  private hearGone(table: MatchTable, vars: Vars): void {
+    const gone = table.get(vars)
+    if (gone === undefined) return
+    table.delete(gone)
+    const goneBases = new Set<BaseSet>()
+    for (const set of gone.sets) {
+      goneBases.add(set.base)
+    }
+    for (const base of goneBases) {
+      for (const optionalMatcher of this.optionalMatchersByName.values()) {
+        optionalMatcher.baseIndex.delete(base.vars, base)
+      }
+      for (const set of base.joinedSetsByVarsKey.values()) {
+        this.removeJoinedSet(set)
+      }
+    }
+  }
+
+  /** Forgets the match of a matcher that is not required. Each base set that could join it stays, and gets new joined sets. */
+  private hearOptionalGone(optional: OptionalMatcher, vars: Vars): void {
+    const gone = optional.table.get(vars)
+    if (gone === undefined) return
+    optional.table.delete(gone)
+    for (const base of optional.baseIndex.lookup(gone.matched.vars)) {
+      base.optionalMatchesByName.get(optional.table.name)!.delete(gone)
+      this.refreshJoinedSets(base)
+    }
+  }
+
+  /**
+   * Runs the chain of left joins of the base set again, and makes its joined sets the result.
+   * Each matcher that is not required, in name order, joins each branch on every var that the branch has.
+   * Each match that agrees makes one branch. With no match that agrees, the matcher is undefined
+   * in the branch and adds no var. Then: a set with the same vars and the same matches does not change.
+   * A set with the same vars and other matches gets new tasks in its group. A set with new vars gets a new
+   * group. A set whose vars are gone is removed, first, so that a new set can give the same task id.
+   */
+  private refreshJoinedSets(base: BaseSet): void {
+    let branches: Branch[] = [{ vars: { ...base.vars }, optionalMembersByName: new Map() }]
+    for (const [optionalName, optionalMatcher] of this.optionalMatchersByName) {
+      const matches = base.optionalMatchesByName.get(optionalName)!
+      const longerBranches: Branch[] = []
+      for (const branch of branches) {
+        let joinedOne = false
+        for (const match of matches) {
+          let agrees = true
+          for (const varName of optionalMatcher.table.varNames) {
+            if (Object.hasOwn(branch.vars, varName) && branch.vars[varName] !== match.matched.vars[varName]) agrees = false
+          }
+          if (!agrees) continue
+          joinedOne = true
+          const optionalMembersByName = new Map(branch.optionalMembersByName)
+          optionalMembersByName.set(optionalName, match)
+          longerBranches.push({ vars: { ...branch.vars, ...match.matched.vars }, optionalMembersByName })
         }
+        if (!joinedOne) longerBranches.push(branch)
       }
-      for (const member of set.membersByName.values()) {
+      branches = longerBranches
+    }
+
+    const branchesByVarsKey = new Map<string, Branch>()
+    for (const branch of branches) {
+      const values: (string | null)[] = []
+      for (const varName of this.unionVarNames) {
+        values.push(Object.hasOwn(branch.vars, varName) ? branch.vars[varName]! : null)
+      }
+      branchesByVarsKey.set(JSON.stringify(values), branch)
+    }
+    for (const [varsKey, set] of base.joinedSetsByVarsKey) {
+      if (!branchesByVarsKey.has(varsKey)) this.removeJoinedSet(set)
+    }
+    for (const [varsKey, branch] of branchesByVarsKey) {
+      const membersByName = new Map(base.requiredMembersByName)
+      for (const [optionalName, match] of branch.optionalMembersByName) {
+        membersByName.set(optionalName, match)
+      }
+      let set = base.joinedSetsByVarsKey.get(varsKey)
+      if (set === undefined) {
+        const varEntries: [string, string][] = []
+        for (const varName of this.unionVarNames) {
+          if (Object.hasOwn(branch.vars, varName)) varEntries.push([varName, branch.vars[varName]!])
+        }
+        // fromEntries makes each var an own property, also a var named __proto__.
+        const vars: Vars = Object.fromEntries(varEntries)
+        set = { base, varsKey, vars, membersByName, group: new TaskGroup(this.labelOf(vars)) }
+        base.joinedSetsByVarsKey.set(varsKey, set)
+      } else {
+        let sameMembers = set.membersByName.size === membersByName.size
+        for (const [name, member] of membersByName) {
+          if (set.membersByName.get(name) !== member) sameMembers = false
+        }
+        if (sameMembers) continue
+        for (const member of set.membersByName.values()) {
+          member.sets.delete(set)
+        }
+        set.membersByName = membersByName
+      }
+      for (const member of membersByName.values()) {
         member.sets.add(set)
       }
       this.giveTasks(set)
     }
   }
 
-  /** Forgets the match of a required matcher and removes the tasks of each joined set that holds it. */
-  private hearGone(table: MatchTable, vars: Vars): void {
-    const gone = table.get(vars)
-    if (gone === undefined) return
-    table.delete(gone)
-    for (const set of gone.sets) {
-      for (const member of set.membersByName.values()) {
-        if (member !== gone) member.sets.delete(set)
-      }
-      for (const setIndex of this.setIndexesByOptionalName.values()) {
-        setIndex.delete(set.vars, set)
-      }
-      this.setTasks(set.group, [])
+  /** Removes the tasks of the set, and the set from its base set and from each of its matches. */
+  private removeJoinedSet(set: JoinedSet): void {
+    for (const member of set.membersByName.values()) {
+      member.sets.delete(set)
     }
+    set.base.joinedSetsByVarsKey.delete(set.varsKey)
+    this.setTasks(set.group, [])
   }
 
-  /** Forgets the match of a matcher that is not required. Each set that held it stays, without it, and gets new tasks. */
-  private hearOptionalGone(table: MatchTable, vars: Vars): void {
-    const gone = table.get(vars)
-    if (gone === undefined) return
-    table.delete(gone)
-    for (const set of gone.sets) {
-      set.membersByName.delete(table.name)
-      this.giveTasks(set)
-    }
-  }
-
-  /** The join keys in the indexes of all matchers and of the joined sets. 0 when no match is left. */
+  /** The join keys in the indexes of all matchers and of the base sets. 0 when no match is left. */
   get joinKeyCount(): number {
     let count = 0
     for (const table of this.tablesByName.values()) {
       count += table.joinKeyCount
     }
-    for (const setIndex of this.setIndexesByOptionalName.values()) {
-      count += setIndex.joinKeyCount
+    for (const optionalMatcher of this.optionalMatchersByName.values()) {
+      count += optionalMatcher.baseIndex.joinKeyCount
     }
     return count
   }
@@ -218,11 +309,11 @@ export class TaskMaterializer<M extends Record<string, AnyMatcher>, R extends ke
     this.setTasks(set.group, tasks)
   }
 
-  /** `build.each <number> <name>=<value> ...`, in unionVarNames order. Only for error messages. */
+  /** `build.each <number> <name>=<value> ...`, for each var of the set, in unionVarNames order. Only for error messages. */
   private labelOf(vars: Vars): string {
     const parts: string[] = [`build.each ${this.number}`]
     for (const name of this.unionVarNames) {
-      parts.push(`${name}=${vars[name]}`)
+      if (Object.hasOwn(vars, name)) parts.push(`${name}=${vars[name]}`)
     }
     return parts.join(" ")
   }

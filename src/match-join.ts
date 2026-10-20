@@ -17,12 +17,28 @@ export type StoredMatch = {
 }
 
 /**
- * One match of each required matcher, where the var names that two matchers share have the same values.
- * A matcher that is not required is in the set only while it has a match with the vars of the set.
+ * One result of the join of the required matchers: one match of each, where the var names that
+ * two of them share have the same values. The matchers that are not required left-join onto it.
  */
-export type JoinedSet = {
-  // The vars of all its matches, in the union var name order of the build.each.
+export type BaseSet = {
+  // The vars of its required matches.
   vars: Vars
+  requiredMembersByName: Map<string, StoredMatch>
+  // For each matcher that is not required: its current matches that agree with `vars`. Empty when it has none.
+  optionalMatchesByName: Map<string, Set<StoredMatch>>
+  // The joined sets that the chain of left joins gives now, by the JSON of their vars in union order.
+  joinedSetsByVarsKey: Map<string, JoinedSet>
+}
+
+/** A base set with the matches that the left joins add to it. It has the task group. */
+export type JoinedSet = {
+  base: BaseSet
+  // Its key in base.joinedSetsByVarsKey.
+  varsKey: string
+  // The vars of all its matches, in the union var name order of the build.each.
+  // A var of a matcher that is not required and has no match in the set is not here.
+  vars: Vars
+  // A matcher that is not required is not here when the set has no match of it.
   membersByName: Map<string, StoredMatch>
   group: TaskGroup
 }
@@ -30,7 +46,7 @@ export type JoinedSet = {
 /**
  * Items by the values of some var names. A MatchTable keeps its matches in these indexes,
  * so a changed match of another matcher finds its partners here. A matcher that is not
- * required keeps the joined sets in one, by its own var names.
+ * required keeps the base sets in one, by the var names that it shares with the required matchers.
  */
 export class JoinIndex<T> {
   private readonly itemsByJoinKey = new Map<JoinKey, Set<T>>()
