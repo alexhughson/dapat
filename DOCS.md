@@ -912,7 +912,7 @@ The matchers that are not required join one after the other, in the order of the
 
 The **ON vars** of a matcher that is not required are its var names that a required matcher or an earlier matcher that is not required has. `build.each` finds them one time, when you call it. A match joins a set only when the set has a value for each ON var, and the values are equal. Each match that joins makes one set, and adds its other vars to it. If no match joins, the matcher is `undefined` in the set, and it adds no var.
 
-A set that has no value for an ON var joins no match, as NULL equals nothing in SQL. Example: `page` has `slug` and is required. `comment` has `slug` and `author`. `info` has `author`. Both are not required, in the order `{ page, comment, info }`. The ON vars of `info` are `author`, from `comment`.
+A set that has no value for an ON var joins no match, as NULL equals nothing in SQL. Example: `page` has `slug` and is required. `comment` has `slug` and `author`. `info` has `author`. Both are not required, in the order `{ page, comment, info }`. The ON vars of `info` are `author`, from `comment`. There is one info, for ann. If two earlier matchers both have an ON var, a set has only one value for it, because the later matcher joined on it.
 
 | Page | Its comments | Its joined sets |
 | --- | --- | --- |
