@@ -3,7 +3,7 @@ import { mkdtemp, rm, writeFile, mkdir } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import path from "node:path"
 import { Build, Task } from "../../src/index"
-import { DirectoryArtifact, FileArtifact, PathPrefix } from "../../contrib/fs"
+import { FileArtifact, FilesystemPrefix } from "../../contrib/fs"
 import { JsonStore, SqliteStore } from "../../contrib/store"
 
 const temps: string[] = []
@@ -116,7 +116,7 @@ describe("filesystem artifacts", () => {
     expect(runs).toBe(1)
   })
 
-  test("directory listing waits for writers and reruns when the directory changes", async () => {
+  test("a folder listing waits for writers and reruns when the folder changes", async () => {
     const root = await tempDir()
     const outDir = path.join(root, "out")
     const zipPath = path.join(root, "bundle.txt")
@@ -132,7 +132,7 @@ describe("filesystem artifacts", () => {
     const runOnce = async () => {
       const foo = new FileArtifact(path.join(outDir, "foo.txt"))
       const bar = new FileArtifact(path.join(outDir, "bar.txt"))
-      const listing = new DirectoryArtifact(outDir)
+      const listing = new FilesystemPrefix(outDir)
       const zip = new FileArtifact(zipPath)
       const build = new Build({ store })
       build.add(
@@ -164,7 +164,7 @@ describe("filesystem artifacts", () => {
           outputs: [zip],
           run: async () => {
             zips += 1
-            const names = await listing.read()
+            const names = await listing.list()
             names.sort()
             const parts: string[] = []
             for (const filePath of names) {
@@ -209,7 +209,7 @@ describe("filesystem artifacts", () => {
     build.add(
       new Task({
         id: "write-log",
-        outputs: [new PathPrefix(outDir)],
+        outputs: [new FilesystemPrefix(outDir)],
         run: async (ctx) => {
           await writeFile(logPath, "{\"ok\":true}")
           ctx.produced(new FileArtifact(logPath))

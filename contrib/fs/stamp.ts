@@ -11,7 +11,7 @@ import { hashLines, sha256Hex } from "../hash"
  */
 export type FileStampMode = "time" | "hash"
 
-/** The options that `file()`, `directory()`, and `pathPrefix()` accept. */
+/** The options that `FileArtifact` and `FilesystemPrefix` accept. */
 export interface FileStampOptions {
   stamp?: FileStampMode
 }

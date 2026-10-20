@@ -4,7 +4,7 @@ import { tmpdir } from "node:os"
 import path from "node:path"
 import { Build, IdPrefix, Task } from "../../src/index"
 import type { Result } from "../../src/index"
-import { DirectoryArtifact, FileArtifact, PathPrefix, directory, file, pathPrefix } from "../../contrib/fs"
+import { FileArtifact, FilesystemPrefix } from "../../contrib/fs"
 import type { FileStampMode } from "../../contrib/fs"
 import { JsonStore } from "../../contrib/store"
 
@@ -38,7 +38,7 @@ async function buildIndex(root: string, store: JsonStore): Promise<Result> {
   build.add(
     new Task({
       id: "index",
-      inputs: [new PathPrefix(pagesDir)],
+      inputs: [new FilesystemPrefix(pagesDir)],
       outputs: [index],
       run: async () => {
         const names = await readdir(pagesDir)
@@ -56,7 +56,7 @@ async function buildIndex(root: string, store: JsonStore): Promise<Result> {
 }
 
 describe("prefix stamps", () => {
-  test("a PathPrefix input sees pages that are added, edited, and deleted", async () => {
+  test("a FilesystemPrefix input sees pages that are added, edited, and deleted", async () => {
     const root = await tempDir()
     const pagesDir = path.join(root, "pages")
     await mkdir(pagesDir)
@@ -91,7 +91,7 @@ describe("prefix stamps", () => {
     expect(ids(last.skipped)).toEqual(["index"])
   })
 
-  test("a PathPrefix output runs again when files under it are deleted by hand", async () => {
+  test("a FilesystemPrefix output runs again when files under it are deleted by hand", async () => {
     const root = await tempDir()
     const docPath = path.join(root, "doc.txt")
     const outDir = path.join(root, "out")
@@ -100,20 +100,20 @@ describe("prefix stamps", () => {
     let runs = 0
 
     const runOnce = async () => {
-      const doc = file(docPath)
+      const doc = new FileArtifact(docPath)
       const build = new Build({ store })
       build.add(
         new Task({
           id: "split",
           inputs: [doc],
-          outputs: [pathPrefix(outDir)],
+          outputs: [new FilesystemPrefix(outDir)],
           run: async (ctx) => {
             runs += 1
             const text = new TextDecoder().decode(await doc.read())
             const lines = text.split("\n")
             await mkdir(outDir, { recursive: true })
             for (let i = 0; i < lines.length; i++) {
-              const page = file(path.join(outDir, `${i + 1}.txt`))
+              const page = new FileArtifact(path.join(outDir, `${i + 1}.txt`))
               await writeFile(page.path, lines[i]!)
               ctx.produced(page)
             }
@@ -148,8 +148,8 @@ describe("prefix stamps", () => {
       build.add(
         new Task({
           id: "copy",
-          inputs: [file(srcPath), new IdPrefix("mem:pages/")],
-          outputs: [file(outPath)],
+          inputs: [new FileArtifact(srcPath), new IdPrefix("mem:pages/")],
+          outputs: [new FileArtifact(outPath)],
           run: async () => {
             runs += 1
             await writeFile(outPath, "x")
@@ -190,40 +190,6 @@ describe("prefix stamps", () => {
     expect(ids(next.skipped)).toEqual(["index"])
   })
 
-  test("a prefix and an artifact with the same id keep separate stamps in the record", async () => {
-    const root = await tempDir()
-    const dir = path.join(root, "pages")
-    await mkdir(dir)
-    await writeFile(path.join(dir, "a.md"), "A")
-    const store = new JsonStore(path.join(root, "state.json"))
-    const prefix = new PathPrefix(dir)
-    const listing = new DirectoryArtifact(dir)
-    expect(prefix.id).toBe(listing.id)
-
-    const runOnce = async () => {
-      const build = new Build({ store })
-      build.add(
-        new Task({
-          id: "read",
-          inputs: [prefix, listing],
-          outputs: [file(path.join(root, "out.txt"))],
-          run: async () => {
-            await writeFile(path.join(root, "out.txt"), "x")
-          },
-        }),
-      )
-      return build.run()
-    }
-
-    await runOnce()
-    const record = await store.get("read")
-    const keys = Object.keys(record!.inputStamps)
-    keys.sort()
-    expect(keys).toEqual([`artifact ${listing.id}`, `prefix ${prefix.id}`])
-    const second = await runOnce()
-    expect(second.skipped.length).toBe(1)
-  })
-
   test("a task with no inputs runs on every build, also with a prefix output", async () => {
     const root = await tempDir()
     const rawDir = path.join(root, "raw")
@@ -235,7 +201,7 @@ describe("prefix stamps", () => {
       build.add(
         new Task({
           id: "fetch",
-          outputs: [pathPrefix(rawDir)],
+          outputs: [new FilesystemPrefix(rawDir)],
           run: async () => {
             runs += 1
             await mkdir(rawDir, { recursive: true })
@@ -268,8 +234,8 @@ describe("prefix layouts that overlap", () => {
       build.add(
         new Task({
           id: "index",
-          inputs: [pathPrefix(pagesDir)],
-          outputs: [file(indexPath)],
+          inputs: [new FilesystemPrefix(pagesDir)],
+          outputs: [new FileArtifact(indexPath)],
           run: async () => {
             runs += 1
             const names = await readdir(pagesDir)
@@ -299,7 +265,7 @@ describe("prefix layouts that overlap", () => {
     expect(runs).toBe(3)
   })
 
-  test("a directory() input that covers the output of its own task also runs on every build", async () => {
+  test("a new FilesystemPrefix() input whose list() includes the output of its own task also runs on every build", async () => {
     const root = await tempDir()
     const pagesDir = path.join(root, "pages")
     const indexPath = path.join(pagesDir, "index.html")
@@ -309,16 +275,16 @@ describe("prefix layouts that overlap", () => {
     let runs = 0
 
     const runOnce = async () => {
-      const pages = directory(pagesDir)
+      const pages = new FilesystemPrefix(pagesDir)
       const build = new Build({ store })
       build.add(
         new Task({
           id: "index",
           inputs: [pages],
-          outputs: [file(indexPath)],
+          outputs: [new FileArtifact(indexPath)],
           run: async () => {
             runs += 1
-            const files = await pages.read()
+            const files = await pages.list()
             // One more "#" on each run, so the size changes even inside one clock tick.
             const marks = "#".repeat(runs)
             await writeFile(indexPath, `${files.length} ${marks}`)
@@ -356,8 +322,8 @@ describe("prefix layouts that overlap", () => {
       build.add(
         new Task({
           id: "split",
-          inputs: [file(path.join(root, "book.txt"))],
-          outputs: [pathPrefix(outDir)],
+          inputs: [new FileArtifact(path.join(root, "book.txt"))],
+          outputs: [new FilesystemPrefix(outDir)],
           run: async () => {
             runs.push("split")
             await mkdir(outDir, { recursive: true })
@@ -368,8 +334,8 @@ describe("prefix layouts that overlap", () => {
       build.add(
         new Task({
           id: "index",
-          inputs: [file(pagePath)],
-          outputs: [file(indexPath)],
+          inputs: [new FileArtifact(pagePath)],
+          outputs: [new FileArtifact(indexPath)],
           run: async () => {
             runs.push("index")
             await writeFile(indexPath, `page.html ${marks}`)
@@ -379,8 +345,8 @@ describe("prefix layouts that overlap", () => {
       build.add(
         new Task({
           id: "list",
-          inputs: [pathPrefix(outDir)],
-          outputs: [file(listPath)],
+          inputs: [new FilesystemPrefix(outDir)],
+          outputs: [new FileArtifact(listPath)],
           run: async () => {
             runs.push("list")
             const names = await readdir(outDir)
@@ -407,6 +373,62 @@ describe("prefix layouts that overlap", () => {
     expect(ids(third.executed).toSorted()).toEqual(["index", "list", "split"])
   })
 
+  test("a folder input waits for a folder output in a subfolder", async () => {
+    const root = await tempDir()
+    const outDir = path.join(root, "out")
+    const subDir = path.join(outDir, "sub")
+    const listPath = path.join(root, "list.txt")
+    const runs: string[] = []
+
+    const build = new Build()
+    build.add(
+      new Task({
+        id: "top",
+        outputs: [new FilesystemPrefix(outDir)],
+        run: async () => {
+          runs.push("top")
+          await mkdir(outDir, { recursive: true })
+          await writeFile(path.join(outDir, "top.txt"), "top")
+        },
+      }),
+    )
+    build.add(
+      new Task({
+        id: "sub",
+        outputs: [new FilesystemPrefix(subDir)],
+        run: async () => {
+          // sub ends after top, so a reader that waits only for top misses sub/a.txt.
+          await Bun.sleep(20)
+          runs.push("sub")
+          await mkdir(subDir, { recursive: true })
+          await writeFile(path.join(subDir, "a.txt"), "a")
+        },
+      }),
+    )
+    const out = new FilesystemPrefix(outDir)
+    build.add(
+      new Task({
+        id: "list",
+        inputs: [out],
+        outputs: [new FileArtifact(listPath)],
+        run: async () => {
+          runs.push("list")
+          const names: string[] = []
+          for (const filePath of await out.list()) {
+            names.push(path.relative(outDir, filePath))
+          }
+          names.sort()
+          await writeFile(listPath, names.join(","))
+        },
+      }),
+    )
+
+    const result = await build.run()
+    expect(result.success).toBe(true)
+    expect(runs).toEqual(["top", "sub", "list"])
+    expect(await readFile(listPath, "utf8")).toBe(`sub${path.sep}a.txt,top.txt`)
+  })
+
   test("the split and index example settles when each writer has its own folder", async () => {
     const root = await tempDir()
     const bookPath = path.join(root, "book.txt")
@@ -416,19 +438,19 @@ describe("prefix layouts that overlap", () => {
     const store = new JsonStore(path.join(root, ".dapat", "state.json"))
 
     const runOnce = async () => {
-      const book = file(bookPath)
+      const book = new FileArtifact(bookPath)
       const build = new Build({ store })
       build.add(
         new Task({
           id: "split",
           inputs: [book],
-          outputs: [pathPrefix(pagesDir)],
+          outputs: [new FilesystemPrefix(pagesDir)],
           run: async (ctx) => {
             const text = new TextDecoder().decode(await book.read())
             const parts = text.split("\n---\n")
             await mkdir(pagesDir, { recursive: true })
             for (let i = 0; i < parts.length; i++) {
-              const page = file(path.join(pagesDir, `${i + 1}.md`))
+              const page = new FileArtifact(path.join(pagesDir, `${i + 1}.md`))
               await writeFile(page.path, parts[i]!)
               ctx.produced(page)
             }
@@ -438,8 +460,8 @@ describe("prefix layouts that overlap", () => {
       build.add(
         new Task({
           id: "index",
-          inputs: [pathPrefix(pagesDir)],
-          outputs: [file(indexPath)],
+          inputs: [new FilesystemPrefix(pagesDir)],
+          outputs: [new FileArtifact(indexPath)],
           run: async () => {
             const names = await readdir(pagesDir)
             names.sort()
@@ -466,13 +488,14 @@ describe("prefix layouts that overlap", () => {
 })
 
 describe("folder walks", () => {
-  test("a missing folder has a stamp; a file where a folder must be fails the task", async () => {
+  test("a missing folder has a stamp and lists no files; a file where a folder must be fails the task", async () => {
     const root = await tempDir()
     const pagesPath = path.join(root, "pages")
-    const missing = await pathPrefix(pagesPath).stamp()
+    const missing = await new FilesystemPrefix(pagesPath).stamp()
     expect(missing).not.toBeNull()
+    expect(await new FilesystemPrefix(pagesPath).list()).toEqual([])
     await mkdir(pagesPath)
-    expect(await pathPrefix(pagesPath).stamp()).toBe(missing)
+    expect(await new FilesystemPrefix(pagesPath).stamp()).toBe(missing)
     await rm(pagesPath, { recursive: true })
 
     await writeFile(pagesPath, "a file, not a folder")
@@ -481,8 +504,8 @@ describe("folder walks", () => {
     build.add(
       new Task({
         id: "index",
-        inputs: [pathPrefix(pagesPath)],
-        outputs: [file(path.join(root, "index.html"))],
+        inputs: [new FilesystemPrefix(pagesPath)],
+        outputs: [new FileArtifact(path.join(root, "index.html"))],
         run: async () => {},
       }),
     )
@@ -494,9 +517,9 @@ describe("folder walks", () => {
 
   test("a FileArtifact whose path is a folder throws from stamp", async () => {
     const root = await tempDir()
-    expect(file(root).stamp()).rejects.toThrow(`not a file: ${root}`)
-    expect(file(root, { stamp: "hash" }).stamp()).rejects.toThrow(`not a file: ${root}`)
-    expect(await file(path.join(root, "none.txt")).stamp()).toBeNull()
+    expect(new FileArtifact(root).stamp()).rejects.toThrow(`not a file: ${root}`)
+    expect(new FileArtifact(root, { stamp: "hash" }).stamp()).rejects.toThrow(`not a file: ${root}`)
+    expect(await new FileArtifact(path.join(root, "none.txt")).stamp()).toBeNull()
   })
 
   test("symlinks under a prefix: a file link counts as its target, a folder link is walked, a loop stops", async () => {
@@ -512,7 +535,7 @@ describe("folder walks", () => {
     await symlink(pagesDir, path.join(pagesDir, "loop"))
     await symlink(path.join(root, "nothing"), path.join(pagesDir, "broken.md"))
 
-    const listing = await directory(pagesDir).read()
+    const listing = await new FilesystemPrefix(pagesDir).list()
     const names: string[] = []
     for (const filePath of listing) {
       names.push(path.relative(pagesDir, filePath))
@@ -526,10 +549,10 @@ describe("folder walks", () => {
       build.add(
         new Task({
           id: "count",
-          inputs: [pathPrefix(pagesDir)],
-          outputs: [file(path.join(root, "count.txt"))],
+          inputs: [new FilesystemPrefix(pagesDir)],
+          outputs: [new FileArtifact(path.join(root, "count.txt"))],
           run: async () => {
-            const files = await directory(pagesDir).read()
+            const files = await new FilesystemPrefix(pagesDir).list()
             await writeFile(path.join(root, "count.txt"), String(files.length))
           },
         }),
@@ -561,14 +584,14 @@ describe("folder walks", () => {
     await symlink(path.join(pagesDir, "ping"), path.join(pagesDir, "pong"))
     await symlink(path.join(root, "plain.txt", "inside"), path.join(pagesDir, "through-file"))
 
-    const listing = await directory(pagesDir).read()
+    const listing = await new FilesystemPrefix(pagesDir).list()
     expect(listing).toEqual([path.join(pagesDir, "a.md")])
-    expect(await pathPrefix(pagesDir).stamp()).not.toBeNull()
+    expect(await new FilesystemPrefix(pagesDir).stamp()).not.toBeNull()
 
     // The prefix root itself is a link loop. That is an error, not a missing folder.
     const loopRoot = path.join(root, "loop-root")
     await symlink(loopRoot, loopRoot)
-    expect(pathPrefix(loopRoot).stamp()).rejects.toThrow("ELOOP")
+    expect(new FilesystemPrefix(loopRoot).stamp()).rejects.toThrow("ELOOP")
   })
 
   test('stamp "hash" streams a large file and gets the same hash as the bytes', async () => {
@@ -581,7 +604,7 @@ describe("folder walks", () => {
     await writeFile(bigPath, bytes)
     const hasher = new Bun.CryptoHasher("sha256")
     hasher.update(bytes)
-    expect(await file(bigPath, { stamp: "hash" }).stamp()).toBe(hasher.digest("hex"))
+    expect(await new FileArtifact(bigPath, { stamp: "hash" }).stamp()).toBe(hasher.digest("hex"))
   })
 })
 
@@ -599,8 +622,8 @@ describe("file stamp modes", () => {
     store: JsonStore,
     mode: FileStampMode,
   ): Promise<Result> {
-    const src = file(path.join(root, "src.txt"), { stamp: mode })
-    const out = file(path.join(root, "out.txt"), { stamp: mode })
+    const src = new FileArtifact(path.join(root, "src.txt"), { stamp: mode })
+    const out = new FileArtifact(path.join(root, "out.txt"), { stamp: mode })
     const build = new Build({ store })
     build.add(
       new Task({
@@ -639,7 +662,7 @@ describe("file stamp modes", () => {
     expect(second.skipped.length).toBe(1)
   })
 
-  test('stamp "hash" on a PathPrefix: the same bytes let the task skip', async () => {
+  test('stamp "hash" on a FilesystemPrefix: the same bytes let the task skip', async () => {
     const root = await tempDir()
     const pagesDir = path.join(root, "pages")
     await mkdir(pagesDir)
@@ -651,8 +674,8 @@ describe("file stamp modes", () => {
       build.add(
         new Task({
           id: "count",
-          inputs: [pathPrefix(pagesDir, { stamp: mode })],
-          outputs: [file(path.join(root, "count.txt"), { stamp: mode })],
+          inputs: [new FilesystemPrefix(pagesDir, { stamp: mode })],
+          outputs: [new FileArtifact(path.join(root, "count.txt"), { stamp: mode })],
           run: async () => {
             const names = await readdir(pagesDir)
             await writeFile(path.join(root, "count.txt"), String(names.length))
@@ -675,6 +698,6 @@ describe("file stamp modes", () => {
 
   test("an unknown stamp mode throws", () => {
     const bad = { stamp: "md5" } as unknown as { stamp: FileStampMode }
-    expect(() => file("x.txt", bad)).toThrow('stamp must be "time" or "hash", not "md5"')
+    expect(() => new FileArtifact("x.txt", bad)).toThrow('stamp must be "time" or "hash", not "md5"')
   })
 })

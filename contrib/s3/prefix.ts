@@ -40,7 +40,3 @@ export class S3Prefix extends Prefix {
     return hashLines(lines)
   }
 }
-
-export function s3Prefix(client: S3Client, bucket: string, keyPrefix: string): S3Prefix {
-  return new S3Prefix(client, bucket, keyPrefix)
-}

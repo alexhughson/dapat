@@ -24,7 +24,3 @@ export class S3ObjectArtifact extends Artifact<Uint8Array> {
     return this.client.get(this.bucket, this.key)
   }
 }
-
-export function s3Object(client: S3Client, bucket: string, key: string): S3ObjectArtifact {
-  return new S3ObjectArtifact(client, bucket, key)
-}
