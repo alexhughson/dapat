@@ -25,7 +25,7 @@ When you run a **build**, dapat does these steps for each task:
 
 dapat does not know about disks or SQL. It only reads artifact ids and stamps. The adapters in `dapat/contrib` supply files, S3, and stores in JSON and SQLite.
 
-You declare tasks with `Build` and `Task`. You can know each task in advance, or your code can decide which tasks to add. Sections 3 to 9 describe this. `build.each` makes tasks for you from the things that a matcher finds ([section 10](#10-buildeach-task-materializered-artifact)).
+You declare tasks with `Build` and `Task`. You can know each task in advance, or your code can decide which tasks to add. Sections 3 to 9 describe this. `build.each` makes tasks for you from the things that a matcher finds ([section 10](#10-buildeach-tasks-for-each-matched-artifact)).
 
 ## 2. Install and import
 
@@ -274,7 +274,7 @@ new Task({
 
 The task `id` must be unique in a build. The store uses the task `id` as its key, so use an id that stays the same from run to run.
 
-Each task in a build has one owner. `build.add(task)` gives the task the owner `add:<task id>`, so a replacement with the same id has the same owner. `build.each` makes tasks under its own owners ([section 10](#10-buildeach-task-materializered-artifact)). A task id can have only one owner, so `build.add` throws if `build.each` already made a task with the same id. `build.remove(id)` removes the task from its owner, and the owner can give the same id again later. For `build.add` and `build.remove`, owners change nothing else.
+Each task in a build has one owner. `build.add(task)` gives the task the owner `add:<task id>`, so a replacement with the same id has the same owner. `build.each` makes tasks under its own owners ([section 10](#10-buildeach-tasks-for-each-matched-artifact)). A task id can have only one owner, so `build.add` throws if `build.each` already made a task with the same id. `build.remove(id)` removes the task from its owner, and the owner can give the same id again later. For `build.add` and `build.remove`, owners change nothing else.
 
 The task writes its outputs itself. dapat does not write, move, or delete files. When a task deletes an artifact, it reports the delete with `ctx.deleted(artifact)`.
 
@@ -1123,7 +1123,7 @@ new Build(opts?: { store?: Store; sendLimit?: number })
 | `remove(id: string): void` | Removes a task. Aborts it if it is running and sends a `withdrawn` event for each declared output. Does not throw when a subscriber throws. Starts to delete its store record. Does not wait for the delete, but `run()` does. A delete error goes into `result.errors`. Does nothing if the id is not known. The other tasks of the same owner stay. |
 | `subscribe(listener: (event: ArtifactEvent) => void): void` | From `Emitter`. Calls `listener` synchronously for each artifact event, in the order of the event queue. Does not replay earlier events. See [section 9](#9-subscribe-to-artifact-events). |
 | `protected setTasks(owner: string, tasks: readonly Task[]): void` | Makes `tasks` the tasks of `owner` ([section 5](#5-tasks-and-dependencies)). Adds each new id, replaces each known id, and removes each id that `owner` gave before and does not give now. Changes all state first, then puts the events on the queue: all `withdrawn` events of the call first, then the `promised` events, by id in list order. A dropped task ends as `cancelled` with the reason `"removed"` if it had not finished. Throws and changes nothing if another owner has one of the ids, if `tasks` has one id two times, or if two tasks declare one exact output. `add(task)` calls `setTasks("add:" + task.id, [task])`. `build.each` calls it; your code does not. |
-| `each<M extends Record<string, AnyMatcher>>(config: TaskMaterializerConfig<M>): void` | Makes tasks for each matched artifact ([section 10](#10-buildeach-task-materializered-artifact)). Subscribes to the one matcher in `matchersByName` and gives the tasks of each match through `setTasks`, with the owner `<number>:<var values>`. The build sends each artifact event to `matcher.receiveArtifactEvent`, one time for each matcher. An error in `tasks` or in a matched artifact is fatal for the build, like a subscriber error. Throws if `matchersByName` does not have exactly one matcher, if `run()` has started, or if another `Build` uses the matcher. |
+| `each<M extends Record<string, AnyMatcher>>(config: TaskMaterializerConfig<M>): void` | Makes tasks for each matched artifact ([section 10](#10-buildeach-tasks-for-each-matched-artifact)). Subscribes to the one matcher in `matchersByName` and gives the tasks of each match through `setTasks`, with the owner `<number>:<var values>`. The build sends each artifact event to `matcher.receiveArtifactEvent`, one time for each matcher. An error in `tasks` or in a matched artifact is fatal for the build, like a subscriber error. Throws if `matchersByName` does not have exactly one matcher, if `run()` has started, or if another `Build` uses the matcher. |
 | `run(): Promise<Result>` | The first time, sends a `promised` event for each output of each task that is in the build, and then runs the scan of each matcher and waits for all of them. A call during the scans waits for the same scans. Then starts every task and resolves when every started task has finished. Does not reject when a task fails. Rejects with the first subscriber error, `build.each` error, scan error, or send-limit error of the build, at once if that error happened before the call ([section 9](#subscriber-errors)). After a scan error, no task starts. |
 
 ### `class Task`
@@ -1299,7 +1299,7 @@ abstract class Matcher<D extends MatchedData = MatchedData> extends Emitter<Matc
 
 A matcher belongs to one `Build`.
 
-See [section 10](#10-buildeach-task-materializered-artifact).
+See [section 10](#10-buildeach-tasks-for-each-matched-artifact).
 
 ### `type Vars`, `type MatchedData`, `type MatchedArtifact`, and `type MatchedArtifactEvent`
 
