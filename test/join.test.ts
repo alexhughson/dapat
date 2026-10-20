@@ -1181,7 +1181,35 @@ describe("build.each: one step of task changes for each drain of the event queue
     expect(sortedIds(result.executed)).toEqual(["copy:out:page/a", "copy:out:page/b", "copy:out:rev/a/ann", "draft", "page:a"])
   })
 
-  test("a build.each that feeds itself through promised outputs stops at the send limit", async () => {
+  test("a chain of three rules with more events in one drain than sendLimit passes when each pass is under it", async () => {
+    const sources: Mem[] = []
+    for (let i = 0; i < 30; i++) {
+      sources.push(new Mem(`src:${i}`, "S"))
+    }
+    const build = new Build({ sendLimit: 50 })
+    // Each rule promises one output for each match: src -> mid -> out -> done. 90 promised events, 30 in each pass.
+    const stages: [string, string][] = [
+      ["src:", "mid:"],
+      ["mid:", "out:"],
+      ["out:", "done:"],
+    ]
+    for (const [from, to] of stages) {
+      const scanned = from === "src:" ? sources : []
+      build.each({
+        matchersByName: { item: new PathMatcher(from, ["i"], scanned) },
+        *tasks(vars) {
+          yield new Task({ id: `${to}${vars.i}`, outputs: [new Mem(`${to}${vars.i}`)], run: async () => {} })
+        },
+      })
+    }
+
+    const result = await build.run()
+
+    expect(result.success).toBe(true)
+    expect(result.executed.length).toBe(90)
+  })
+
+  test("a build.each that feeds itself through promised outputs stops at the limit of passes", async () => {
     const turns = new PathMatcher("turn:", ["n"], [new Mem("turn:0", "0")])
     const build = new Build({ sendLimit: 50 })
     build.each({
@@ -1192,7 +1220,7 @@ describe("build.each: one step of task changes for each drain of the event queue
       },
     })
 
-    await expect(build.run()).rejects.toThrow("send limit: subscribers caused 50 events in one drain")
+    await expect(build.run()).rejects.toThrow("send limit: 50 passes in one drain, and more task changes wait")
   })
 
   test("build.add during the scans of an id that a set of the scans gives rejects run(), and names both groups", async () => {

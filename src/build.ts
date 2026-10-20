@@ -35,9 +35,6 @@ type MatcherHearer = {
   matcherName: string
 }
 
-/** The events that one drain sent, the number that were in the queue when it started, and if it has its own step. */
-type SendCounts = { initial: number; sent: number; ownStep: boolean }
-
 type MatchEventToHear = MatcherHearer & { event: MatchedArtifactEvent }
 
 class Slot {
@@ -455,18 +452,23 @@ export class Build extends Emitter<ArtifactEvent> {
     this.draining = true
     try {
       // The open step of the scans or of a matcher event belongs to its opener, which applies it.
-      // The limit counts only the events that subscribers cause, not the events that started the drain.
-      const counts: SendCounts = { initial: this.queue.length, sent: 0, ownStep: this.pendingTasksByGroup === null }
-      if (!counts.ownStep) {
-        this.sendQueue(counts)
+      if (this.pendingTasksByGroup !== null) {
+        this.sendQueue()
         return
       }
       // One step for each pass over the queue: the task changes of all the events of the pass.
       // The events of those changes then make the next pass, until no change is left.
+      // A build.each that feeds itself makes a pass for each round, so the passes have a limit too.
+      let passes = 0
       let changed = true
       while (changed && this.fatal === null) {
+        if (passes >= this.sendLimit) {
+          this.fail(new Error(`send limit: ${passes} passes in one drain, and more task changes wait; a build.each can feed itself`))
+          return
+        }
+        passes += 1
         this.pendingTasksByGroup = new Map()
-        this.sendQueue(counts)
+        this.sendQueue()
         changed = this.closeOpenStep()
       }
     } finally {
@@ -474,7 +476,11 @@ export class Build extends Emitter<ArtifactEvent> {
     }
   }
 
-  private sendQueue(counts: SendCounts): void {
+  /** Sends the queue until it is empty: one pass of a drain. */
+  private sendQueue(): void {
+    // The limit counts only the events that subscribers cause, not the events that started the pass.
+    const initial = this.queue.length
+    let sent = 0
     while (this.queue.length > 0) {
       const event = this.queue.shift()!
       try {
@@ -483,13 +489,11 @@ export class Build extends Emitter<ArtifactEvent> {
         this.fail(toError(error))
         return
       }
-      counts.sent += 1
-      const caused = counts.sent - counts.initial
-      // The changes of the step of this drain make more events when the drain applies them.
-      const moreWait = this.queue.length > 0 || (counts.ownStep && this.pendingTasksByGroup !== null && this.pendingTasksByGroup.size > 0)
-      if (caused >= this.sendLimit && moreWait) {
+      sent += 1
+      const caused = sent - initial
+      if (caused >= this.sendLimit && this.queue.length > 0) {
         const message =
-          `send limit: subscribers caused ${caused} events in one drain, and more wait; ` +
+          `send limit: subscribers caused ${caused} events in one pass of a drain, and more wait; ` +
           `the last sent was '${eventLine(event).slice(0, 400)}'`
         this.fail(new Error(message))
         return
