@@ -513,7 +513,7 @@ describe("build.each errors", () => {
       },
     })
 
-    await expect(build.run()).rejects.toThrow("task 'same' has two owners: '1:a' and '1:b'")
+    await expect(build.run()).rejects.toThrow("task 'same' is in two groups: 'build.each 1 name=a' and 'build.each 1 name=b'")
   })
 
   test("a matcher that catches the error of its send cannot hide a build.each error", async () => {
@@ -533,7 +533,7 @@ describe("build.each errors", () => {
       },
     })
 
-    await expect(build.run()).rejects.toThrow("task 'same' has two owners: '1:a' and '1:b'")
+    await expect(build.run()).rejects.toThrow("task 'same' is in two groups: 'build.each 1 name=a' and 'build.each 1 name=b'")
   })
 
   test("a build.each error outside run() makes the next run() reject, even if the matcher catches it", async () => {

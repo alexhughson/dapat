@@ -5,6 +5,7 @@ import type { Prefix } from "./prefix"
 import { Task, isArtifact, isPrefix, type Context, type Ref } from "./task"
 import type { Store, TaskState } from "./store"
 import { Outcome, Result } from "./result"
+import { TaskGroup } from "./task-group"
 import { TaskMaterializer, type TaskMaterializerConfig } from "./task-materializer"
 
 export type ArtifactEvent =
@@ -37,8 +38,8 @@ class Slot {
 
   constructor(
     public task: Task,
-    // The owner that gave the task: `add:<task id>` for build.add.
-    public owner: string,
+    // The group that gave the task.
+    public group: TaskGroup,
   ) {}
 }
 
@@ -46,8 +47,10 @@ export class Build extends Emitter<ArtifactEvent> {
   private readonly store: Store | undefined
   private readonly sendLimit: number
   private readonly slots = new Map<string, Slot>()
-  // For each owner, the ids of the tasks that it gave. Slot.owner is the reverse.
-  private readonly owners = new Map<string, Set<string>>()
+  // For each group, the ids of its tasks. Slot.group is the reverse.
+  private readonly taskIdsByGroup = new Map<TaskGroup, Set<string>>()
+  // The group that build.add made for each task id. A replacement with the same id keeps its group.
+  private readonly addedTaskGroups = new Map<string, TaskGroup>()
   private readonly exactOutputs = new Map<string, { artifact: Artifact; taskId: string }>()
   // The prefix outputs of all tasks. The producer lookup scans them; exact outputs are in exactOutputs.
   private readonly prefixOutputs: PrefixOutput[] = []
@@ -90,14 +93,23 @@ export class Build extends Emitter<ArtifactEvent> {
   }
 
   add(task: Task): void {
-    this.setTasks(`add:${task.id}`, [task])
+    let group = this.addedTaskGroups.get(task.id)
+    if (group === undefined) {
+      group = new TaskGroup(`build.add ${task.id}`)
+      this.addedTaskGroups.set(task.id, group)
+    }
+    this.setTasks(group, [task])
   }
 
-  /** Removes the task from its owner. The owner's other tasks stay. */
+  /** Removes the task from its group. The other tasks of the group stay. */
   remove(id: string): void {
     const slot = this.slots.get(id)
     if (!slot) return
-    this.change(slot.owner, [], [slot])
+    // A group of build.add has one task, so it is now empty and a later add can make a new one.
+    if (this.addedTaskGroups.get(id) === slot.group) {
+      this.addedTaskGroups.delete(id)
+    }
+    this.change(slot.group, [], [slot])
   }
 
   /**
@@ -109,10 +121,10 @@ export class Build extends Emitter<ArtifactEvent> {
       throw new Error("build.each must come before the first build.run()")
     }
     const number = this.eachCount + 1
-    const taskMaterializer = new TaskMaterializer(number, config, (owner, tasks) => this.setTasks(owner, tasks))
+    const taskMaterializer = new TaskMaterializer(number, config, (group, tasks) => this.setTasks(group, tasks))
     const matcher = taskMaterializer.matcher
-    const owner = matcherBuilds.get(matcher)
-    if (owner !== undefined && owner !== this) {
+    const matcherBuild = matcherBuilds.get(matcher)
+    if (matcherBuild !== undefined && matcherBuild !== this) {
       throw new Error(`build.each ${number}: its matcher belongs to another Build; make a new matcher for each Build`)
     }
     this.eachCount = number
@@ -133,23 +145,23 @@ export class Build extends Emitter<ArtifactEvent> {
   }
 
   /**
-   * Makes `tasks` the tasks of `owner`. Adds each new id, replaces each known id,
-   * and removes each id that the owner gave before and does not give now.
-   * build.each calls it. Throws, with no change, if another owner has one of the ids.
+   * Makes `tasks` the tasks of `group`. Adds each new id, replaces each known id,
+   * and removes each id that the group had before and does not get now.
+   * build.add and build.each call it. Throws, with no change, if another group has one of the ids.
    */
-  protected setTasks(owner: string, tasks: readonly Task[]): void {
-    this.assertSettable(owner, tasks)
+  protected setTasks(group: TaskGroup, tasks: readonly Task[]): void {
+    this.assertSettable(group, tasks)
     const given = new Set<string>()
     for (const task of tasks) {
       given.add(task.id)
     }
     const dropped: Slot[] = []
-    const before = this.owners.get(owner) ?? new Set<string>()
+    const before = this.taskIdsByGroup.get(group) ?? new Set<string>()
     for (const id of before) {
       if (given.has(id)) continue
       dropped.push(this.slots.get(id)!)
     }
-    this.change(owner, tasks, dropped)
+    this.change(group, tasks, dropped)
   }
 
   /**
@@ -157,7 +169,7 @@ export class Build extends Emitter<ArtifactEvent> {
    * It changes the state, puts the events on the queue, and then ends the stopped tasks.
    * It drains the queue last.
    */
-  private change(owner: string, tasks: readonly Task[], dropped: readonly Slot[]): void {
+  private change(group: TaskGroup, tasks: readonly Task[], dropped: readonly Slot[]): void {
     const replaced: Slot[] = []
     // All withdrawn events of the call go before any promised event. Thus an output
     // that moves from one task to another in one call is withdrawn before it is promised.
@@ -180,14 +192,14 @@ export class Build extends Emitter<ArtifactEvent> {
         replaced.push(existing)
         before = outputsByKey(existing.task)
       }
-      this.slots.set(task.id, new Slot(task, owner))
+      this.slots.set(task.id, new Slot(task, group))
       this.index(task)
       const after = outputsByKey(task)
       addOutputEvents(withdrawn, "withdrawn", task.id, before, after)
       addOutputEvents(promised, "promised", task.id, after, before)
     }
 
-    const ids = new Set(this.owners.get(owner))
+    const ids = new Set(this.taskIdsByGroup.get(group))
     for (const slot of dropped) {
       ids.delete(slot.task.id)
     }
@@ -195,9 +207,9 @@ export class Build extends Emitter<ArtifactEvent> {
       ids.add(task.id)
     }
     if (ids.size === 0) {
-      this.owners.delete(owner)
+      this.taskIdsByGroup.delete(group)
     } else {
-      this.owners.set(owner, ids)
+      this.taskIdsByGroup.set(group, ids)
     }
     // An abort listener below can change tasks too. Its events must come after these.
     this.push(withdrawn)
@@ -365,20 +377,20 @@ export class Build extends Emitter<ArtifactEvent> {
     this.wake()
   }
 
-  /** Throws if `setTasks(owner, tasks)` would break a rule of the build. */
-  private assertSettable(owner: string, tasks: readonly Task[]): void {
+  /** Throws if `setTasks(group, tasks)` would break a rule of the build. */
+  private assertSettable(group: TaskGroup, tasks: readonly Task[]): void {
     const ids = new Set<string>()
     // Each exact output id in `tasks`, and the task that declares it.
     const claims = new Map<string, string>()
     for (const task of tasks) {
       if (ids.has(task.id)) {
-        throw new Error(`owner '${owner}' gives task '${task.id}' twice`)
+        throw new Error(`group '${group.label}' gives task '${task.id}' twice`)
       }
       ids.add(task.id)
       const existing = this.slots.get(task.id)
-      if (existing && existing.owner !== owner) {
+      if (existing && existing.group !== group) {
         throw new Error(
-          `task '${task.id}' has two owners: '${existing.owner}' and '${owner}'`,
+          `task '${task.id}' is in two groups: '${existing.group.label}' and '${group.label}'`,
         )
       }
       for (const output of task.outputs) {
@@ -393,9 +405,9 @@ export class Build extends Emitter<ArtifactEvent> {
           )
         }
         claims.set(output.id, task.id)
-        // The tasks of this owner are all replaced or removed, so their outputs are free.
+        // The tasks of this group are all replaced or removed, so their outputs are free.
         const claimer = this.exactOutputs.get(output.id)
-        if (claimer && this.slots.get(claimer.taskId)!.owner !== owner) {
+        if (claimer && this.slots.get(claimer.taskId)!.group !== group) {
           throw new Error(
             `duplicate output '${output.id}': claimed by '${claimer.taskId}' and '${task.id}'`,
           )

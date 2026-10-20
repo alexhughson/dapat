@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { Build, IdPrefix, MemoryStore, SEND_LIMIT, Task, isPrefix } from "../src/index"
+import { Build, IdPrefix, MemoryStore, SEND_LIMIT, Task, TaskGroup, isPrefix } from "../src/index"
 import type { Artifact, ArtifactEvent, Ref, TaskState } from "../src/index"
 import { Mem, MemPrefix } from "./mem"
 
@@ -1938,19 +1938,19 @@ describe("promised and withdrawn events", () => {
       const first = await build.run()
       expect(first.executed.length).toBe(10)
 
-      class Owner extends Build {
+      class GroupBuild extends Build {
         give(tasks: Task[]): void {
-          this.setTasks("owner", tasks)
+          this.setTasks(new TaskGroup("test"), tasks)
         }
       }
-      const owner = new Owner({ sendLimit: 3 })
-      await owner.run()
+      const groupBuild = new GroupBuild({ sendLimit: 3 })
+      await groupBuild.run()
       const tasks: Task[] = []
       for (let i = 0; i < 10; i++) {
         tasks.push(new Task({ id: `t${i}`, outputs: [new Mem(`mem:${i}`)], run: async () => {} }))
       }
-      owner.give(tasks)
-      const second = await owner.run()
+      groupBuild.give(tasks)
+      const second = await groupBuild.run()
       expect(second.executed.length).toBe(10)
     })
 

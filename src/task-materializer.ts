@@ -2,6 +2,7 @@ import type { Artifact } from "./artifact"
 import type { AnyMatcher, DataOf } from "./matcher"
 import type { MatchedArtifact, MatchedArtifactEvent, MatchedData, Vars } from "./matched-artifact"
 import type { Task } from "./task"
+import { TaskGroup } from "./task-group"
 
 /** What `tasks` gets: the matched artifact of each matcher, by name, with the data type of that matcher. */
 export type MatchedByName<M extends Record<string, AnyMatcher>> = {
@@ -15,19 +16,25 @@ export type TaskMaterializerConfig<M extends Record<string, AnyMatcher>> = {
   tasks: (vars: Vars, matched: MatchedByName<M>) => Iterable<Task>
 }
 
-type SetTasks = (owner: string, tasks: readonly Task[]) => void
+type SetTasks = (group: TaskGroup, tasks: readonly Task[]) => void
+
+/** The current match of one vars key. */
+type Match = {
+  group: TaskGroup
+  // A found event with the same artifact ids does nothing.
+  artifactIds: string
+}
 
 /**
  * A materialized view of the matches: listens to the found and gone events of its one matcher,
  * and keeps one task list in the build for each matched artifact.
- * Each match is one owner, `<number>:<vars key>`, so `setTasks` replaces the tasks
+ * Each match has one task group, so `setTasks` replaces the tasks
  * of a match that changes and removes the tasks of a match that is gone.
  */
 export class TaskMaterializer<M extends Record<string, AnyMatcher>> {
   readonly matcher: AnyMatcher
   private readonly matcherName: string
-  // The artifact ids of the current match of each owner. A found event with the same ids does nothing.
-  private readonly artifactIdsByOwner = new Map<string, string>()
+  private readonly matchesByVarsKey = new Map<string, Match>()
 
   constructor(
     readonly number: number,
@@ -44,15 +51,24 @@ export class TaskMaterializer<M extends Record<string, AnyMatcher>> {
 
   hear(event: MatchedArtifactEvent): void {
     if (event.kind === "gone") {
-      const owner = this.ownerOf(event.vars)
-      this.artifactIdsByOwner.delete(owner)
-      this.setTasks(owner, [])
+      const goneKey = this.varsKeyOf(event.vars)
+      const gone = this.matchesByVarsKey.get(goneKey)
+      if (gone === undefined) return
+      this.matchesByVarsKey.delete(goneKey)
+      this.setTasks(gone.group, [])
       return
     }
     const found = event.matched
-    const owner = this.ownerOf(found.vars)
+    const varsKey = this.varsKeyOf(found.vars)
     const artifactIds = artifactIdsOf(found.data)
-    if (this.artifactIdsByOwner.get(owner) === artifactIds) return
+    const current = this.matchesByVarsKey.get(varsKey)
+    let group: TaskGroup
+    if (current === undefined) {
+      group = new TaskGroup(this.labelOf(found.vars))
+    } else {
+      if (current.artifactIds === artifactIds) return
+      group = current.group
+    }
     // There is one matcher, so the object holds only its match.
     const matched = { [this.matcherName]: found } as MatchedByName<M>
     const tasks: Task[] = []
@@ -60,12 +76,12 @@ export class TaskMaterializer<M extends Record<string, AnyMatcher>> {
       tasks.push(task)
     }
     // Set before setTasks: its events can make the matcher find this artifact again.
-    this.artifactIdsByOwner.set(owner, artifactIds)
-    this.setTasks(owner, tasks)
+    this.matchesByVarsKey.set(varsKey, { group, artifactIds })
+    this.setTasks(group, tasks)
   }
 
-  /** `<number>:<values>`: the var values in varNames order, each URI-encoded, joined with "/". */
-  private ownerOf(vars: Vars): string {
+  /** The var values in varNames order, each URI-encoded, joined with "/". Throws if the var names are wrong. */
+  private varsKeyOf(vars: Vars): string {
     const varNames = this.matcher.varNames
     const given = Object.keys(vars)
     let sameNames = given.length === varNames.length
@@ -83,7 +99,16 @@ export class TaskMaterializer<M extends Record<string, AnyMatcher>> {
           `[${given.join(", ")}]; its varNames are [${varNames.join(", ")}]`,
       )
     }
-    return `${this.number}:${parts.join("/")}`
+    return parts.join("/")
+  }
+
+  /** `build.each <number> <name>=<value> ...`, in varNames order. Only for error messages. */
+  private labelOf(vars: Vars): string {
+    const parts: string[] = [`build.each ${this.number}`]
+    for (const name of this.matcher.varNames) {
+      parts.push(`${name}=${vars[name]}`)
+    }
+    return parts.join(" ")
   }
 }
 

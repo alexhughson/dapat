@@ -42,7 +42,7 @@ The package has two entry points:
 
 | Import | Contents |
 | --- | --- |
-| `dapat` | `Build`, `Task`, `Artifact`, `Prefix`, `IdPrefix`, `Matcher`, `MemoryStore`, `Result`, and their types |
+| `dapat` | `Build`, `TaskGroup`, `Task`, `Artifact`, `Prefix`, `IdPrefix`, `Matcher`, `MemoryStore`, `Result`, and their types |
 | `dapat/contrib` | `FileArtifact`, `FilesystemPrefix` (and the types `FileStampMode` and `FileStampOptions`), `S3ObjectArtifact`, `S3Prefix`, `MemoryS3` (and the types `S3Client`, `S3Head`, and `S3ListEntry`), `JsonStore`, and `SqliteStore` |
 
 ## 3. First build
@@ -274,9 +274,45 @@ new Task({
 
 The task `id` must be unique in a build. The store uses the task `id` as its key, so use an id that stays the same from run to run.
 
-Each task in a build has one owner. `build.add(task)` gives the task the owner `add:<task id>`, so a replacement with the same id has the same owner. `build.each` makes tasks under its own owners ([section 10](#10-buildeach-tasks-for-each-matched-artifact)). A task id can have only one owner, so `build.add` throws if `build.each` already made a task with the same id. `build.remove(id)` removes the task from its owner, and the owner can give the same id again later. For `build.add` and `build.remove`, owners change nothing else.
-
 The task writes its outputs itself. dapat does not write, move, or delete files. When a task deletes an artifact, it reports the delete with `ctx.deleted(artifact)`.
+
+### Task groups
+
+Each task in a build is in one task group. A group holds a list of tasks. The build replaces the list of a group as one unit.
+
+For example, this build has two `build.add` tasks and one `build.each` over two posts ([section 10](#10-buildeach-tasks-for-each-matched-artifact)):
+
+```ts
+build.add(lint)
+build.add(test)
+build.each({
+  matchersByName: { post: new Posts() }, // finds posts/a.md and posts/b.md
+  *tasks(vars, matched) {
+    yield new Task({ id: `page:${vars.slug}`, inputs: [matched.post.data], outputs: [/* ... */], run: async () => {} })
+  },
+})
+```
+
+The build has four task groups:
+
+| Group | Made by | Tasks |
+| --- | --- | --- |
+| `build.add lint` | `build.add(lint)` | `lint` |
+| `build.add test` | `build.add(test)` | `test` |
+| `build.each 1 slug=a` | the match of `posts/a.md` | `page:a` |
+| `build.each 1 slug=b` | the match of `posts/b.md` | `page:b` |
+
+Now you delete `posts/b.md`. The matcher sends `gone` with the vars `{ slug: "b" }`. `build.each` sets the task list of the group `build.each 1 slug=b` to an empty list. Thus the build removes `page:b`. The other three groups do not change.
+
+The rules:
+
+- Each task is in exactly one group.
+- A task id can be in only one group. Thus `build.add` throws if `build.each` already made a task with the same id.
+- `build.add(task)` makes one group for the task id. When you add the same id again, the replacement stays in the same group.
+- `build.each` makes one group for each match ([section 10](#10-buildeach-tasks-for-each-matched-artifact)).
+- `setTasks(group, tasks)` replaces the whole list of the group. It adds each new id, replaces each known id, and removes each id that it does not get again.
+- `build.remove(id)` removes the task from its group. The other tasks of the group stay, and the group can get the same id again later.
+- A group is an object, a `TaskGroup`. Its label is only for error messages. Two groups with the same label are two different groups. Thus two parts of your code cannot share a group only because they use the same label.
 
 ### What `build.run()` does
 
@@ -850,7 +886,7 @@ build.each({
 }
 ```
 
-Each match is one owner ([section 5](#5-tasks-and-dependencies)). The owner is `<number>:<var values>`, for example `1:hello`. dapat counts the `build.each` calls from 1, in order. Each var value is URI-encoded, and the values are joined with `/` in `varNames` order. A task id must be unique in the build. If two matches give one task id, or a match gives the id of a task that you added with `build.add`, `build.run()` rejects ([Errors in `build.each`](#errors-in-buildeach)). So put the vars in the task id, as `page:${vars.slug}` does.
+Each match has one task group ([Task groups](#task-groups)). The label of the group is `build.each <number> <var name>=<var value> ...`, for example `build.each 1 slug=hello`. dapat counts the `build.each` calls from 1, in order. The vars are in `varNames` order. A task id must be unique in the build. If two matches give one task id, or a match gives the id of a task that you added with `build.add`, `build.run()` rejects ([Errors in `build.each`](#errors-in-buildeach)). So put the vars in the task id, as `page:${vars.slug}` does.
 
 Call `build.each` before the first `build.run()`. After that, it throws.
 
@@ -922,7 +958,7 @@ An error in `build.each` is fatal for the build, as a subscriber error is. The `
 | `build.each` | its matcher is used by another `Build` | `build.each` throws |
 | a scan | the folder does not exist | `build.run()` rejects at once, and no task runs. The other scans get an aborted `signal`. `build.run()` does not wait for them. |
 | a matched artifact | its vars are not the `varNames` of its matcher | `build.run()` rejects |
-| `tasks` | two matches give one task id | `build.run()` rejects with `task 'x' has two owners: '1:a' and '1:b'` |
+| `tasks` | two matches give one task id | `build.run()` rejects with `task 'x' is in two groups: 'build.each 1 slug=a' and 'build.each 1 slug=b'` |
 | `tasks` | it throws | `build.run()` rejects with that error |
 
 Two limits remain:
@@ -1119,12 +1155,20 @@ new Build(opts?: { store?: Store; sendLimit?: number })
 
 | Member | Description |
 | --- | --- |
-| `add(task: Task): void` | Adds a task. If a task with the same id exists, replaces it (see [section 8](#replacement)). If `run()` has started, sends a `promised` event for each declared output, and the task starts at once. Does not throw when a subscriber throws ([section 9](#subscriber-errors)). Throws if another task already declares one of its exact outputs, if the task declares one output twice, or if another owner holds that id ([section 5](#5-tasks-and-dependencies)). Throws before it changes anything. |
-| `remove(id: string): void` | Removes a task. Aborts it if it is running and sends a `withdrawn` event for each declared output. Does not throw when a subscriber throws. Starts to delete its store record. Does not wait for the delete, but `run()` does. A delete error goes into `result.errors`. Does nothing if the id is not known. The other tasks of the same owner stay. |
+| `add(task: Task): void` | Adds a task. If a task with the same id exists, replaces it (see [section 8](#replacement)). If `run()` has started, sends a `promised` event for each declared output, and the task starts at once. Does not throw when a subscriber throws ([section 9](#subscriber-errors)). Throws if another task already declares one of its exact outputs, if the task declares one output twice, or if another task group has that id ([Task groups](#task-groups)). Throws before it changes anything. |
+| `remove(id: string): void` | Removes a task. Aborts it if it is running and sends a `withdrawn` event for each declared output. Does not throw when a subscriber throws. Starts to delete its store record. Does not wait for the delete, but `run()` does. A delete error goes into `result.errors`. Does nothing if the id is not known. The other tasks of the same task group stay. |
 | `subscribe(listener: (event: ArtifactEvent) => void): void` | From `Emitter`. Calls `listener` synchronously for each artifact event, in the order of the event queue. Does not replay earlier events. See [section 9](#9-subscribe-to-artifact-events). |
-| `protected setTasks(owner: string, tasks: readonly Task[]): void` | Makes `tasks` the tasks of `owner` ([section 5](#5-tasks-and-dependencies)). Adds each new id, replaces each known id, and removes each id that `owner` gave before and does not give now. Changes all state first, then puts the events on the queue: all `withdrawn` events of the call first, then the `promised` events, by id in list order. A dropped task ends as `cancelled` with the reason `"removed"` if it had not finished. Throws and changes nothing if another owner has one of the ids, if `tasks` has one id two times, or if two tasks declare one exact output. `add(task)` calls `setTasks("add:" + task.id, [task])`. `build.each` calls it; your code does not. |
-| `each<M extends Record<string, AnyMatcher>>(config: TaskMaterializerConfig<M>): void` | Makes tasks for each matched artifact ([section 10](#10-buildeach-tasks-for-each-matched-artifact)). Subscribes to the one matcher in `matchersByName` and gives the tasks of each match through `setTasks`, with the owner `<number>:<var values>`. The build sends each artifact event to `matcher.receiveArtifactEvent`, one time for each matcher. An error in `tasks` or in a matched artifact is fatal for the build, like a subscriber error. Throws if `matchersByName` does not have exactly one matcher, if `run()` has started, or if another `Build` uses the matcher. |
+| `protected setTasks(group: TaskGroup, tasks: readonly Task[]): void` | Makes `tasks` the tasks of `group` ([Task groups](#task-groups)). Adds each new id, replaces each known id, and removes each id that `group` had before and does not get now. Changes all state first, then puts the events on the queue: all `withdrawn` events of the call first, then the `promised` events, by id in list order. A dropped task ends as `cancelled` with the reason `"removed"` if it had not finished. Throws and changes nothing if another group has one of the ids, if `tasks` has one id two times, or if two tasks declare one exact output. `add(task)` calls it with one group for each task id. `build.each` calls it with one group for each match. A subclass of `Build` can call it with its own `new TaskGroup(label)`. |
+| `each<M extends Record<string, AnyMatcher>>(config: TaskMaterializerConfig<M>): void` | Makes tasks for each matched artifact ([section 10](#10-buildeach-tasks-for-each-matched-artifact)). Subscribes to the one matcher in `matchersByName` and gives the tasks of each match through `setTasks`, with one task group for each match, labeled `build.each <number> <var name>=<var value> ...`. The build sends each artifact event to `matcher.receiveArtifactEvent`, one time for each matcher. An error in `tasks` or in a matched artifact is fatal for the build, like a subscriber error. Throws if `matchersByName` does not have exactly one matcher, if `run()` has started, or if another `Build` uses the matcher. |
 | `run(): Promise<Result>` | The first time, sends a `promised` event for each output of each task that is in the build, and then runs the scan of each matcher and waits for all of them. A call during the scans waits for the same scans. Then starts every task and resolves when every started task has finished. Does not reject when a task fails. Rejects with the first subscriber error, `build.each` error, scan error, or send-limit error of the build, at once if that error happened before the call ([section 9](#subscriber-errors)). After a scan error, no task starts. |
+
+### `class TaskGroup`
+
+```ts
+new TaskGroup(label: string)
+```
+
+A group of tasks for `setTasks` ([Task groups](#task-groups)). The object is the identity. `label` is only for error messages.
 
 ### `class Task`
 
