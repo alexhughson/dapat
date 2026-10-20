@@ -23,7 +23,7 @@ When you run a **build**, dapat does these steps for each task:
 2. It compares the current stamps of the inputs and outputs with the stamps from the last successful run. The **store** keeps the last stamps.
 3. It skips the task when every stamp is equal to the stamp from the last run. Otherwise, it runs the task.
 
-dapat does not know about disks or SQL. It only reads artifact ids and stamps. The adapters in `dapat/contrib` supply files, S3, and stores in JSON and SQLite.
+dapat does not know about disks or SQL. It only reads artifact ids and stamps. The adapters in `dapat/contrib` supply files, a matcher of files, S3, and stores in JSON and SQLite.
 
 You declare tasks with `Build` and `Task`. You can know each task in advance, or your code can decide which tasks to add. Sections 3 to 9 describe this. `build.each` makes tasks for you from the things that matchers find, and joins them on shared var names ([section 10](#10-buildeach-tasks-for-each-matched-artifact)).
 
@@ -43,7 +43,7 @@ The package has two entry points:
 | Import | Contents |
 | --- | --- |
 | `dapat` | `Build`, `TaskGroup`, `Task`, `Artifact`, `Prefix`, `IdPrefix`, `Matcher`, `MemoryStore`, `Result`, and their types |
-| `dapat/contrib` | `FileArtifact`, `FilesystemPrefix` (and the types `FileStampMode` and `FileStampOptions`), `S3ObjectArtifact`, `S3Prefix`, `MemoryS3` (and the types `S3Client`, `S3Head`, and `S3ListEntry`), `JsonStore`, and `SqliteStore` |
+| `dapat/contrib` | `FileArtifact`, `FilesystemPrefix`, `FileMatcher` (and the types `FileStampMode` and `FileStampOptions`), `S3ObjectArtifact`, `S3Prefix`, `MemoryS3` (and the types `S3Client`, `S3Head`, and `S3ListEntry`), `JsonStore`, and `SqliteStore` |
 
 ## 3. First build
 
@@ -280,13 +280,13 @@ The task writes its outputs itself. dapat does not write, move, or delete files.
 
 Each task in a build is in one task group. A group holds a list of tasks. The build replaces the list of a group as one unit.
 
-For example, this build has two `build.add` tasks and one `build.each` over two posts. `lint` and `test` are any two tasks. `Posts` is the matcher from [section 10](#10-buildeach-tasks-for-each-matched-artifact).
+For example, this build has two `build.add` tasks and one `build.each` over two posts. `lint` and `test` are any two tasks. The matcher is a `FileMatcher` ([section 10](#filematcher-one-match-for-each-file)).
 
 ```ts
 build.add(lint)
 build.add(test)
 build.each({
-  matchersByName: { post: new Posts() }, // finds posts/a.md and posts/b.md
+  matchersByName: { post: new FileMatcher("posts/<slug>.md") }, // finds posts/a.md and posts/b.md
   *tasks(vars, matched) {
     yield new Task({ id: `page:${vars.slug}`, inputs: [matched.post.data], outputs: [/* ... */], run: async () => {} })
   },
@@ -735,52 +735,23 @@ Inside the build, a `TaskMaterializer` does this work. It acts like a materializ
 
 A matcher also gets each output that a task declares or writes. So a task can make new things while the build runs, and `build.each` makes their tasks in the same run.
 
-dapat has no built-in matchers yet. You write a small subclass of `Matcher`.
+For files, use `FileMatcher` from `dapat/contrib` ([`FileMatcher`](#filematcher-one-match-for-each-file)). For other things, write a small subclass of `Matcher` ([Write your own matcher](#write-your-own-matcher)).
 
 ### Example: pages joined to a template
 
 This program makes one HTML page for each file `content/<lang>/<slug>.md`. Each page uses the template of its language, `templates/<lang>.html`:
 
 ```ts
-import { readdir } from "node:fs/promises"
-import path from "node:path"
-import { Build, Matcher, Task } from "dapat"
-import { FileArtifact, JsonStore } from "dapat/contrib"
-
-// Finds content/<lang>/<slug>.md.
-class Pages extends Matcher<FileArtifact> {
-  readonly varNames = ["lang", "slug"]
-
-  async scan(): Promise<void> {
-    for (const lang of await readdir("content")) {
-      for (const name of await readdir(path.join("content", lang))) {
-        if (!name.endsWith(".md")) continue
-        const slug = path.basename(name, ".md")
-        const file = new FileArtifact(path.join("content", lang, name))
-        this.send({ kind: "found", matched: { vars: { lang, slug }, data: file } })
-      }
-    }
-  }
-}
-
-// Finds templates/<lang>.html.
-class Templates extends Matcher<FileArtifact> {
-  readonly varNames = ["lang"]
-
-  async scan(): Promise<void> {
-    for (const name of await readdir("templates")) {
-      if (!name.endsWith(".html")) continue
-      const lang = path.basename(name, ".html")
-      const file = new FileArtifact(path.join("templates", name))
-      this.send({ kind: "found", matched: { vars: { lang }, data: file } })
-    }
-  }
-}
+import { Build, Task } from "dapat"
+import { FileArtifact, FileMatcher, JsonStore } from "dapat/contrib"
 
 const build = new Build({ store: new JsonStore(".dapat/state.json") })
 
 build.each({
-  matchersByName: { page: new Pages(), template: new Templates() },
+  matchersByName: {
+    page: new FileMatcher("content/<lang>/<slug>.md"),
+    template: new FileMatcher("templates/<lang>.html"),
+  },
   *tasks(vars, matched) {
     const page = matched.page.data // a FileArtifact
     const template = matched.template.data // the template with the same lang
@@ -801,7 +772,7 @@ build.each({
 const result = await build.run()
 ```
 
-The two matchers share the var name `lang`. So each page joins with the template of the same `lang`. With these files:
+Each `FileMatcher` reads its var names from its pattern: `page` has `lang` and `slug`, and `template` has `lang`. The two matchers share the var name `lang`. So each page joins with the template of the same `lang`. With these files:
 
 ```
 content/en/hello.md
@@ -822,7 +793,7 @@ templates/fr.html
 
 `content/de/hello.md` has no template with `lang` `de`, so it has no joined set and no task.
 
-If `Templates` sends `gone` for `{ lang: "fr" }`, `build.each` removes `page:fr/hello`. If it then sends `found` for `{ lang: "fr" }` again, `page:fr/hello` comes back. If it sends `found` for `{ lang: "en" }` with a different artifact, `build.each` replaces the tasks of the two `en` sets. The `fr` task does not change.
+If the `template` matcher sends `gone` for `{ lang: "fr" }`, `build.each` removes `page:fr/hello`. If it then sends `found` for `{ lang: "fr" }` again, `page:fr/hello` comes back. If it sends `found` for `{ lang: "en" }` with a different artifact, `build.each` replaces the tasks of the two `en` sets. The `fr` task does not change.
 
 ### Joins on shared var names
 
@@ -868,7 +839,10 @@ By default, a joined set needs a match of each matcher. Sometimes a task can use
 
 ```ts
 build.each({
-  matchersByName: { page: new Pages(), review: new Reviews() },
+  matchersByName: {
+    page: new FileMatcher("content/<lang>/<slug>.md"),
+    review: new FileMatcher("reviews/<lang>/<slug>/<reviewer>.json"),
+  },
   required: ["page"],
   *tasks(vars, matched) {
     const name = `${vars.lang}/${vars.slug}.${vars.reviewer ?? "nobody"}`
@@ -881,7 +855,7 @@ build.each({
 })
 ```
 
-`Pages` is the matcher of [the first example](#example-pages-joined-to-a-template), with the `varNames` `lang` and `slug`. `Reviews` is a matcher like `Templates`, with the `varNames` `lang`, `slug`, and `reviewer`, that finds `reviews/<lang>/<slug>/<reviewer>.json`. `review` is not required. It joins each page like a LEFT JOIN in SQL:
+`page` has the `varNames` `lang` and `slug`. `review` has the `varNames` `lang`, `slug`, and `reviewer`. `review` is not required. It joins each page like a LEFT JOIN in SQL:
 
 - A page with reviews has one joined set for each of its reviews.
 - A page with no review has one joined set. In it, `matched.review` is `undefined`, and `vars.reviewer` is `undefined`.
@@ -910,10 +884,10 @@ Without `required`, `hello` has no review, so it has no set and no task.
 The sets change when the reviews change. Start with `content/en/hello.md` and no review:
 
 1. The set `lang=en slug=hello` has `matched.review === undefined`.
-2. `Reviews` sends `found` for `{ lang: "en", slug: "hello", reviewer: "ann" }`. `build.each` removes the set with no review, and its tasks. Then it adds the set `reviewer=ann`.
-3. `Reviews` sends `found` for `reviewer: "bob"`. `build.each` adds the set `reviewer=bob`. The set `reviewer=ann` does not change.
-4. `Reviews` sends `gone` for `reviewer: "bob"`. `build.each` removes the set `reviewer=bob`.
-5. `Reviews` sends `gone` for `reviewer: "ann"`. `build.each` removes the set `reviewer=ann`, and adds the set with no review again.
+2. The `review` matcher sends `found` for `{ lang: "en", slug: "hello", reviewer: "ann" }`. `build.each` removes the set with no review, and its tasks. Then it adds the set `reviewer=ann`.
+3. The `review` matcher sends `found` for `reviewer: "bob"`. `build.each` adds the set `reviewer=bob`. The set `reviewer=ann` does not change.
+4. The `review` matcher sends `gone` for `reviewer: "bob"`. `build.each` removes the set `reviewer=bob`.
+5. The `review` matcher sends `gone` for `reviewer: "ann"`. `build.each` removes the set `reviewer=ann`, and adds the set with no review again.
 
 A review of a page that does not exist makes no set. It waits, and joins the page when the page is found.
 
@@ -973,47 +947,15 @@ TypeScript knows which matched artifacts can be `undefined`, when `required` is 
 This program makes one HTML page for each file `posts/<slug>.md`:
 
 ```ts
-import { readdir } from "node:fs/promises"
-import path from "node:path"
-import { Build, Matcher, Task, type ArtifactEvent } from "dapat"
-import { FileArtifact, JsonStore } from "dapat/contrib"
-
-// Finds posts/<slug>.md, and sends one matched artifact for each file.
-class Posts extends Matcher<FileArtifact> {
-  readonly varNames = ["slug"]
-  private readonly folder = path.resolve("posts")
-
-  async scan(): Promise<void> {
-    const names = await readdir(this.folder)
-    for (const name of names) {
-      this.found(new FileArtifact(path.join(this.folder, name)))
-    }
-  }
-
-  // A task that declares or writes a post is also found, during the run.
-  override receiveArtifactEvent(event: ArtifactEvent): void {
-    if (event.kind === "promised" && event.output instanceof FileArtifact) {
-      this.found(event.output)
-    }
-    if (event.kind === "produced" && event.artifact instanceof FileArtifact) {
-      this.found(event.artifact)
-    }
-  }
-
-  private found(file: FileArtifact): void {
-    if (path.dirname(file.path) !== this.folder) return
-    if (!file.path.endsWith(".md")) return
-    const slug = path.basename(file.path, ".md")
-    this.send({ kind: "found", matched: { vars: { slug }, data: file } })
-  }
-}
+import { Build, Task } from "dapat"
+import { FileArtifact, FileMatcher, JsonStore } from "dapat/contrib"
 
 const build = new Build({ store: new JsonStore(".dapat/state.json") })
 
 build.each({
-  matchersByName: { post: new Posts() },
+  matchersByName: { post: new FileMatcher("posts/<slug>.md") },
   *tasks(vars, matched) {
-    const post = matched.post.data // a FileArtifact, the data type of Posts
+    const post = matched.post.data // a FileArtifact, the data type of FileMatcher
     const html = new FileArtifact(`site/${vars.slug}.html`)
     yield new Task({
       id: `page:${vars.slug}`,
@@ -1032,11 +974,73 @@ const result = await build.run()
 
 With `posts/hello.md` and `posts/bye.md`, the first run does these steps:
 
-1. `Posts.scan` reads the folder and sends `found` for `{ slug: "hello" }` and `{ slug: "bye" }`.
+1. The scan of the matcher reads the folder `posts` and sends `found` for `{ slug: "hello" }` and `{ slug: "bye" }`.
 2. For each matched artifact, `build.each` calls `tasks`.
 3. The scan returns. The build adds `page:hello` and `page:bye` in one step, and starts both tasks.
 
-The next time the program runs with no change, both tasks skip. If you add a task with `build.add` that declares the output `posts/news.md`, `Posts` gets its `promised` event and sends `found` for `{ slug: "news" }`. `build.each` adds `page:news`, and `page:news` waits for the task that writes the post.
+The next time the program runs with no change, both tasks skip. If you add a task with `build.add` that declares the output `posts/news.md`, the matcher gets its `promised` event and sends `found` for `{ slug: "news" }`. `build.each` adds `page:news`, and `page:news` waits for the task that writes the post.
+
+### `FileMatcher`: one match for each file
+
+`FileMatcher` is in `dapat/contrib`. It finds the files that fit a pattern, and sends one matched artifact for each file. The data of each match is a `FileArtifact`, so `FileMatcher` is a `Matcher<FileArtifact>`.
+
+```ts
+import { FileMatcher } from "dapat/contrib"
+
+const pages = new FileMatcher("content/<lang>/<section>/<slug>.md")
+const templates = new FileMatcher("templates/<lang>.html", { stamp: "hash" })
+```
+
+[examples/file-pipeline.ts](examples/file-pipeline.ts) is a program that you can run. It joins pages to templates and writes HTML. Run it two times: the second run skips each page.
+
+#### The pattern
+
+- The parts of a pattern are separated by `/`. `<name>` is a var. A var matches one or more characters, but not `/`. Thus a var never crosses a folder.
+- The matcher reads its `varNames` from the pattern, in order. `templates/<lang>.html` has the var names `["lang"]`. For the file `templates/en.html`, the match is `{ vars: { lang: "en" }, data: <FileArtifact of templates/en.html> }`. `content/<lang>/<section>/<slug>.md` has the var names `["lang", "section", "slug"]`.
+- One part can hold text and vars together, for example `<slug>.md` or `v<major>.<minor>.json`.
+- Two vars must have text between them. `<a><b>.md` throws, because a name such as `xy.md` has more than one split.
+- A var can come two times. `docs/<lang>/<lang>.md` matches `docs/en/en.md`, and it does not match `docs/en/fr.md`.
+- A pattern with no var names one file. Its `varNames` is `[]`, and it has one match or none.
+- `*` and `**` are not supported yet. The constructor throws for a pattern with `*` or `**`. Use one var for each part that changes. A later version adds them.
+- An empty pattern throws.
+
+#### Paths
+
+A relative pattern resolves against the current working directory when you create the matcher, as the path of a `FileArtifact` does. An absolute pattern stays as it is. The matcher removes `./` and `x/../` from the pattern. `matcher.root` is the folder that the pattern is relative to, and `matcher.pattern` is the pattern after this change.
+
+Each `FileArtifact` that the matcher sends has an absolute path. The `stamp` option goes to each of these `FileArtifact` objects.
+
+#### The scan
+
+The scan reads only the folders that the pattern names. It starts at the text before the first var, for example `content/`, and goes down to the depth of the pattern. It sends `found` for each file that fits, in name order.
+
+- A missing folder has no files. This is not an error, because a task can make the folder later.
+- The scan follows symlinks. A link to a file counts as that file. A broken link adds nothing.
+- Every other error, for example a permission error, makes `build.run()` reject.
+
+#### Events during the run
+
+A file has a match while one of these is true:
+
+- The file is on disk, as far as the matcher knows. The matcher knows this when the scan found the file, or a task produced it, and no task deleted it after that.
+- A task in the build declares the file as an output.
+
+`receiveArtifactEvent` must do no I/O, so the matcher does not look at the disk during the run. It uses only the scan and the events of the build. It hears only events of a `FileArtifact` whose path fits the pattern.
+
+| Build event | `FileMatcher` does |
+| --- | --- |
+| `promised`: a task declares the file | sends `found`, if it has not sent it |
+| `produced`: a task wrote the file | sends `found`, if it has not sent it |
+| `deleted`: a task deleted the file | sends `gone`, unless a task still declares the file |
+| `withdrawn`: the task that declared the file leaves the build | sends `gone`, unless the file is on disk |
+
+The matcher sends `found` one time for each file. It sends `gone` only for a file that it sent `found` for. After `gone`, a new `promised` or `produced` sends `found` again.
+
+A `promised` event of a `FilesystemPrefix` gives no file name, so it makes no match. A task that writes files into a prefix output must call `ctx.produced` for each file ([Matches during the run](#matches-during-the-run)).
+
+#### Between runs
+
+dapat does not delete old outputs. When you delete a source file, the next scan does not find it, so its task is not in the build. But the outputs of that task from the last run stay on disk. A `FileMatcher` whose pattern fits those outputs finds them in its scan. For example, a task makes `upper/<slug>.txt` from `content/<slug>.md`, and a second `build.each` uses `new FileMatcher("upper/<slug>.txt")`. When you delete `content/b.md`, the task `upper:b` goes away, but `upper/b.txt` stays, and the task of the second `build.each` for `b` stays too. Delete the old outputs yourself when this is a problem.
 
 ### Matchers
 
@@ -1056,11 +1060,59 @@ abstract class Matcher<D extends MatchedData = MatchedData> extends Emitter<Matc
 
 A matcher sends events with `this.send(event)`. It knows nothing about the code that listens to it. One matcher can feed several `build.each` calls of one build. It still gets each build event one time. One `build.each` cannot use one matcher object under two names. A matcher belongs to the first build that uses it: give each `Build` its own matchers.
 
-A matcher may send `found` again for the same thing. `build.each` ignores a `found` whose data has the same artifact ids, in the same order, as the current match. So the `Posts` matcher can send `found` for the `promised` event and again for the `produced` event of one file. The task is made one time, and a task that rewrites its own input in place does not run again. One artifact and a list of one artifact are different data, so a change from one to the other replaces the tasks.
+A matcher may send `found` again for the same thing. `build.each` ignores a `found` whose data has the same artifact ids, in the same order, as the current match. So a matcher can send `found` for the `promised` event and again for the `produced` event of one file. The task is made one time, and a task that rewrites its own input in place does not run again. One artifact and a list of one artifact are different data, so a change from one to the other replaces the tasks.
 
 A change to the content of an artifact is the job of its stamp, not of the match: the next build runs the task again because the stamp changed. To force the tasks of a match to be made again, a matcher sends `gone` and then `found`.
 
 A task that has finished does not run again in the same run when a task it waits for is replaced and writes its output again. The next build runs it again, because the stamp of its input changed. Plain tasks work the same way.
+
+### Write your own matcher
+
+Write a subclass of `Matcher` for things that `FileMatcher` cannot find, for example S3 objects or the rows of a table. This matcher finds the S3 objects `reports/<day>.json` in one bucket:
+
+```ts
+import { Matcher, type ArtifactEvent } from "dapat"
+import { S3ObjectArtifact, type S3Client } from "dapat/contrib"
+
+// Finds reports/<day>.json in one bucket.
+class DailyReports extends Matcher<S3ObjectArtifact> {
+  readonly varNames = ["day"]
+
+  constructor(
+    private readonly client: S3Client,
+    private readonly bucket: string,
+  ) {
+    super()
+  }
+
+  async scan(): Promise<void> {
+    const entries = await this.client.list(this.bucket, "reports/")
+    for (const entry of entries) {
+      this.foundKey(entry.key)
+    }
+  }
+
+  // A task that declares or writes a report is also found, during the run.
+  override receiveArtifactEvent(event: ArtifactEvent): void {
+    if (event.kind === "promised" && event.output instanceof S3ObjectArtifact) {
+      if (event.output.bucket === this.bucket) this.foundKey(event.output.key)
+    }
+    if (event.kind === "produced" && event.artifact instanceof S3ObjectArtifact) {
+      if (event.artifact.bucket === this.bucket) this.foundKey(event.artifact.key)
+    }
+  }
+
+  private foundKey(key: string): void {
+    const match = /^reports\/([^/]+)\.json$/.exec(key)
+    if (match === null) return
+    const day = match[1]!
+    const report = new S3ObjectArtifact(this.client, this.bucket, key)
+    this.send({ kind: "found", matched: { vars: { day }, data: report } })
+  }
+}
+```
+
+This matcher sends `found` again for the `produced` event of a report that it found before. That does no harm: `build.each` ignores a `found` with the same artifact ids. It sends no `gone`. Thus a report that a task deletes, or that no task declares now, keeps its match until the next build. `FileMatcher` sends `gone` for these cases ([Events during the run](#events-during-the-run)).
 
 ### Matched artifacts
 
@@ -1077,7 +1129,7 @@ type MatchedArtifact<D extends MatchedData = MatchedData> = {
 }
 ```
 
-`vars` holds the values that name the thing, one for each name in `varNames`. `data` is the artifact that the task reads, or a list of artifacts. Its type comes from the matcher. In the example, `Posts` is a `Matcher<FileArtifact>`, so `matched.post.data` is a `FileArtifact`, and it can go straight into `inputs`.
+`vars` holds the values that name the thing, one for each name in `varNames`. `data` is the artifact that the task reads, or a list of artifacts. Its type comes from the matcher. In the example, `FileMatcher` is a `Matcher<FileArtifact>`, so `matched.post.data` is a `FileArtifact`, and it can go straight into `inputs`.
 
 The vars of a matched artifact are also its key. Two matched artifacts with the same vars are the same match.
 
@@ -1105,7 +1157,7 @@ For example, a matcher sends `found { slug: "a" }`, then `found { slug: "a" }` w
 
 ```ts
 build.each({
-  matchersByName: { post: new Posts() },
+  matchersByName: { post: new FileMatcher("posts/<slug>.md") },
   *tasks(vars, matched) { ... },
 })
 ```
@@ -1148,18 +1200,6 @@ When a task calls `ctx.produced(artifact)`, the build sends the `produced` event
 This task splits a book into chapters. `build.each` makes one summary task for each chapter, while `split` runs:
 
 ```ts
-class Chapters extends Matcher<FileArtifact> {
-  readonly varNames = ["n"]
-  async scan(): Promise<void> {}
-  override receiveArtifactEvent(event: ArtifactEvent): void {
-    if (event.kind !== "produced") return
-    if (!(event.artifact instanceof FileArtifact)) return
-    const match = /\/chapters\/(\d+)\.md$/.exec(event.artifact.path)
-    if (match === null) return
-    this.send({ kind: "found", matched: { vars: { n: match[1]! }, data: event.artifact } })
-  }
-}
-
 build.add(
   new Task({
     id: "split",
@@ -1175,14 +1215,14 @@ build.add(
 )
 
 build.each({
-  matchersByName: { chapter: new Chapters() },
+  matchersByName: { chapter: new FileMatcher("chapters/<n>.md") },
   *tasks(vars, matched) {
     yield new Task({ id: `summary:${vars.n}`, inputs: [matched.chapter.data], run: async () => {} })
   },
 })
 ```
 
-When `split` returns, `summary:0`, `summary:1`, and `summary:2` exist. They run in the same `build.run()`.
+When `split` returns, `summary:0`, `summary:1`, and `summary:2` exist. They run in the same `build.run()`. On the next build, the scan finds the chapters of the last run. Each summary task then waits for `split`, because the output `chapters` of `split` covers its input.
 
 ### Errors in `build.each`
 
@@ -1199,7 +1239,8 @@ An error in `build.each` is fatal for the build, as a subscriber error is. The `
 | `build.each` | one matcher object is under two names | `build.each` throws |
 | `build.each` | you call it after `build.run()` | `build.each` throws |
 | `build.each` | one of its matchers is used by another `Build` | `build.each` throws, and names the matcher |
-| a scan | the folder does not exist | `build.run()` rejects at once, and no task runs. The other scans get an aborted `signal`. `build.run()` does not wait for them. |
+| `new FileMatcher` | the pattern has `*` or `**`, two vars with nothing between them, or no text | the constructor throws |
+| a scan | it throws, for example your own matcher reads a folder that does not exist | `build.run()` rejects at once, and no task runs. The other scans get an aborted `signal`. `build.run()` does not wait for them. |
 | a matched artifact or a `gone` | its vars are not the `varNames` of its matcher | `build.run()` rejects |
 | `tasks` | two matches give one task id | `build.run()` rejects with `task 'x' is in two groups: 'build.each 1 slug=a' and 'build.each 1 slug=b'` |
 | `tasks` | it throws | `build.run()` rejects with that error |
@@ -1216,6 +1257,8 @@ The [API reference](#api-reference) gives the full details of each class.
 ### 11.1 Files: `FileArtifact`, `FilesystemPrefix`
 
 A relative path resolves against the current working directory when you create the object.
+
+To make tasks for each file that fits a pattern, use `FileMatcher` ([`FileMatcher`](#filematcher-one-match-for-each-file)).
 
 | Class | Stamp | Value |
 | --- | --- | --- |
@@ -1378,7 +1421,10 @@ A new checkout changes the modification time of each file. With the default `sta
 - **A prefix input that covers the store file runs on every build.** For example, a task reads `new FilesystemPrefix(".")`, and the store is `.dapat/state.json`. Each build writes the store, so the stamp of the prefix changes. Put the store outside the folders that tasks read, or read a narrower prefix.
 - **Only a missing path counts as missing.** `FileArtifact` returns a `null` stamp, and `FilesystemPrefix` returns the stamp of an empty list and lists no files, only for `ENOENT`. Every other error makes `stamp()` throw, so the task fails with that error, for example a permission error, or a file where a folder must be. In `"time"` mode, dapat reads only the metadata of a file. A file that the task cannot read still gets a stamp, and `read()` fails later.
 - **The skip rule ignores the order and the repeats of the inputs.** The record keeps the stamps by id. So a task that ran with the inputs `[a, b]` skips with `[b, a]`, and a task that ran with `[a]` skips with `[a, a]`. If the result of a task depends on the order of its inputs, put the order in the task id, or force the task to run ([section 12.1](#121-force-tasks-to-run-again)).
-- **A key pattern needs text between two vars.** `KeyPattern` (in `src/pattern.ts`, not exported yet) throws when two vars have nothing between them, for example `v/<lang><slug>.md`. A key such as `v/enintro.md` has more than one split. The error names the pattern and the two vars. Put text between the vars, for example `v/<lang>-<slug>.md`. A `*` between two vars is allowed, for example `v/<lang>*<slug>.md`. Then the first var takes the most text that it can.
+- **A `FileMatcher` pattern needs text between two vars.** `FileMatcher` throws when two vars have nothing between them, for example `v/<lang><slug>.md`. A key such as `v/enintro.md` has more than one split. The error names the pattern and the two vars. Put text between the vars, for example `v/<lang>-<slug>.md`.
+- **A `FileMatcher` pattern cannot have `*` or `**` yet.** Use one var for each part that changes.
+- **A `FileMatcher` finds the old outputs of a task that is gone.** dapat does not delete old outputs, so the scan finds them on the next build ([Between runs](#between-runs)).
+- **A `FileMatcher` does not see a change on disk during the run that no task reports.** It looks at the disk only in its scan. A file that another program writes during the run gets its match on the next build.
 - **A var that comes twice in one segment can be slow on long names.** For example, `<a>-<b>-<c>-<a>` tries each split of the segment. A 255-character file name that almost matches takes about 10 ms. A 1000-character key can take seconds. Each segment without such a repeated var keeps its first split, so it stays fast.
 - **Matches that come in separate steps after the scans can pass through a state in between.** For example, a file watcher sends one file at a time, or two tasks that write a page and its review end at different times. Then `build.each` can make a set with `matched.review === undefined` for a while, and later replace it. This is correct if each set gives its own task ids and outputs. It is not safe when the id or an output depends on a matcher that is not required being `undefined`, and other sets can give the same id. For example, the drafts rule gives `draft:${vars.lang}` for the page of a lang with no review. In the state in between, two pages of one lang have no review, so two sets give `draft:en`, and `build.run()` rejects. Or the id moves between sets in two steps, and its store record is deleted, so the task runs again on the next build. Two passes of one drain are separate steps too. For example, rule 1 promises the pages, and rule 1b promises the reviews only when it gets those page events. Then the drafts rule gets the pages in pass 1 and the reviews in pass 2, and it passes through the same state in between. The safe pattern: put every var of the required matchers in each task id and each output, for example `draft:${vars.lang}/${vars.slug}`.
 - **No timeout and no concurrency limit.** All ready tasks start at the same time. Add limits and timeouts in your task code ([section 12.2](#122-limit-parallel-work)), and use `ctx.signal` to stop work.
@@ -1660,6 +1706,24 @@ new FilesystemPrefix(path: string, opts?: { stamp?: "time" | "hash" })
 | `stampMode` | `"time"` or `"hash"`. Default `"time"`. |
 | `stamp()` | SHA-256 of the sorted lines `<relative path>=<file stamp>` for every file under the path, at any depth. Each file stamp is as in `FileArtifact`. A missing folder has the stamp of an empty list. Never `null`. Throws if the path is a file, and for every other error. |
 | `list()` | Absolute paths of every file under the folder, at any depth. Follows symlinks as `stamp()` does. A missing folder lists no files. Throws if the path is a file, and for every other error. |
+
+### `class FileMatcher extends Matcher<FileArtifact>`
+
+```ts
+new FileMatcher(pattern: string, opts?: { stamp?: "time" | "hash" })
+```
+
+| Member | Value |
+| --- | --- |
+| `pattern` | The pattern without `./` and `x/../`, for example `content/<lang>/<slug>.md`. |
+| `root` | The absolute folder that the pattern is relative to: the working directory when you create the matcher, or `/` for an absolute pattern. |
+| `varNames` | The vars of the pattern, in order. `templates/<lang>.html` gives `["lang"]`. |
+| `stampMode` | The stamp mode of each `FileArtifact` that the matcher sends. Default `"time"`. |
+| `match(path)` | The vars of the file at `path`, or `null` when the file does not fit. A relative `path` resolves against the working directory. |
+| `scan(signal)` | Sends `found` for each file on disk that fits, in name order. Reads only the folders of the pattern. A missing folder has no files. Follows symlinks. Throws for every other error. |
+| `receiveArtifactEvent(event)` | `promised` and `produced` of a `FileArtifact` that fits send `found`. `deleted` sends `gone` unless a task still declares the file. `withdrawn` sends `gone` unless the file is on disk. |
+
+The constructor throws for an empty pattern, a pattern with `*` or `**`, and two vars with nothing between them. Each match is `{ vars, data: FileArtifact }`. See [`FileMatcher`](#filematcher-one-match-for-each-file).
 
 ## S3 (`dapat/contrib`)
 

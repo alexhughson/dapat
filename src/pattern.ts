@@ -1,4 +1,4 @@
-// Not exported from index.ts yet. A file matcher will build on this.
+// Not exported from index.ts. FileMatcher in contrib/fs/matcher.ts builds on this.
 
 export type Vars = Record<string, string>
 

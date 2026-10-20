@@ -1,4 +1,5 @@
 export { FileArtifact } from "./file"
 export { FilesystemPrefix } from "./folder"
+export { FileMatcher } from "./matcher"
 export { fileId, dirId } from "./id"
 export type { FileStampMode, FileStampOptions } from "./stamp"
