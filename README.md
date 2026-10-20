@@ -18,7 +18,7 @@ Use dapat for data pipelines, generated files, and agent loops, where a step is 
 
 ```
 Status: version 0.1.0. dapat is not published to a registry, and the API can change.
-`build.each` makes tasks for each artifact that a matcher finds. It takes one matcher for now, and dapat has no built-in matchers yet.
+`build.each` makes tasks for each artifact that a matcher finds. With several matchers, it joins their matches on shared var names, like a database join. dapat has no built-in matchers yet.
 ```
 
 ```

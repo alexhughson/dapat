@@ -1,6 +1,7 @@
 import type { Artifact } from "./artifact"
 import { Emitter } from "./emitter"
 import type { AnyMatcher } from "./matcher"
+import type { MatchedArtifactEvent } from "./matched-artifact"
 import type { Prefix } from "./prefix"
 import { Task, isArtifact, isPrefix, type Context, type Ref } from "./task"
 import type { Store, TaskState } from "./store"
@@ -26,6 +27,13 @@ const matcherBuilds = new WeakMap<AnyMatcher, Build>()
 
 // The outputs of no task. Shared, and never changed.
 const NO_OUTPUTS: ReadonlyMap<string, Ref> = new Map()
+
+type MatchEventToHear = {
+  // A TaskMaterializer of any matcher types.
+  taskMaterializer: { hear(matcherName: string, event: MatchedArtifactEvent): void }
+  matcherName: string
+  event: MatchedArtifactEvent
+}
 
 class Slot {
   generation = 1
@@ -65,6 +73,9 @@ export class Build extends Emitter<ArtifactEvent> {
   // The matchers of every build.each, each one time, in the order of the build.each calls.
   private readonly matchers = new Set<AnyMatcher>()
   private eachCount = 0
+  // The matcher events that wait for a TaskMaterializer.hear, oldest first. See hearMatchEvents.
+  private matchEvents: MatchEventToHear[] = []
+  private hearing = false
 
   private started = false
   // True while the first run() waits for the scans. No task starts then.
@@ -112,7 +123,7 @@ export class Build extends Emitter<ArtifactEvent> {
   }
 
   /**
-   * Makes tasks for each artifact that the matcher finds.
+   * Makes tasks for each joined set of the matches of its matchers.
    * Call it before the first run(): that run scans each matcher before any task starts.
    */
   each<M extends Record<string, AnyMatcher>>(config: TaskMaterializerConfig<M>): void {
@@ -121,25 +132,56 @@ export class Build extends Emitter<ArtifactEvent> {
     }
     const number = this.eachCount + 1
     const taskMaterializer = new TaskMaterializer(number, config, (group, tasks) => this.setTasks(group, tasks))
-    const matcher = taskMaterializer.matcher
-    const matcherBuild = matcherBuilds.get(matcher)
-    if (matcherBuild !== undefined && matcherBuild !== this) {
-      throw new Error(`build.each ${number}: its matcher belongs to another Build; make a new matcher for each Build`)
+    const matcherNames = Object.keys(config.matchersByName)
+    for (const name of matcherNames) {
+      const matcherBuild = matcherBuilds.get(config.matchersByName[name]!)
+      if (matcherBuild !== undefined && matcherBuild !== this) {
+        throw new Error(
+          `build.each ${number}: its matcher '${name}' belongs to another Build; make a new matcher for each Build`,
+        )
+      }
     }
     this.eachCount = number
-    matcher.subscribe((event) => {
-      // An error here is fatal, like a subscriber error. The matcher's send never sees it.
-      try {
-        taskMaterializer.hear(event)
-      } catch (error) {
-        this.fail(toError(error))
+    for (const name of matcherNames) {
+      const matcher = config.matchersByName[name]!
+      matcher.subscribe((event) => {
+        // A failed build makes no more tasks, so it does not call `tasks` again.
+        if (this.fatal) return
+        this.matchEvents.push({ taskMaterializer, matcherName: name, event })
+        this.hearMatchEvents()
+      })
+      // Each matcher gets each artifact event one time, even if several build.each calls use it.
+      if (!this.matchers.has(matcher)) {
+        matcherBuilds.set(matcher, this)
+        this.matchers.add(matcher)
+        this.subscribe((event) => matcher.receiveArtifactEvent(event))
       }
-    })
-    // Each matcher gets each artifact event one time, even if several build.each calls use it.
-    if (!this.matchers.has(matcher)) {
-      matcherBuilds.set(matcher, this)
-      this.matchers.add(matcher)
-      this.subscribe((event) => matcher.receiveArtifactEvent(event))
+    }
+  }
+
+  /**
+   * Gives each waiting matcher event to its TaskMaterializer, oldest first, until none waits.
+   * A hear never runs inside another hear: a matcher event that comes during a hear, from
+   * `tasks` or from a subscriber of the events of setTasks, waits here, and this loop hears it
+   * next. So the outermost matcher send still returns only after every task it caused exists.
+   * An error here is fatal, like a subscriber error. The matcher's send never sees it.
+   */
+  private hearMatchEvents(): void {
+    if (this.hearing) return
+    this.hearing = true
+    try {
+      while (this.matchEvents.length > 0 && this.fatal === null) {
+        const next = this.matchEvents.shift()!
+        next.taskMaterializer.hear(next.matcherName, next.event)
+      }
+    } catch (error) {
+      this.matchEvents = []
+      this.fail(toError(error))
+    } finally {
+      this.hearing = false
+      if (this.fatal) {
+        this.matchEvents = []
+      }
     }
   }
 

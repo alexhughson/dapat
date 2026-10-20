@@ -567,17 +567,17 @@ describe("build.each errors", () => {
     )
   })
 
-  test("build.each needs exactly one matcher", () => {
+  test("build.each needs a matcher, and its matchers must share var names", () => {
     const build = new Build()
     expect(() => build.each({ matchersByName: {}, *tasks() {} })).toThrow(
-      "build.each 1 has 0 matchers; build.each needs exactly one matcher",
+      "build.each 1 has no matcher; build.each needs at least one matcher",
     )
     expect(() =>
       build.each({
-        matchersByName: { a: new MemMatcher("a:"), b: new MemMatcher("b:") },
+        matchersByName: { a: new MemMatcher("a:"), b: new EventMatcher<Mem>(["slug"], []) },
         *tasks() {},
       }),
-    ).toThrow("build.each 1 has 2 matchers; build.each needs exactly one matcher")
+    ).toThrow("build.each 1: the matchers ['b'] share no var name with matcher 'a' or its partners")
   })
 
   test("build.each after run() throws", async () => {
@@ -595,7 +595,7 @@ describe("build.each errors", () => {
     const second = new Build()
 
     expect(() => second.each({ matchersByName: { page: matcher }, *tasks() {} })).toThrow(
-      "build.each 1: its matcher belongs to another Build; make a new matcher for each Build",
+      "build.each 1: its matcher 'page' belongs to another Build; make a new matcher for each Build",
     )
   })
 })
