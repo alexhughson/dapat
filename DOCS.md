@@ -25,7 +25,7 @@ When you run a **build**, dapat does these steps for each task:
 
 dapat does not know about disks or SQL. It only reads artifact ids and stamps. The adapters in `dapat/contrib` supply files, S3, and stores in JSON and SQLite.
 
-You declare tasks with `Build` and `Task`. You can know each task in advance, or your code can decide which tasks to add. Sections 3 to 9 describe this.
+You declare tasks with `Build` and `Task`. You can know each task in advance, or your code can decide which tasks to add. Sections 3 to 9 describe this. `build.each` makes tasks for you from the things that a matcher finds ([section 10](#10-buildeach-tasks-for-each-matched-artifact)).
 
 ## 2. Install and import
 
@@ -42,7 +42,7 @@ The package has two entry points:
 
 | Import | Contents |
 | --- | --- |
-| `dapat` | `Build`, `Task`, `Artifact`, `Prefix`, `IdPrefix`, `MemoryStore`, `Result`, and their types |
+| `dapat` | `Build`, `TaskGroup`, `Task`, `Artifact`, `Prefix`, `IdPrefix`, `Matcher`, `MemoryStore`, `Result`, and their types |
 | `dapat/contrib` | `FileArtifact`, `FilesystemPrefix` (and the types `FileStampMode` and `FileStampOptions`), `S3ObjectArtifact`, `S3Prefix`, `MemoryS3` (and the types `S3Client`, `S3Head`, and `S3ListEntry`), `JsonStore`, and `SqliteStore` |
 
 ## 3. First build
@@ -105,7 +105,7 @@ Put `hello` into `in.txt`, and then run the script more than one time:
 1. **First run.** Both tasks execute. `out.txt` contains `[HELLO]`.
 2. **No change.** Both tasks skip.
 3. **Change `in.txt` to `bye`.** Both tasks execute. `out.txt` contains `[BYE]`.
-4. **Run `touch in.txt`.** The modification time changes, but the bytes do not. By default, the stamp of a `FileArtifact` is the modification time and the size, so the stamp changes. Both tasks run. To skip in this case, use `new FileArtifact("in.txt", { stamp: "hash" })`. Then the stamp is a hash of the bytes ([section 10.1](#101-files-fileartifact-filesystemprefix)).
+4. **Run `touch in.txt`.** The modification time changes, but the bytes do not. By default, the stamp of a `FileArtifact` is the modification time and the size, so the stamp changes. Both tasks run. To skip in this case, use `new FileArtifact("in.txt", { stamp: "hash" })`. Then the stamp is a hash of the bytes ([section 11.1](#111-files-fileartifact-filesystemprefix)).
 
 [Section 6](#6-when-a-task-skips) gives the full rules.
 
@@ -219,7 +219,7 @@ A **region** is a prefix: a ref that stands for many ids, for example `new Files
 - **A task writes into a folder that it reads.** For example, a task reads `new FilesystemPrefix("pages/")` and writes `pages/index.html`. With the default `"time"` stamp, the task runs on every build. Put `index.html` next to `pages/`, not in it.
 - **Two tasks write into one folder.** For example, `split` writes `new FilesystemPrefix("out/")`, and `index` writes `out/index.html`. The writers, and a task that reads `out/`, run again on later builds. In some layouts they run on every build. Give each writer its own folder, for example `out/pages/` for `split`.
 
-[Section 12](#12-limits) explains what runs again and why.
+[Section 13](#13-limits) explains what runs again and why.
 
 ### Write your own artifact
 
@@ -274,9 +274,45 @@ new Task({
 
 The task `id` must be unique in a build. The store uses the task `id` as its key, so use an id that stays the same from run to run.
 
-Each task in a build has one owner. `build.add(task)` gives the task the owner `add:<task id>`, so a replacement with the same id has the same owner. Later versions of dapat add rules, which make tasks under their own owners. A task id can have only one owner, so `build.add` will throw if a rule already made a task with the same id. `build.remove(id)` removes the task from its owner, and the owner can give the same id again later. For `build.add` and `build.remove`, owners change nothing else.
-
 The task writes its outputs itself. dapat does not write, move, or delete files. When a task deletes an artifact, it reports the delete with `ctx.deleted(artifact)`.
+
+### Task groups
+
+Each task in a build is in one task group. A group holds a list of tasks. The build replaces the list of a group as one unit.
+
+For example, this build has two `build.add` tasks and one `build.each` over two posts. `lint` and `test` are any two tasks. `Posts` is the matcher from [section 10](#10-buildeach-tasks-for-each-matched-artifact).
+
+```ts
+build.add(lint)
+build.add(test)
+build.each({
+  matchersByName: { post: new Posts() }, // finds posts/a.md and posts/b.md
+  *tasks(vars, matched) {
+    yield new Task({ id: `page:${vars.slug}`, inputs: [matched.post.data], outputs: [/* ... */], run: async () => {} })
+  },
+})
+```
+
+The build has four task groups:
+
+| Group | Made by | Tasks |
+| --- | --- | --- |
+| `build.add lint` | `build.add(lint)` | `lint` |
+| `build.add test` | `build.add(test)` | `test` |
+| `build.each 1 slug=a` | the match of `posts/a.md` | `page:a` |
+| `build.each 1 slug=b` | the match of `posts/b.md` | `page:b` |
+
+Now you delete `posts/b.md`. The matcher sends `gone` with the vars `{ slug: "b" }`. `build.each` sets the task list of the group `build.each 1 slug=b` to an empty list. Thus the build removes `page:b`. The other three groups do not change.
+
+The rules:
+
+- Each task id is in exactly one group, so `build.add` throws if `build.each` already made a task with that id.
+- `build.add(task)` makes one group for the task id. When you add the same id again, the replacement stays in the same group.
+- `build.each` makes one group for each match ([section 10](#10-buildeach-tasks-for-each-matched-artifact)).
+- A subclass of `Build` can call `setTasks(group, tasks)`. It replaces the whole list of the group. It adds each new id, replaces each known id, and removes each id that it does not get again.
+- `build.remove(id)` removes the task from its group. The other tasks of the group stay, and the group can get the same id again later.
+- After `build.remove(id)`, a later `build.add` with that id makes a new group. A task that `build.each` made and that you remove comes back only when its match changes, or after `gone` and then `found`.
+- A group is an object, a `TaskGroup`. Its label is only for error messages. Two groups with the same label are two different groups. Thus two parts of your code cannot share a group only because they use the same label.
 
 ### What `build.run()` does
 
@@ -340,7 +376,7 @@ build.add(producer) // writes x
 await build.run()   // consumer waits for producer
 ```
 
-Tasks with no dependency between them run at the same time. dapat has no concurrency limit. [Section 11.2](#112-limit-parallel-work) shows how to limit parallel work inside `run`.
+Tasks with no dependency between them run at the same time. dapat has no concurrency limit. [Section 12.2](#122-limit-parallel-work) shows how to limit parallel work inside `run`.
 
 ### Outputs with unknown names
 
@@ -488,7 +524,7 @@ The store keeps one stamp for each declared input and output. The key is `artifa
 
 dapat treats a record from an older version as no record. The task runs, and dapat writes a record in the new shape. So the first build after an upgrade runs every task one time. Older versions keyed the stamps by the bare id, or wrote two stamps for each id.
 
-Add the store file to `.gitignore`. To make tasks run again, see [section 11.1](#111-force-tasks-to-run-again).
+Add the store file to `.gitignore`. To make tasks run again, see [section 12.1](#121-force-tasks-to-run-again).
 
 ## 8. Failure, cancellation, and replacement
 
@@ -586,7 +622,7 @@ Delivery is synchronous. dapat calls each subscriber in the order that it subscr
 
 `subscribe` does not replay earlier events. Subscribe before the first `build.run()` to get all events. A subscriber that you add during a send gets the next event, not the current one.
 
-A task that skips sends no `produced` or `deleted` events ([section 12](#12-limits)).
+A task that skips sends no `produced` or `deleted` events ([section 13](#13-limits)).
 
 A subscriber can add tasks. This subscriber adds one task for each page from the `split` sample in section 5. Add it to that sample before `build.run()`:
 
@@ -679,11 +715,262 @@ send limit: subscribers caused 10000 events in one drain, and more wait; the las
 
 dapat handles this error as a subscriber error: `build.run()` rejects with it.
 
-## 10. Built-in artifacts
+## 10. `build.each`: tasks for each matched artifact
+
+Often you want one task for each thing of one kind: one HTML page for each markdown file, or one summary for each chapter. You do not want to list these tasks by hand, because the list changes when the files change.
+
+`build.each` makes these tasks for you. You give it two parts:
+
+- a **matcher**, which finds the things. It sends one **matched artifact** for each thing it finds.
+- a `tasks` function, which makes the tasks for one matched artifact.
+
+`build.run()` asks each matcher to scan, and `build.each` turns each matched artifact into tasks. These tasks then run like the tasks that you add with `build.add`. They use the same scheduler, the same store, and the same skip rule ([section 6](#6-when-a-task-skips)).
+
+Inside the build, a `TaskMaterializer` does this work. It acts like a materialized view of the matches: it listens to the `found` and `gone` events of the matcher and keeps one task list in the build for each match. A new match adds its tasks, a changed match replaces them, and a gone match removes them.
+
+A matcher also gets each output that a task declares or writes. So a task can make new things while the build runs, and `build.each` makes their tasks in the same run.
+
+Today `build.each` takes exactly one matcher, and dapat has no built-in matchers. You write a small subclass of `Matcher`.
+
+### Example
+
+This program makes one HTML page for each file `posts/<slug>.md`:
+
+```ts
+import { readdir } from "node:fs/promises"
+import path from "node:path"
+import { Build, Matcher, Task, type ArtifactEvent } from "dapat"
+import { FileArtifact, JsonStore } from "dapat/contrib"
+
+// Finds posts/<slug>.md, and sends one matched artifact for each file.
+class Posts extends Matcher<FileArtifact> {
+  readonly varNames = ["slug"]
+  private readonly folder = path.resolve("posts")
+
+  async scan(): Promise<void> {
+    const names = await readdir(this.folder)
+    for (const name of names) {
+      this.found(new FileArtifact(path.join(this.folder, name)))
+    }
+  }
+
+  // A task that declares or writes a post is also found, during the run.
+  override receiveArtifactEvent(event: ArtifactEvent): void {
+    if (event.kind === "promised" && event.output instanceof FileArtifact) {
+      this.found(event.output)
+    }
+    if (event.kind === "produced" && event.artifact instanceof FileArtifact) {
+      this.found(event.artifact)
+    }
+  }
+
+  private found(file: FileArtifact): void {
+    if (path.dirname(file.path) !== this.folder) return
+    if (!file.path.endsWith(".md")) return
+    const slug = path.basename(file.path, ".md")
+    this.send({ kind: "found", matched: { vars: { slug }, data: file } })
+  }
+}
+
+const build = new Build({ store: new JsonStore(".dapat/state.json") })
+
+build.each({
+  matchersByName: { post: new Posts() },
+  *tasks(vars, matched) {
+    const post = matched.post.data // a FileArtifact, the data type of Posts
+    const html = new FileArtifact(`site/${vars.slug}.html`)
+    yield new Task({
+      id: `page:${vars.slug}`,
+      inputs: [post],
+      outputs: [html],
+      run: async () => {
+        const text = await Bun.file(post.path).text()
+        await Bun.write(html.path, `<pre>${text}</pre>`)
+      },
+    })
+  },
+})
+
+const result = await build.run()
+```
+
+With `posts/hello.md` and `posts/bye.md`, the first run does these steps:
+
+1. `Posts.scan` reads the folder and sends `found` for `{ slug: "hello" }` and `{ slug: "bye" }`.
+2. For each matched artifact, `build.each` calls `tasks`, and the build adds `page:hello` and `page:bye`.
+3. The scan returns. The build starts both tasks.
+
+The next time the program runs with no change, both tasks skip. If you add a task with `build.add` that declares the output `posts/news.md`, `Posts` gets its `promised` event and sends `found` for `{ slug: "news" }`. `build.each` adds `page:news`, and `page:news` waits for the task that writes the post.
+
+### Matchers
+
+A matcher is a subclass of `Matcher<D>`. `D` is the data of each matched artifact, for example `FileArtifact`, or `readonly FileArtifact[]` for a list. It has three members:
+
+```ts
+abstract class Matcher<D extends MatchedData = MatchedData> extends Emitter<MatchedArtifactEvent<D>> {
+  abstract readonly varNames: readonly string[]
+  abstract scan(signal: AbortSignal): Promise<void>
+  receiveArtifactEvent(event: ArtifactEvent): void {}
+}
+```
+
+- `varNames` are the names of the vars of each matched artifact. In the example, `["slug"]`.
+- `scan` looks at the world now, and sends `found` for each thing that it finds. Disk reads and network calls go here. `signal` aborts when another scan fails, or when the build fails.
+- `receiveArtifactEvent` gets each event of the build ([section 9](#9-subscribe-to-artifact-events)). It can send `found` for an output that a task declares or writes. It must be fast and do no I/O. The default does nothing, so the matches never change during a run.
+
+A matcher sends events with `this.send(event)`. It knows nothing about the code that listens to it. One matcher can feed several `build.each` calls of one build. It still gets each build event one time. A matcher belongs to the first build that uses it: give each `Build` its own matchers.
+
+A matcher may send `found` again for the same thing. `build.each` ignores a `found` whose data has the same artifact ids, in the same order, as the current match. So the `Posts` matcher can send `found` for the `promised` event and again for the `produced` event of one file. The task is made one time, and a task that rewrites its own input in place does not run again.
+
+A change to the content of an artifact is the job of its stamp, not of the match: the next build runs the task again because the stamp changed. To force the tasks of a match to be made again, a matcher sends `gone` and then `found`.
+
+A task that has finished does not run again in the same run when a task it waits for is replaced and writes its output again. The next build runs it again, because the stamp of its input changed. Plain tasks work the same way.
+
+### Matched artifacts
+
+A matched artifact is one thing that a matcher found:
+
+```ts
+type Vars = Readonly<Record<string, string>>
+
+type MatchedData = Artifact | readonly Artifact[]
+
+type MatchedArtifact<D extends MatchedData = MatchedData> = {
+  vars: Vars
+  data: D
+}
+```
+
+`vars` holds the values that name the thing, one for each name in `varNames`. `data` is the artifact that the task reads, or a list of artifacts. Its type comes from the matcher. In the example, `Posts` is a `Matcher<FileArtifact>`, so `matched.post.data` is a `FileArtifact`, and it can go straight into `inputs`.
+
+The vars of a matched artifact are also its key. Two matched artifacts with the same vars are the same match.
+
+### Matched artifact events: `found` and `gone`
+
+A matcher sends a `MatchedArtifactEvent`:
+
+```ts
+type MatchedArtifactEvent =
+  | { kind: "found"; matched: MatchedArtifact }  // a new match, or a new version of the match with these vars
+  | { kind: "gone"; vars: Vars }                 // the match with these vars is gone
+```
+
+| The matcher sends | `build.each` does |
+| --- | --- |
+| `found` with new vars | adds the tasks of the match |
+| `found` with known vars and new data | replaces the tasks of the match ([section 8](#replacement)) |
+| `found` with known vars and the same artifact ids | nothing |
+| `gone` | removes the tasks of the match ([section 8](#removal)) |
+
+For example, a matcher sends `found { slug: "a" }`, then `found { slug: "a" }` with a new file, then `gone { slug: "a" }`. `build.each` adds the tasks of `a`, replaces them, and then removes them. A `gone` for a match that `build.each` does not know does nothing.
+
+### The `build.each` config
+
+```ts
+build.each({
+  matchersByName: { post: new Posts() },
+  *tasks(vars, matched) { ... },
+})
+```
+
+- `matchersByName` names the matcher. The name is yours. `tasks` gets the matched artifact under that name, as `matched.post`.
+- `tasks` gets the vars and the matched artifacts by name. It returns the tasks for that match. Write it as a generator (`*tasks`), so it can yield no task, one task, or many tasks.
+
+`tasks` can yield more than one task for a match:
+
+```ts
+*tasks(vars, matched) {
+  const post = matched.post.data
+  yield new Task({ id: `page:${vars.slug}`, inputs: [post], outputs: [new FileArtifact(`site/${vars.slug}.html`)], run: async () => {} })
+  yield new Task({ id: `words:${vars.slug}`, inputs: [post], outputs: [new FileArtifact(`site/${vars.slug}.words`)], run: async () => {} })
+}
+```
+
+Each match has one task group ([Task groups](#task-groups)). The label of the group is `build.each <number> <var name>=<var value> ...`, for example `build.each 1 slug=hello`. dapat counts the `build.each` calls from 1, in order. The vars are in `varNames` order. A task id must be unique in the build. If two matches give one task id, or a match gives the id of a task that you added with `build.add`, `build.run()` rejects ([Errors in `build.each`](#errors-in-buildeach)). So put the vars in the task id, as `page:${vars.slug}` does.
+
+Call `build.each` before the first `build.run()`. After that, it throws.
+
+### Scans finish before tasks start
+
+The first `build.run()` does these steps:
+
+1. It sends a `promised` event for each output of each task that you added with `build.add`. Matchers get them, so `build.each` can make tasks for them.
+2. It starts the scan of each matcher, all at the same time, and waits until every scan has returned.
+3. It starts the tasks.
+
+No task starts during a scan. A scan that is still running could find a thing whose task writes the input of another task.
+
+A later `build.run()` on the same build does not scan again. A `build.run()` that you call while the scans of the first one still run waits for the same scans, and then starts the tasks.
+
+### Matches during the run
+
+When a task calls `ctx.produced(artifact)`, the build sends the `produced` event to each matcher. A matcher can send `found`, and `build.each` adds its tasks. All of this happens before `ctx.produced` returns.
+
+This task splits a book into chapters. `build.each` makes one summary task for each chapter, while `split` runs:
+
+```ts
+class Chapters extends Matcher<FileArtifact> {
+  readonly varNames = ["n"]
+  async scan(): Promise<void> {}
+  override receiveArtifactEvent(event: ArtifactEvent): void {
+    if (event.kind !== "produced") return
+    if (!(event.artifact instanceof FileArtifact)) return
+    const match = /\/chapters\/(\d+)\.md$/.exec(event.artifact.path)
+    if (match === null) return
+    this.send({ kind: "found", matched: { vars: { n: match[1]! }, data: event.artifact } })
+  }
+}
+
+build.add(
+  new Task({
+    id: "split",
+    outputs: [new FilesystemPrefix("chapters")],
+    run: async (ctx) => {
+      for (let n = 0; n < 3; n++) {
+        const chapter = new FileArtifact(`chapters/${n}.md`)
+        await Bun.write(chapter.path, `chapter ${n}`)
+        ctx.produced(chapter) // build.each adds summary:<n> before this returns
+      }
+    },
+  }),
+)
+
+build.each({
+  matchersByName: { chapter: new Chapters() },
+  *tasks(vars, matched) {
+    yield new Task({ id: `summary:${vars.n}`, inputs: [matched.chapter.data], run: async () => {} })
+  },
+})
+```
+
+When `split` returns, `summary:0`, `summary:1`, and `summary:2` exist. They run in the same `build.run()`.
+
+### Errors in `build.each`
+
+The `tasks` function and a matcher are part of your program, like a subscriber. A mistake in them makes `build.run()` reject ([Subscriber errors](#subscriber-errors)).
+
+An error in `build.each` is fatal for the build, as a subscriber error is. The `send` of the matcher does not throw it, so a matcher that catches errors cannot hide it. An error outside `build.run()`, for example from the `promised` event of a `build.add` after the run, makes the next `build.run()` reject.
+
+| Where | Example | What you see |
+| --- | --- | --- |
+| `build.each` | `matchersByName` has no matcher, or two | `build.each` throws |
+| `build.each` | you call it after `build.run()` | `build.each` throws |
+| `build.each` | its matcher is used by another `Build` | `build.each` throws |
+| a scan | the folder does not exist | `build.run()` rejects at once, and no task runs. The other scans get an aborted `signal`. `build.run()` does not wait for them. |
+| a matched artifact | its vars are not the `varNames` of its matcher | `build.run()` rejects |
+| `tasks` | two matches give one task id | `build.run()` rejects with `task 'x' is in two groups: 'build.each 1 slug=a' and 'build.each 1 slug=b'` |
+| `tasks` | it throws | `build.run()` rejects with that error |
+
+Two limits remain:
+
+- **A scan that never returns makes `build.run()` wait forever.** `build.run()` takes no signal, and the scan signal aborts only when the build fails.
+- **A `build.each` that feeds itself is not bounded yet.** For example, a task reads `turns/<n>.txt` and writes `turns/<n+1>.txt`. Each produced file makes a new task, and the run does not end. A task limit comes in a later version.
+
+## 11. Built-in artifacts
 
 The [API reference](#api-reference) gives the full details of each class.
 
-### 10.1 Files: `FileArtifact`, `FilesystemPrefix`
+### 11.1 Files: `FileArtifact`, `FilesystemPrefix`
 
 A relative path resolves against the current working directory when you create the object.
 
@@ -722,7 +1009,7 @@ Older versions of dapat used the hash for every file. After an upgrade, every st
 
 Older versions also had `directory()`, a folder artifact. Use `new FilesystemPrefix(path)` in its place, and call `list()` in place of `read()`. dapat stores a folder stamp under a different key, so each task that used `directory()` runs one time after the change.
 
-### 10.2 S3: `S3ObjectArtifact`, `S3Prefix`, `S3Client`, `MemoryS3`
+### 11.2 S3: `S3ObjectArtifact`, `S3Prefix`, `S3Client`, `MemoryS3`
 
 dapat does not include an AWS client. You give it an object that has these four methods:
 
@@ -758,9 +1045,9 @@ Write an adapter for the AWS SDK or for your own HTTP client. The adapter must o
 | `S3ObjectArtifact(client, bucket, key)` | `etag` | `Uint8Array` |
 | `S3Prefix(client, bucket, keyPrefix)` | SHA-256 of each key under the prefix and its `etag` | none |
 
-## 11. Recipes
+## 12. Recipes
 
-### 11.1 Force tasks to run again
+### 12.1 Force tasks to run again
 
 To run every task again, clear the store before the build:
 
@@ -772,7 +1059,7 @@ const build = new Build({ store })
 
 To run one task again, delete its record with `await store.delete(taskId)`. A task with no record always runs.
 
-### 11.2 Limit parallel work
+### 12.2 Limit parallel work
 
 dapat starts every ready task at the same time. To limit how many tasks do heavy work at the same time, share a gate between the tasks:
 
@@ -817,7 +1104,7 @@ build.add(
 
 When a task finishes, the gate gives its place directly to the next waiting task. So no more than `max` tasks do work at the same time.
 
-### 11.3 Run in CI
+### 12.3 Run in CI
 
 A task skips only when the store has a record for it. To skip unchanged tasks in CI, keep these items in the CI cache between runs:
 
@@ -826,7 +1113,7 @@ A task skips only when the store has a record for it. To skip unchanged tasks in
 
 A new checkout changes the modification time of each file. With the default `stamp: "time"`, that changes the stamp of each file, and every task with a file input runs. In CI, pass `{ stamp: "hash" }` to `FileArtifact` and `FilesystemPrefix`. A hash does not change when the bytes stay the same. The ids of these artifacts are absolute paths. So check out the repo at the same path on each CI run. At a different path, the ids change, and every task runs. If the cache is empty, every task runs.
 
-## 12. Limits
+## 13. Limits
 
 - **A task that skips sends no `produced` or `deleted` events.** This applies to its prefix outputs and to its declared outputs. A subscriber gets only the `promised` events of that task on the next build.
 - **A task with an `IdPrefix` input or output runs on each build.** An `IdPrefix` cannot list what is under it, so its stamp is `null`. A skip could hide a change under it. To let the task skip, use a prefix that can stamp, for example `FilesystemPrefix` or `S3Prefix`, or write a prefix subclass with a `stamp()` method.
@@ -847,7 +1134,7 @@ A new checkout changes the modification time of each file. With the default `sta
   To let all of these tasks skip from build 2, give each writer its own folder, for example `out/pages/` for `split` and `out/index.html` next to it, with no task that reads all of `out/`.
 - **A prefix input that covers the store file runs on every build.** For example, a task reads `new FilesystemPrefix(".")`, and the store is `.dapat/state.json`. Each build writes the store, so the stamp of the prefix changes. Put the store outside the folders that tasks read, or read a narrower prefix.
 - **Only a missing path counts as missing.** `FileArtifact` returns a `null` stamp, and `FilesystemPrefix` returns the stamp of an empty list and lists no files, only for `ENOENT`. Every other error makes `stamp()` throw, so the task fails with that error, for example a permission error, or a file where a folder must be. In `"time"` mode, dapat reads only the metadata of a file. A file that the task cannot read still gets a stamp, and `read()` fails later.
-- **No timeout and no concurrency limit.** All ready tasks start at the same time. Add limits and timeouts in your task code ([section 11.2](#112-limit-parallel-work)), and use `ctx.signal` to stop work.
+- **No timeout and no concurrency limit.** All ready tasks start at the same time. Add limits and timeouts in your task code ([section 12.2](#122-limit-parallel-work)), and use `ctx.signal` to stop work.
 - **Bun only.** The adapters use Bun APIs.
 
 ---
@@ -868,11 +1155,20 @@ new Build(opts?: { store?: Store; sendLimit?: number })
 
 | Member | Description |
 | --- | --- |
-| `add(task: Task): void` | Adds a task. If a task with the same id exists, replaces it (see [section 8](#replacement)). If `run()` has started, sends a `promised` event for each declared output, and the task starts at once. Does not throw when a subscriber throws ([section 9](#subscriber-errors)). Throws if another task already declares one of its exact outputs, if the task declares one output twice, or if another owner holds that id ([section 5](#5-tasks-and-dependencies)). Throws before it changes anything. |
-| `remove(id: string): void` | Removes a task. Aborts it if it is running and sends a `withdrawn` event for each declared output. Does not throw when a subscriber throws. Starts to delete its store record. Does not wait for the delete, but `run()` does. A delete error goes into `result.errors`. Does nothing if the id is not known. The other tasks of the same owner stay. |
+| `add(task: Task): void` | Adds a task. If a task with the same id exists, replaces it (see [section 8](#replacement)). If `run()` has started, sends a `promised` event for each declared output, and the task starts at once. Does not throw when a subscriber throws ([section 9](#subscriber-errors)). Throws if another task already declares one of its exact outputs, if the task declares one output twice, or if another task group has that id ([Task groups](#task-groups)). Throws before it changes anything. |
+| `remove(id: string): void` | Removes a task. Aborts it if it is running and sends a `withdrawn` event for each declared output. Does not throw when a subscriber throws. Starts to delete its store record. Does not wait for the delete, but `run()` does. A delete error goes into `result.errors`. Does nothing if the id is not known. The other tasks of the same task group stay. |
 | `subscribe(listener: (event: ArtifactEvent) => void): void` | From `Emitter`. Calls `listener` synchronously for each artifact event, in the order of the event queue. Does not replay earlier events. See [section 9](#9-subscribe-to-artifact-events). |
-| `protected setTasks(owner: string, tasks: readonly Task[]): void` | Makes `tasks` the tasks of `owner` ([section 5](#5-tasks-and-dependencies)). Adds each new id, replaces each known id, and removes each id that `owner` gave before and does not give now. Changes all state first, then puts the events on the queue: all `withdrawn` events of the call first, then the `promised` events, by id in list order. A dropped task ends as `cancelled` with the reason `"removed"` if it had not finished. Throws and changes nothing if another owner has one of the ids, if `tasks` has one id two times, or if two tasks declare one exact output. `add(task)` calls `setTasks("add:" + task.id, [task])`. Rules will call it; your code does not. |
-| `run(): Promise<Result>` | The first time, sends a `promised` event for each output of each task that is in the build. Then starts every task and resolves when every started task has finished. Does not reject when a task fails. Rejects with the first subscriber error or send-limit error of the build, at once if that error happened before the call ([section 9](#subscriber-errors)). |
+| `protected setTasks(group: TaskGroup, tasks: readonly Task[]): void` | Makes `tasks` the tasks of `group` ([Task groups](#task-groups)). Adds each new id, replaces each known id, and removes each id that `group` had before and does not get now. Changes all state first, then puts the events on the queue: all `withdrawn` events of the call first, then the `promised` events, by id in list order. A dropped task ends as `cancelled` with the reason `"removed"` if it had not finished. Throws and changes nothing if another group has one of the ids, if `tasks` has one id two times, or if two tasks declare one exact output. `add(task)` calls it with one group for each task id. `build.each` calls it with one group for each match. A subclass of `Build` can call it with its own `new TaskGroup(label)`. |
+| `each<M extends Record<string, AnyMatcher>>(config: TaskMaterializerConfig<M>): void` | Makes tasks for each matched artifact ([section 10](#10-buildeach-tasks-for-each-matched-artifact)). Subscribes to the one matcher in `matchersByName` and gives the tasks of each match through `setTasks`, with one task group for each match, labeled `build.each <number> <var name>=<var value> ...`. The build sends each artifact event to `matcher.receiveArtifactEvent`, one time for each matcher. An error in `tasks` or in a matched artifact is fatal for the build, like a subscriber error. Throws if `matchersByName` does not have exactly one matcher, if `run()` has started, or if another `Build` uses the matcher. |
+| `run(): Promise<Result>` | The first time, sends a `promised` event for each output of each task that is in the build, and then runs the scan of each matcher and waits for all of them. A call during the scans waits for the same scans. Then starts every task and resolves when every started task has finished. Does not reject when a task fails. Rejects with the first subscriber error, `build.each` error, scan error, or send-limit error of the build, at once if that error happened before the call ([section 9](#subscriber-errors)). After a scan error, no task starts. |
+
+### `class TaskGroup`
+
+```ts
+new TaskGroup(label: string)
+```
+
+A group of tasks for `setTasks` ([Task groups](#task-groups)). The object is the identity. `label` is only for error messages.
 
 ### `class Task`
 
@@ -1029,6 +1325,57 @@ type ArtifactEvent =
 
 `taskId` is the task that declares the output, or that produced or deleted the artifact. See [section 9](#9-subscribe-to-artifact-events).
 
+### `abstract class Matcher<D extends MatchedData = MatchedData>`
+
+```ts
+abstract class Matcher<D extends MatchedData = MatchedData> extends Emitter<MatchedArtifactEvent<D>> {
+  abstract readonly varNames: readonly string[]
+  abstract scan(signal: AbortSignal): Promise<void>
+  receiveArtifactEvent(event: ArtifactEvent): void {}
+}
+```
+
+| Member | Description |
+| --- | --- |
+| `varNames` | The var names of each matched artifact that the matcher sends. Each one must have exactly these vars. |
+| `scan(signal)` | Looks at the world now and sends `found` for each thing that it finds. The first `build.run()` calls it, and waits for it before any task starts. `signal` aborts when another scan fails or when the build fails. |
+| `receiveArtifactEvent(event)` | Gets each artifact event of the build. It can send `found` and `gone`. It must be fast and do no I/O. The default does nothing. |
+
+A matcher belongs to one `Build`.
+
+See [section 10](#10-buildeach-tasks-for-each-matched-artifact).
+
+### `type Vars`, `type MatchedData`, `type MatchedArtifact`, and `type MatchedArtifactEvent`
+
+```ts
+type Vars = Readonly<Record<string, string>>
+
+type MatchedData = Artifact | readonly Artifact[]
+
+type MatchedArtifact<D extends MatchedData = MatchedData> = { vars: Vars; data: D }
+
+type MatchedArtifactEvent<D extends MatchedData = MatchedData> =
+  | { kind: "found"; matched: MatchedArtifact<D> }
+  | { kind: "gone"; vars: Vars }
+```
+
+The vars of a matched artifact are its key. A `found` with known vars and new data replaces the match, a `found` with the same artifact ids in the same order does nothing, and a `gone` removes it. See [Matched artifacts](#matched-artifacts).
+
+### `type TaskMaterializerConfig<M>` and `type MatchedByName<M>`
+
+```ts
+type TaskMaterializerConfig<M extends Record<string, AnyMatcher>> = {
+  matchersByName: M
+  tasks: (vars: Vars, matched: MatchedByName<M>) => Iterable<Task>
+}
+
+type MatchedByName<M extends Record<string, AnyMatcher>> = {
+  readonly [K in keyof M]: MatchedArtifact<DataOf<M[K]>>
+}
+```
+
+`AnyMatcher` is `Matcher<any>`: a matcher of any data type. Each matched artifact has the data type of its own matcher: `DataOf` reads `D` from the matcher type. `matchersByName` must have exactly one entry. `tasks` gets the vars of one match and the matched artifact under its matcher's name. See [The `build.each` config](#the-buildeach-config).
+
 ## Filesystem (`dapat/contrib`)
 
 Relative paths are resolved against `process.cwd()` when you construct the artifact.
@@ -1065,7 +1412,7 @@ new FilesystemPrefix(path: string, opts?: { stamp?: "time" | "hash" })
 
 ### `interface S3Client` and `interface S3Head`
 
-See [section 10.2](#102-s3-s3objectartifact-s3prefix-s3client-memorys3).
+See [section 11.2](#112-s3-s3objectartifact-s3prefix-s3client-memorys3).
 
 ### `class S3ObjectArtifact extends Artifact<Uint8Array>`
 
