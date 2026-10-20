@@ -206,7 +206,7 @@ Example: a task writes `index.html` from every page under `pages/`. Its input is
 
 An edit to a page or a deleted page also changes the stamp.
 
-An empty or missing folder has a real stamp, for example the hash of an empty list. So a task can skip when its folder is still empty.
+An empty or missing folder has a real stamp, for example the hash of an empty list. So a task can skip when its folder is still empty. This also means that a task whose folder output holds no files does not run again when you delete that empty folder.
 
 A prefix returns `null` from `stamp()` when it cannot tell what is under it. Then each task that uses that prefix runs on each build. The base class `Prefix` returns `null`. `IdPrefix` uses the base class, because an id string cannot list its children. A skip could then hide a change, so the task runs.
 
@@ -314,7 +314,7 @@ You do not declare edges. dapat finds them from the ids of your inputs and outpu
 
 An input that no task writes is a **source**, for example `in.txt` in section 3. dapat does not wait for a source.
 
-Only one task can declare a given artifact as an output. `build.add()` throws `duplicate output '<id>'` when a second task declares the same output id. One task also cannot declare the same output two times. Two tasks can still write into one folder, and a task can write into a folder that it reads. Those tasks run on every build ([Prefix layouts](#prefix-layouts)).
+Only one task can declare a given artifact as an output. `build.add()` throws `duplicate output '<id>'` when a second task declares the same output id. One task also cannot declare the same output two times. Two tasks can still write into one folder, and a task can write into a folder that it reads. Those tasks can run again with no edits ([Prefix layouts](#prefix-layouts)).
 
 A waiting task finds its producers again each time a task is added, removed, or completed. When a producer finishes, the waiting task continues in this way:
 
@@ -699,7 +699,7 @@ Both classes take the option `stamp: "time" | "hash"`. The factory functions `fi
 - `"time"`: the stamp of a file is its modification time in nanoseconds and its size. dapat reads no bytes.
 - `"hash"`: the stamp of a file is the SHA-256 of its bytes. dapat reads each file in full.
 
-`FilesystemPrefix` follows symlinks, in `stamp()` and in `list()`. A link to a file counts as that file, with the stamp of its target. A link to a folder is walked. A link back to a folder above it is not walked again. A link that cannot resolve adds no file: a broken link, a link to itself, two links that point at each other, or a link through a file. If the folder of the prefix itself cannot resolve, `stamp()` throws.
+`FilesystemPrefix` follows symlinks, in `stamp()` and in `list()`. A link to a file counts as that file, with the stamp of its target. A link to a folder is walked. A link back to a folder above it is not walked again. A link that cannot resolve adds no file: a broken link, a link to itself, two links that point at each other, or a link through a file. If the folder of the prefix is a broken link, dapat treats it as a missing folder: `list()` returns `[]`. If the folder of the prefix is a link loop, `stamp()` throws.
 
 `"time"` stats up to 256 files at the same time. `"hash"` reads up to 8 files at the same time, and streams a file of 1 MB or more into the hash, so a large file does not fill the memory.
 
@@ -719,6 +719,8 @@ const pages = folder("pages/", { stamp: "hash" })
 ```
 
 Older versions of dapat used the hash for every file. After an upgrade, every stamp of a file is different, so each task with a file runs one time.
+
+Older versions also had `directory()`, a folder artifact. Use `folder()` in its place, and call `list()` in place of `read()`. dapat stores a folder stamp under a different key, so each task that used `directory()` runs one time after the change.
 
 ### 10.2 S3: `S3ObjectArtifact`, `S3Prefix`, `S3Client`, `MemoryS3`
 
