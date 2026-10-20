@@ -1,10 +1,10 @@
 import type { MatchedArtifact, Vars } from "./matched-artifact"
 import type { TaskGroup } from "./task-group"
 
-/** The var values of a match in its matcher's varNames order, each URI-encoded, joined with "/". */
+/** The JSON list of the var values of a match, in its matcher's varNames order. */
 type VarsKey = string
 
-/** The values of some join var names, in a fixed order, encoded like a VarsKey. */
+/** The values of some join var names, in a fixed order, as a JSON list like a VarsKey. */
 type JoinKey = string
 
 /** The current match of one vars key of one matcher. */
@@ -108,7 +108,7 @@ export class MatchTable {
     }
     if (!sameNames) {
       throw new Error(
-        `matcher '${this.name}' of build.each ${this.eachNumber} matched an artifact with vars ` +
+        `matcher '${this.name}' of build.each ${this.eachNumber} sent vars ` +
           `[${given.join(", ")}]; its varNames are [${this.varNames.join(", ")}]`,
       )
     }
@@ -198,11 +198,14 @@ export function joinFrom(table: MatchTable, start: StoredMatch, steps: readonly 
   return partialSets
 }
 
-/** The values of `varNames` in that order, each URI-encoded, joined with "/". */
+/**
+ * The JSON list of the values of `varNames`, in that order.
+ * JSON, not encodeURIComponent: that throws on a lone surrogate, and a var value can hold one.
+ */
 function keyOfVars(vars: Vars, varNames: readonly string[]): string {
-  const parts: string[] = []
+  const values: string[] = []
   for (const name of varNames) {
-    parts.push(encodeURIComponent(vars[name]!))
+    values.push(vars[name]!)
   }
-  return parts.join("/")
+  return JSON.stringify(values)
 }

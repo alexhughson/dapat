@@ -308,6 +308,84 @@ describe("build.each with one matcher", () => {
     expect(sortedIds(result.executed)).toEqual(["sitemap:en"])
   })
 
+  test("one artifact and a list of that one artifact are different data", async () => {
+    const a = new Mem("html:a", "A")
+    const shapes: string[] = []
+    const matcher = new EventMatcher<Mem | readonly Mem[]>(
+      ["lang"],
+      [
+        { kind: "found", matched: { vars: { lang: "en" }, data: a } },
+        { kind: "found", matched: { vars: { lang: "en" }, data: [a] } },
+      ],
+    )
+    const build = new Build()
+    build.each({
+      matchersByName: { html: matcher },
+      *tasks(vars, matched) {
+        const data = matched.html.data
+        if (Array.isArray(data)) {
+          shapes.push("list")
+        } else {
+          shapes.push("one")
+        }
+        yield new Task({ id: `sitemap:${vars.lang}`, run: async () => {} })
+      },
+    })
+
+    await build.run()
+
+    expect(shapes).toEqual(["one", "list"])
+  })
+
+  test("a var named __proto__ and a matcher named __proto__ reach tasks() as own properties", async () => {
+    const events: MatchedArtifactEvent<Mem>[] = []
+    for (const owner of ["ann", "bob"]) {
+      // A computed key makes an own property named __proto__.
+      events.push({ kind: "found", matched: { vars: { ["__proto__"]: owner, slug: "x" }, data: new Mem(`mem:${owner}`, "1") } })
+    }
+    const matcher = new EventMatcher<Mem>(["__proto__", "slug"], events)
+    const got: string[] = []
+    const build = new Build()
+    build.each({
+      matchersByName: { ["__proto__"]: matcher },
+      *tasks(vars, matched) {
+        const owner = Object.hasOwn(vars, "__proto__") ? vars["__proto__"] : "?"
+        const data = Object.hasOwn(matched, "__proto__") ? matched["__proto__"].data.id : "?"
+        got.push(`${owner} ${data}`)
+        yield new Task({ id: `t:${owner}/${vars.slug}`, run: async () => {} })
+      },
+    })
+
+    const result = await build.run()
+
+    expect(got).toEqual(["ann mem:ann", "bob mem:bob"])
+    expect(sortedIds(result.executed)).toEqual(["t:ann/x", "t:bob/x"])
+  })
+
+  test("a var value with a lone surrogate makes a task", async () => {
+    // The two halves of one emoji, each one alone.
+    const highHalf = "\ud83d"
+    const lowHalf = "\ude00"
+    const matcher = new EventMatcher<Mem>(
+      ["name"],
+      [
+        { kind: "found", matched: { vars: { name: highHalf }, data: new Mem("page:high", "1") } },
+        { kind: "found", matched: { vars: { name: lowHalf }, data: new Mem("page:low", "1") } },
+      ],
+    )
+    const build = new Build()
+    build.each({
+      matchersByName: { page: matcher },
+      *tasks(_vars, matched) {
+        yield new Task({ id: `t:${matched.page.data.id}`, run: async () => {} })
+      },
+    })
+
+    const result = await build.run()
+
+    expect(sortedIds(result.executed)).toEqual(["t:page:high", "t:page:low"])
+  })
+
   test("a task that rewrites its own input in place runs one time", async () => {
     const post = new Mem("post:a", "draft")
     let runs = 0
@@ -563,7 +641,22 @@ describe("build.each errors", () => {
     })
 
     await expect(build.run()).rejects.toThrow(
-      "matcher 'page' of build.each 1 matched an artifact with vars [slug]; its varNames are [name]",
+      "matcher 'page' of build.each 1 sent vars [slug]; its varNames are [name]",
+    )
+  })
+
+  test("a gone with wrong var names rejects run(); a gone with the right var names and no match does nothing", async () => {
+    const unknownGone = new EventMatcher<Mem>(["name"], [{ kind: "gone", vars: { name: "nobody" } }])
+    const quiet = new Build()
+    quiet.each({ matchersByName: { page: unknownGone }, *tasks() {} })
+    const result = await quiet.run()
+    expect(result.success).toBe(true)
+
+    const wrongGone = new EventMatcher<Mem>(["name"], [{ kind: "gone", vars: { slug: "a" } }])
+    const failing = new Build()
+    failing.each({ matchersByName: { page: wrongGone }, *tasks() {} })
+    await expect(failing.run()).rejects.toThrow(
+      "matcher 'page' of build.each 1 sent vars [slug]; its varNames are [name]",
     )
   })
 

@@ -481,6 +481,35 @@ describe("matcher events never run inside another hear", () => {
     expect(result.success).toBe(true)
     expect(templateIdsThatRan).toEqual(["template:en#2"])
   })
+  test("two build.each calls on one matcher both end with the newer found that tasks() of the first sends", async () => {
+    const posts = new PathMatcher("post:", ["slug"], [new Mem("post:a#1", "1")])
+    const build = new Build()
+    let sentNewer = false
+    const ran: string[] = []
+    build.each({
+      matchersByName: { post: posts },
+      *tasks(vars, matched) {
+        const postId = matched.post.data.id
+        if (!sentNewer) {
+          sentNewer = true
+          posts.foundArtifact(new Mem("post:a#2", "2"))
+        }
+        yield new Task({ id: `one:${vars.slug}`, inputs: [matched.post.data], run: async () => void ran.push(`one ${postId}`) })
+      },
+    })
+    build.each({
+      matchersByName: { post: posts },
+      *tasks(vars, matched) {
+        const postId = matched.post.data.id
+        yield new Task({ id: `two:${vars.slug}`, inputs: [matched.post.data], run: async () => void ran.push(`two ${postId}`) })
+      },
+    })
+
+    const result = await build.run()
+
+    expect(result.success).toBe(true)
+    expect(ran.sort()).toEqual(["one post:a#2", "two post:a#2"])
+  })
 })
 
 describe("MatchTable", () => {
