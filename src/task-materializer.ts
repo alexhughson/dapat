@@ -83,10 +83,12 @@ export class TaskMaterializer<M extends Record<string, AnyMatcher>> {
     table.put(stored)
     const joinSteps = this.joinStepsByName.get(matcherName)!
     for (const joined of joinFrom(table, stored, joinSteps)) {
-      const vars: Record<string, string> = {}
+      const varEntries: [string, string][] = []
       for (const varName of this.unionVarNames) {
-        vars[varName] = joined.vars[varName]!
+        varEntries.push([varName, joined.vars[varName]!])
       }
+      // fromEntries makes each var an own property, also a var named __proto__.
+      const vars: Vars = Object.fromEntries(varEntries)
       const set: JoinedSet = { vars, membersByName: joined.membersByName, group: new TaskGroup(this.labelOf(vars)) }
       for (const member of set.membersByName.values()) {
         member.sets.add(set)
@@ -110,10 +112,12 @@ export class TaskMaterializer<M extends Record<string, AnyMatcher>> {
 
   /** Gives the build the tasks of the set, from its current matches. */
   private giveTasks(set: JoinedSet): void {
-    const matched: Record<string, MatchedArtifact> = {}
+    const matchedEntries: [string, MatchedArtifact][] = []
     for (const [name, member] of set.membersByName) {
-      matched[name] = member.matched
+      matchedEntries.push([name, member.matched])
     }
+    // fromEntries makes each name an own property, also a matcher named __proto__.
+    const matched = Object.fromEntries(matchedEntries)
     const tasks: Task[] = []
     for (const task of this.config.tasks(set.vars, matched as MatchedByName<M>)) {
       tasks.push(task)

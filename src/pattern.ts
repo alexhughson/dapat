@@ -20,13 +20,18 @@ export class KeyPattern {
   readonly varNames: readonly string[]
   readonly hasGlob: boolean
   private readonly segments: Segment[]
+  private readonly keyRegex: RegExp
 
   constructor(template: string) {
     this.template = template
-    this.segments = splitTemplate(template).map(parseSegment)
+    this.segments = []
+    for (const raw of splitTemplate(template)) {
+      this.segments.push(parseSegment(raw, template))
+    }
     const meta = collectMeta(this.segments)
     this.varNames = meta.varNames
     this.hasGlob = meta.hasGlob
+    this.keyRegex = keyRegexOf(this.segments)
   }
 
   /** Literal key up to the first var or glob. Always ends with `/` when non-empty. */
@@ -41,7 +46,19 @@ export class KeyPattern {
   }
 
   match(key: string): Vars | null {
-    return matchSegments(this.segments, splitTemplate(key))
+    let slashedKey = ""
+    for (const segment of splitTemplate(key)) {
+      slashedKey += `/${segment}`
+    }
+    const match = this.keyRegex.exec(slashedKey)
+    if (match === null) return null
+    const groups = match.groups ?? {}
+    const entries: [string, string][] = []
+    for (const name of this.varNames) {
+      entries.push([name, groups[name]!])
+    }
+    // fromEntries makes each var an own property, also a var named __proto__.
+    return Object.fromEntries(entries)
   }
 
   render(vars: Vars): string {
@@ -79,7 +96,7 @@ function splitTemplate(template: string): string[] {
   return out
 }
 
-function parseSegment(raw: string): Segment {
+function parseSegment(raw: string, template: string): Segment {
   if (raw === "**") return { kind: "rest" }
   if (raw === "*") return { kind: "star" }
   const parts: Part[] = []
@@ -95,7 +112,14 @@ function parseSegment(raw: string): Segment {
     if (match[0] === "*") {
       parts.push({ kind: "star" })
     } else {
-      parts.push({ kind: "var", name: match[1]! })
+      const name = match[1]!
+      const previous = parts[parts.length - 1]
+      if (previous !== undefined && previous.kind === "var") {
+        throw new Error(
+          `pattern '${template}': the vars <${previous.name}> and <${name}> have nothing between them, so a key has no single split`,
+        )
+      }
+      parts.push({ kind: "var", name })
     }
     last = match.index + match[0].length
     match = token.exec(raw)
@@ -127,61 +151,44 @@ function collectMeta(segments: Segment[]): {
   return { varNames: names, hasGlob: glob }
 }
 
-function matchSegments(pat: Segment[], pathSegs: string[]): Vars | null {
-  return walk(0, 0, {})
-
-  function walk(pi: number, sj: number, vars: Vars): Vars | null {
-    if (pi === pat.length && sj === pathSegs.length) return vars
-    if (pi === pat.length) return null
-    const segment = pat[pi]
+/**
+ * One regex for the whole key, which `match` gives with a `/` before each segment.
+ * A var that comes again is a backreference, so the regex tries every split until all
+ * places of the var agree. `[^/]` also matches line breaks. The `u` flag keeps a surrogate pair whole.
+ */
+function keyRegexOf(segments: Segment[]): RegExp {
+  let source = "^"
+  const seenVarNames = new Set<string>()
+  for (const segment of segments) {
     if (segment.kind === "rest") {
-      for (let n = 0; n <= pathSegs.length - sj; n++) {
-        const got = walk(pi + 1, sj + n, vars)
-        if (got) return got
-      }
-      return null
+      // Lazy, so `**` takes as few segments as it can.
+      source += "(?:/[^/]+)*?"
+      continue
     }
-    if (sj >= pathSegs.length) return null
+    source += "/"
     if (segment.kind === "lit") {
-      if (pathSegs[sj] !== segment.value) return null
-      return walk(pi + 1, sj + 1, vars)
+      source += escapeRe(segment.value)
+      continue
     }
     if (segment.kind === "star") {
-      return walk(pi + 1, sj + 1, vars)
+      source += "[^/]+"
+      continue
     }
-    const next = matchMix(segment.parts, pathSegs[sj]!, vars)
-    if (!next) return null
-    return walk(pi + 1, sj + 1, next)
-  }
-}
-
-function matchMix(parts: Part[], value: string, vars: Vars): Vars | null {
-  let source = "^"
-  const names: string[] = []
-  for (const part of parts) {
-    if (part.kind === "lit") {
-      source += escapeRe(part.value)
-    } else if (part.kind === "star") {
-      source += ".*"
-    } else {
-      source += "(.+)"
-      names.push(part.name)
+    for (const part of segment.parts) {
+      if (part.kind === "lit") {
+        source += escapeRe(part.value)
+      } else if (part.kind === "star") {
+        source += "[^/]*"
+      } else if (seenVarNames.has(part.name)) {
+        source += `\\k<${part.name}>`
+      } else {
+        seenVarNames.add(part.name)
+        source += `(?<${part.name}>[^/]+)`
+      }
     }
   }
   source += "$"
-  const match = new RegExp(source).exec(value)
-  if (!match) return null
-  const out: Vars = {}
-  for (const key of Object.keys(vars)) {
-    out[key] = vars[key]!
-  }
-  for (let i = 0; i < names.length; i++) {
-    const name = names[i]!
-    const captured = match[i + 1]!
-    if (out[name] !== undefined && out[name] !== captured) return null
-    out[name] = captured
-  }
-  return out
+  return new RegExp(source, "u")
 }
 
 function boundPrefixSegments(segments: Segment[], vars: Vars): string[] {
@@ -198,7 +205,7 @@ function boundPrefixSegments(segments: Segment[], vars: Vars): string[] {
         stop = true
         break
       }
-      if (part.kind === "var" && vars[part.name] === undefined) {
+      if (part.kind === "var" && !Object.hasOwn(vars, part.name)) {
         stop = true
         break
       }
@@ -225,7 +232,7 @@ function renderMix(parts: Part[], vars: Vars): string {
 
 function hasAllVars(names: readonly string[], vars: Vars): boolean {
   for (const name of names) {
-    if (vars[name] === undefined) return false
+    if (!Object.hasOwn(vars, name)) return false
   }
   return true
 }

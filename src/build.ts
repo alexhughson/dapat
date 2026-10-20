@@ -28,12 +28,14 @@ const matcherBuilds = new WeakMap<AnyMatcher, Build>()
 // The outputs of no task. Shared, and never changed.
 const NO_OUTPUTS: ReadonlyMap<string, Ref> = new Map()
 
-type MatchEventToHear = {
+/** A TaskMaterializer that uses a matcher, and the name it gives that matcher. */
+type MatcherHearer = {
   // A TaskMaterializer of any matcher types.
   taskMaterializer: { hear(matcherName: string, event: MatchedArtifactEvent): void }
   matcherName: string
-  event: MatchedArtifactEvent
 }
+
+type MatchEventToHear = MatcherHearer & { event: MatchedArtifactEvent }
 
 class Slot {
   generation = 1
@@ -70,8 +72,9 @@ export class Build extends Emitter<ArtifactEvent> {
   // The first subscriber error or send-limit error. Each later run() rejects with it.
   private fatal: Error | null = null
 
-  // The matchers of every build.each, each one time, in the order of the build.each calls.
-  private readonly matchers = new Set<AnyMatcher>()
+  // The matchers of every build.each, each one time, in the order of the build.each calls,
+  // with the TaskMaterializers that use each one.
+  private readonly hearersByMatcher = new Map<AnyMatcher, MatcherHearer[]>()
   private eachCount = 0
   // The matcher events that wait for a TaskMaterializer.hear, oldest first. See hearMatchEvents.
   private matchEvents: MatchEventToHear[] = []
@@ -144,18 +147,28 @@ export class Build extends Emitter<ArtifactEvent> {
     this.eachCount = number
     for (const name of matcherNames) {
       const matcher = config.matchersByName[name]!
+      const hearer: MatcherHearer = { taskMaterializer, matcherName: name }
+      const knownHearers = this.hearersByMatcher.get(matcher)
+      if (knownHearers !== undefined) {
+        knownHearers.push(hearer)
+        continue
+      }
+      const hearers: MatcherHearer[] = [hearer]
+      matcherBuilds.set(matcher, this)
+      this.hearersByMatcher.set(matcher, hearers)
+      // Each matcher gets each artifact event one time, even if several build.each calls use it.
+      this.subscribe((event) => matcher.receiveArtifactEvent(event))
+      // One subscription for all build.each calls of the matcher. It queues the event for each
+      // of them at once, so each one hears the events of the matcher in send order, also an
+      // event that the `tasks` of another build.each sends.
       matcher.subscribe((event) => {
         // A failed build makes no more tasks, so it does not call `tasks` again.
         if (this.fatal) return
-        this.matchEvents.push({ taskMaterializer, matcherName: name, event })
+        for (const listening of hearers) {
+          this.matchEvents.push({ taskMaterializer: listening.taskMaterializer, matcherName: listening.matcherName, event })
+        }
         this.hearMatchEvents()
       })
-      // Each matcher gets each artifact event one time, even if several build.each calls use it.
-      if (!this.matchers.has(matcher)) {
-        matcherBuilds.set(matcher, this)
-        this.matchers.add(matcher)
-        this.subscribe((event) => matcher.receiveArtifactEvent(event))
-      }
     }
   }
 
@@ -309,7 +322,7 @@ export class Build extends Emitter<ArtifactEvent> {
       this.push(events)
       this.drain()
       // A build with no matchers starts its tasks in this same call, as before build.each existed.
-      if (this.matchers.size > 0 && this.fatal === null) {
+      if (this.hearersByMatcher.size > 0 && this.fatal === null) {
         this.scans = this.scanAll()
       }
     }
@@ -338,7 +351,7 @@ export class Build extends Emitter<ArtifactEvent> {
     })
     const scans: Promise<void>[] = []
     this.scanning = true
-    for (const matcher of this.matchers) {
+    for (const matcher of this.hearersByMatcher.keys()) {
       scans.push(this.scan(matcher, signal))
     }
     await Promise.race([Promise.all(scans), aborted])

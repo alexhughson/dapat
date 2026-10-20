@@ -80,4 +80,40 @@ describe("KeyPattern", () => {
     const pattern = new KeyPattern("pages/<doc>/<page>.txt")
     expect(pattern.boundPrefix({})).toBe("pages/")
   })
+
+  test("a var used twice tries every split until both places agree", () => {
+    expect(new KeyPattern("d/<a>-<a>.txt").match("d/a-b-a-b.txt")).toEqual({ a: "a-b" })
+    expect(new KeyPattern("d/<a>-<b>/<a>.txt").match("d/x-y-z/x.txt")).toEqual({ a: "x", b: "y-z" })
+  })
+
+  test("a var and a glob match a name with a line break", () => {
+    for (const name of ["a\nb", "a\rb", "a\u2028b", "a\u2029b"]) {
+      const key = `notes/${name}.md`
+      expect(new KeyPattern("notes/<slug>.md").match(key)).toEqual({ slug: name })
+      expect(new KeyPattern("notes/*.md").match(key)).toEqual({})
+    }
+  })
+
+  test("a var named like a member of Object.prototype matches, as an own property", () => {
+    for (const name of ["constructor", "toString", "__proto__"]) {
+      const pattern = new KeyPattern(`posts/<${name}>.md`)
+      const vars = pattern.match("posts/hello.md")
+      expect(vars).not.toBeNull()
+      expect(Object.hasOwn(vars!, name)).toBe(true)
+      expect(vars![name]).toBe("hello")
+      expect(pattern.render(vars!)).toBe("posts/hello.md")
+    }
+  })
+
+  test("two vars with nothing between them make the pattern throw", () => {
+    expect(() => new KeyPattern("v/<lang><slug>.md")).toThrow(
+      "pattern 'v/<lang><slug>.md': the vars <lang> and <slug> have nothing between them, so a key has no single split",
+    )
+    expect(() => new KeyPattern("emoji/<a><b>.txt")).toThrow("the vars <a> and <b> have nothing between them")
+  })
+
+  test("a glob next to a var does not split a surrogate pair", () => {
+    const vars = new KeyPattern("emoji/*<a>.txt").match("emoji/\u{1F600}.txt")
+    expect(vars).toEqual({ a: "\u{1F600}" })
+  })
 })
