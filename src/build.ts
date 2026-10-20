@@ -112,7 +112,7 @@ export class Build extends Emitter<ArtifactEvent> {
   }
 
   /**
-   * Makes tasks for each artifact that the matcher finds.
+   * Makes tasks for each joined set of the matches of its matchers.
    * Call it before the first run(): that run scans each matcher before any task starts.
    */
   each<M extends Record<string, AnyMatcher>>(config: TaskMaterializerConfig<M>): void {
@@ -121,25 +121,30 @@ export class Build extends Emitter<ArtifactEvent> {
     }
     const number = this.eachCount + 1
     const taskMaterializer = new TaskMaterializer(number, config, (group, tasks) => this.setTasks(group, tasks))
-    const matcher = taskMaterializer.matcher
-    const matcherBuild = matcherBuilds.get(matcher)
-    if (matcherBuild !== undefined && matcherBuild !== this) {
-      throw new Error(`build.each ${number}: its matcher belongs to another Build; make a new matcher for each Build`)
+    const matcherNames = Object.keys(config.matchersByName)
+    for (const name of matcherNames) {
+      const matcherBuild = matcherBuilds.get(config.matchersByName[name]!)
+      if (matcherBuild !== undefined && matcherBuild !== this) {
+        throw new Error(`build.each ${number}: its matcher belongs to another Build; make a new matcher for each Build`)
+      }
     }
     this.eachCount = number
-    matcher.subscribe((event) => {
-      // An error here is fatal, like a subscriber error. The matcher's send never sees it.
-      try {
-        taskMaterializer.hear(event)
-      } catch (error) {
-        this.fail(toError(error))
+    for (const name of matcherNames) {
+      const matcher = config.matchersByName[name]!
+      matcher.subscribe((event) => {
+        // An error here is fatal, like a subscriber error. The matcher's send never sees it.
+        try {
+          taskMaterializer.hear(name, event)
+        } catch (error) {
+          this.fail(toError(error))
+        }
+      })
+      // Each matcher gets each artifact event one time, even if several build.each calls use it.
+      if (!this.matchers.has(matcher)) {
+        matcherBuilds.set(matcher, this)
+        this.matchers.add(matcher)
+        this.subscribe((event) => matcher.receiveArtifactEvent(event))
       }
-    })
-    // Each matcher gets each artifact event one time, even if several build.each calls use it.
-    if (!this.matchers.has(matcher)) {
-      matcherBuilds.set(matcher, this)
-      this.matchers.add(matcher)
-      this.subscribe((event) => matcher.receiveArtifactEvent(event))
     }
   }
 
