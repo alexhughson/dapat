@@ -35,6 +35,9 @@ type MatcherHearer = {
   matcherName: string
 }
 
+/** The events that one drain sent, the number that were in the queue when it started, and if it has its own step. */
+type SendCounts = { initial: number; sent: number; ownStep: boolean }
+
 type MatchEventToHear = MatcherHearer & { event: MatchedArtifactEvent }
 
 class Slot {
@@ -183,23 +186,23 @@ export class Build extends Emitter<ArtifactEvent> {
    * A hear never runs inside another hear: a matcher event that comes during a hear, from
    * `tasks` or from a subscriber of the events of a task change, waits here, and this loop hears it
    * next. So the outermost matcher send still returns only after every task it caused exists.
-   * Each event is one step of task changes, or a part of the step of the scans when that step is open.
+   * The events join the open step of the scans or of the current drain. With no open step,
+   * the events that this call hears are one step of their own.
    * An error here is fatal, like a subscriber error. The matcher's send never sees it.
    */
   private hearMatchEvents(): void {
     if (this.hearing) return
+    // A matcher event that comes from a drain or a scan joins their step. Else it opens its own.
+    const ownStep = this.pendingTasksByGroup === null
+    if (ownStep) this.pendingTasksByGroup = new Map()
     this.hearing = true
     try {
       while (this.matchEvents.length > 0 && this.fatal === null) {
         const next = this.matchEvents.shift()!
-        const ownStep = this.pendingTasksByGroup === null
-        if (ownStep) this.pendingTasksByGroup = new Map()
         next.taskMaterializer.hear(next.matcherName, next.event)
-        if (ownStep) this.applyOpenStep()
       }
     } catch (error) {
       this.matchEvents = []
-      this.pendingTasksByGroup = null
       this.fail(toError(error))
     } finally {
       this.hearing = false
@@ -207,6 +210,7 @@ export class Build extends Emitter<ArtifactEvent> {
         this.matchEvents = []
       }
     }
+    if (ownStep) this.closeOpenStep()
   }
 
   /**
@@ -214,7 +218,8 @@ export class Build extends Emitter<ArtifactEvent> {
    * and removes each id that the group had before and that no group of the step gets now.
    * While a step is open, the changes join it, and the build applies them all at the end of the step.
    * A later change of a group in the same step replaces its earlier one. A step is open while the
-   * first run() scans, and during each matcher event. Else the changes are a step of their own.
+   * first run() scans, during each drain of the event queue, and during each matcher event that
+   * comes from outside a drain. Else the changes are a step of their own.
    * The rules apply to the state after the whole step. A task id can move from one group of the
    * step to another one: that is a replacement, as a known id in one group is, so its store record stays.
    * Throws, with no change, if a step of its own breaks a rule. An open step that breaks a rule is a fatal error.
@@ -229,15 +234,25 @@ export class Build extends Emitter<ArtifactEvent> {
     this.applyTasksOfGroups(changes)
   }
 
-  /** Closes the open step and applies its changes. A change that a subscriber makes then is a step of its own. */
-  private applyOpenStep(): void {
-    const pending = this.pendingTasksByGroup!
+  /**
+   * Closes the open step and applies its changes. An error is fatal. The events of the changes
+   * drain in a new step. Returns true when the step had a change.
+   */
+  private closeOpenStep(): boolean {
+    const pending = this.pendingTasksByGroup
     this.pendingTasksByGroup = null
+    if (pending === null || pending.size === 0) return false
     const changes: GroupTasks[] = []
     for (const [group, tasks] of pending) {
       changes.push({ group, tasks })
     }
-    if (changes.length > 0) this.applyTasksOfGroups(changes)
+    try {
+      this.applyTasksOfGroups(changes)
+    } catch (error) {
+      this.fail(toError(error))
+      return false
+    }
+    return true
   }
 
   /** Applies one step of task changes now. Throws, with no change, if the step breaks a rule. */
@@ -409,15 +424,7 @@ export class Build extends Emitter<ArtifactEvent> {
     }
     await Promise.race([Promise.all(scans), aborted])
     this.scanning = false
-    if (this.fatal !== null) {
-      this.pendingTasksByGroup = null
-      return
-    }
-    try {
-      this.applyOpenStep()
-    } catch (error) {
-      this.fail(toError(error))
-    }
+    this.closeOpenStep()
   }
 
   private async scan(matcher: AnyMatcher, signal: AbortSignal): Promise<void> {
@@ -447,16 +454,27 @@ export class Build extends Emitter<ArtifactEvent> {
     if (this.draining) return
     this.draining = true
     try {
-      this.sendQueue()
+      // The open step of the scans or of a matcher event belongs to its opener, which applies it.
+      // The limit counts only the events that subscribers cause, not the events that started the drain.
+      const counts: SendCounts = { initial: this.queue.length, sent: 0, ownStep: this.pendingTasksByGroup === null }
+      if (!counts.ownStep) {
+        this.sendQueue(counts)
+        return
+      }
+      // One step for each pass over the queue: the task changes of all the events of the pass.
+      // The events of those changes then make the next pass, until no change is left.
+      let changed = true
+      while (changed && this.fatal === null) {
+        this.pendingTasksByGroup = new Map()
+        this.sendQueue(counts)
+        changed = this.closeOpenStep()
+      }
     } finally {
       this.draining = false
     }
   }
 
-  private sendQueue(): void {
-    // The limit counts only the events that subscribers cause, not the events that started the drain.
-    const initial = this.queue.length
-    let sent = 0
+  private sendQueue(counts: SendCounts): void {
     while (this.queue.length > 0) {
       const event = this.queue.shift()!
       try {
@@ -465,9 +483,11 @@ export class Build extends Emitter<ArtifactEvent> {
         this.fail(toError(error))
         return
       }
-      sent += 1
-      const caused = sent - initial
-      if (caused >= this.sendLimit && this.queue.length > 0) {
+      counts.sent += 1
+      const caused = counts.sent - counts.initial
+      // The changes of the step of this drain make more events when the drain applies them.
+      const moreWait = this.queue.length > 0 || (counts.ownStep && this.pendingTasksByGroup !== null && this.pendingTasksByGroup.size > 0)
+      if (caused >= this.sendLimit && moreWait) {
         const message =
           `send limit: subscribers caused ${caused} events in one drain, and more wait; ` +
           `the last sent was '${eventLine(event).slice(0, 400)}'`
@@ -485,6 +505,8 @@ export class Build extends Emitter<ArtifactEvent> {
     if (this.fatal !== null) return
     this.fatal = error
     this.queue = []
+    // The build applies no more task changes.
+    this.pendingTasksByGroup = null
     this.scanAbort.abort(error)
     for (const slot of this.slots.values()) {
       if (slot.phase === "running" && slot.abort) slot.abort.abort()

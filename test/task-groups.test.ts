@@ -102,6 +102,21 @@ describe("setTasksOfGroups: several groups in one step", () => {
     expect(shared.value).toBe("ty")
   })
 
+  test("after a fatal error in a drain, a later setTasksOfGroups starts no task, and run() rejects with the first error", async () => {
+    const ran: string[] = []
+    const build = new GroupBuild()
+    build.subscribe((event) => {
+      if (event.kind === "promised" && event.output.id === "mem:a") throw new Error("index is full")
+    })
+    build.give(new TaskGroup("x"), [new Task({ id: "a", outputs: [new Mem("mem:a")], run: async () => void ran.push("a") })])
+    await expect(build.run()).rejects.toThrow("index is full")
+
+    build.giveAll([{ group: new TaskGroup("y"), tasks: [new Task({ id: "b", run: async () => void ran.push("b") })] }])
+
+    await expect(build.run()).rejects.toThrow("index is full")
+    expect(ran).toEqual([])
+  })
+
   test("a task id that moves to another group while its task runs is a replacement: cancelled, and its record stays", async () => {
     const deletedIds: string[] = []
     // A real MemoryStore that also logs each delete.

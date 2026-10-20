@@ -1150,6 +1150,79 @@ describe("build.each gives the changes of one matcher event to the build in one 
   })
 })
 
+describe("build.each: one step of task changes for each drain of the event queue", () => {
+  test("a drafts rule fed by the promised outputs of another rule gives the same tasks as with the files there", async () => {
+    // Rule 1 copies each source to an output. Its promised outputs feed rule 2, the drafts rule.
+    const sources = new PathMatcher("src:", ["kind", "slug", "who"], [
+      new Mem("src:page/a/x", "A"),
+      new Mem("src:page/b/x", "B"),
+      new Mem("src:rev/a/ann", "R"),
+    ])
+    const build = new Build()
+    build.each({
+      matchersByName: { source: sources },
+      *tasks(vars) {
+        const out = vars.kind === "page" ? `out:page/${vars.slug}` : `out:rev/${vars.slug}/${vars.who}`
+        yield new Task({ id: `copy:${out}`, outputs: [new Mem(out)], run: async () => {} })
+      },
+    })
+    build.each({
+      matchersByName: { page: new PathMatcher("out:page/", ["slug"]), review: new PathMatcher("out:rev/", ["slug", "who"]) },
+      required: ["page"],
+      *tasks(vars, matched) {
+        // The page with no review is the one draft. Before a review is found, two pages have none.
+        yield new Task({ id: matched.review === undefined ? "draft" : `page:${vars.slug}`, run: async () => {} })
+      },
+    })
+
+    const result = await build.run()
+
+    expect(result.success).toBe(true)
+    expect(sortedIds(result.executed)).toEqual(["copy:out:page/a", "copy:out:page/b", "copy:out:rev/a/ann", "draft", "page:a"])
+  })
+
+  test("a build.each that feeds itself through promised outputs stops at the send limit", async () => {
+    const turns = new PathMatcher("turn:", ["n"], [new Mem("turn:0", "0")])
+    const build = new Build({ sendLimit: 50 })
+    build.each({
+      matchersByName: { turn: turns },
+      *tasks(vars) {
+        const next = Number(vars.n) + 1
+        yield new Task({ id: `turn:${vars.n}`, outputs: [new Mem(`turn:${next}`)], run: async () => {} })
+      },
+    })
+
+    await expect(build.run()).rejects.toThrow("send limit: subscribers caused 50 events in one drain")
+  })
+
+  test("build.add during the scans of an id that a set of the scans gives rejects run(), and names both groups", async () => {
+    let releaseScan!: () => void
+    const scanReleased = new Promise<void>((resolve) => {
+      releaseScan = resolve
+    })
+    class WaitingMatcher extends PathMatcher {
+      override async scan(signal: AbortSignal): Promise<void> {
+        await super.scan(signal)
+        await scanReleased
+      }
+    }
+    const pages = new WaitingMatcher("page:", ["slug"], [new Mem("page:a", "A")])
+    const build = new Build()
+    build.each({
+      matchersByName: { page: pages },
+      *tasks() {
+        yield new Task({ id: "x", run: async () => {} })
+      },
+    })
+    const running = build.run()
+    // The set of page a has its task x only in the open step of the scans, so add cannot see it.
+    build.add(new Task({ id: "x", run: async () => {} }))
+    releaseScan()
+
+    await expect(running).rejects.toThrow("task 'x' is in two groups: 'build.add x' and 'build.each 1 slug=a'")
+  })
+})
+
 describe("matcher events never run inside another hear", () => {
   test("a subscriber that finds the template again while its gone removes the pages", async () => {
     const pages = new PathMatcher("page:", ["lang", "slug"], [
