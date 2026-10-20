@@ -13,6 +13,16 @@ export type MatchedByName<M extends Record<string, AnyMatcher>, R extends keyof 
   readonly [K in keyof M]: K extends R ? MatchedArtifact<DataOf<M[K]>> : MatchedArtifact<DataOf<M[K]>> | undefined
 }
 
+/**
+ * The vars that `tasks` gets. With every matcher required, each var has a value. Else a var of a
+ * matcher that is not required is undefined in a set with no match of it.
+ */
+export type JoinedVars<M extends Record<string, AnyMatcher>, R extends keyof M & string = keyof M & string> = [
+  Exclude<keyof M, R>,
+] extends [never]
+  ? Vars
+  : Readonly<Record<string, string | undefined>>
+
 export type TaskMaterializerConfig<M extends Record<string, AnyMatcher>, R extends keyof M & string = keyof M & string> = {
   /** The matchers to listen to, by name. Their matches join on the var names that they share. */
   matchersByName: M
@@ -25,7 +35,7 @@ export type TaskMaterializerConfig<M extends Record<string, AnyMatcher>, R exten
    * Gives the tasks for one joined set of matches. It can give any number of tasks.
    * A var of a matcher that is not required is undefined when the set has no match of it.
    */
-  tasks: (vars: Readonly<Record<string, string | undefined>>, matched: MatchedByName<M, R>) => Iterable<Task>
+  tasks: (vars: JoinedVars<M, R>, matched: MatchedByName<M, R>) => Iterable<Task>
 }
 
 type SetTasks = (group: TaskGroup, tasks: readonly Task[]) => void
@@ -35,6 +45,9 @@ type OptionalMatcher = {
   table: MatchTable
   // Its var names that a required matcher has, in its varNames order.
   sharedVarNames: readonly string[]
+  // Its var names that a required matcher or an earlier matcher that is not required has: the ON of its LEFT JOIN.
+  // A match joins a branch only when the branch has a value for each of these, and the values are equal.
+  onVarNames: readonly string[]
   // Every base set, by the values of sharedVarNames. A base set is here also while this matcher has no match for it.
   baseIndex: JoinIndex<BaseSet>
 }
@@ -106,13 +119,19 @@ export class TaskMaterializer<M extends Record<string, AnyMatcher>, R extends ke
         optionalTables.push(table)
       }
     }
+    const earlierVarNames = new Set(requiredVarNames)
     for (const table of optionalTables) {
       const sharedVarNames: string[] = []
+      const onVarNames: string[] = []
       for (const varName of table.varNames) {
         if (requiredVarNames.has(varName)) sharedVarNames.push(varName)
+        if (earlierVarNames.has(varName)) onVarNames.push(varName)
+      }
+      for (const varName of table.varNames) {
+        earlierVarNames.add(varName)
       }
       table.addIndex(sharedVarNames)
-      this.optionalMatchersByName.set(table.name, { table, sharedVarNames, baseIndex: new JoinIndex(sharedVarNames) })
+      this.optionalMatchersByName.set(table.name, { table, sharedVarNames, onVarNames, baseIndex: new JoinIndex(sharedVarNames) })
     }
     this.joinStepsByName = planJoins(requiredTables, number)
   }
@@ -145,7 +164,6 @@ export class TaskMaterializer<M extends Record<string, AnyMatcher>, R extends ke
     table.put(stored)
     if (optional !== undefined) {
       for (const base of optional.baseIndex.lookup(found.vars)) {
-        base.optionalMatchesByName.get(matcherName)!.add(stored)
         this.refreshJoinedSets(base)
       }
       return
@@ -156,13 +174,10 @@ export class TaskMaterializer<M extends Record<string, AnyMatcher>, R extends ke
       const base: BaseSet = {
         vars,
         requiredMembersByName: joined.membersByName,
-        optionalMatchesByName: new Map(),
         joinedSetsByVarsKey: new Map(),
       }
-      for (const [optionalName, optionalMatcher] of this.optionalMatchersByName) {
+      for (const optionalMatcher of this.optionalMatchersByName.values()) {
         optionalMatcher.baseIndex.add(vars, base)
-        const matches = optionalMatcher.table.lookup(optionalMatcher.sharedVarNames, vars)
-        base.optionalMatchesByName.set(optionalName, new Set(matches))
       }
       this.refreshJoinedSets(base)
     }
@@ -193,30 +208,28 @@ export class TaskMaterializer<M extends Record<string, AnyMatcher>, R extends ke
     if (gone === undefined) return
     optional.table.delete(gone)
     for (const base of optional.baseIndex.lookup(gone.matched.vars)) {
-      base.optionalMatchesByName.get(optional.table.name)!.delete(gone)
       this.refreshJoinedSets(base)
     }
   }
 
   /**
-   * Runs the chain of left joins of the base set again, and makes its joined sets the result.
-   * Each matcher that is not required, in name order, joins each branch on every var that the branch has.
-   * Each match that agrees makes one branch. With no match that agrees, the matcher is undefined
-   * in the branch and adds no var. Then: a set with the same vars and the same matches does not change.
-   * A set with the same vars and other matches gets new tasks in its group. A set with new vars gets a new
-   * group. A set whose vars are gone is removed, first, so that a new set can give the same task id.
+   * The chain of LEFT JOINs of the base set, as in SQL. Each matcher that is not required, in name order,
+   * joins each branch on its onVarNames. Each match that agrees makes one branch. With no match that agrees,
+   * the matcher is undefined in the branch and adds no var. A branch with no value for an ON var
+   * agrees with no match, as NULL equals nothing in SQL.
+   * Reads the matches from the tables, so the caller changes the table before it calls this.
    */
-  private refreshJoinedSets(base: BaseSet): void {
+  private leftJoinChain(base: BaseSet): Branch[] {
     let branches: Branch[] = [{ vars: { ...base.vars }, optionalMembersByName: new Map() }]
     for (const [optionalName, optionalMatcher] of this.optionalMatchersByName) {
-      const matches = base.optionalMatchesByName.get(optionalName)!
+      const matches = optionalMatcher.table.lookup(optionalMatcher.sharedVarNames, base.vars)
       const longerBranches: Branch[] = []
       for (const branch of branches) {
         let joinedOne = false
         for (const match of matches) {
           let agrees = true
-          for (const varName of optionalMatcher.table.varNames) {
-            if (Object.hasOwn(branch.vars, varName) && branch.vars[varName] !== match.matched.vars[varName]) agrees = false
+          for (const varName of optionalMatcher.onVarNames) {
+            if (!Object.hasOwn(branch.vars, varName) || branch.vars[varName] !== match.matched.vars[varName]) agrees = false
           }
           if (!agrees) continue
           joinedOne = true
@@ -228,7 +241,17 @@ export class TaskMaterializer<M extends Record<string, AnyMatcher>, R extends ke
       }
       branches = longerBranches
     }
+    return branches
+  }
 
+  /**
+   * Makes the joined sets of the base set the result of its chain of LEFT JOINs. A set with the same vars
+   * and the same matches does not change. A set with the same vars and other matches gets new tasks in its
+   * group. A set with new vars gets a new group. A set whose vars are gone is removed first, so that a new
+   * set can give the same task id.
+   */
+  private refreshJoinedSets(base: BaseSet): void {
+    const branches = this.leftJoinChain(base)
     const branchesByVarsKey = new Map<string, Branch>()
     for (const branch of branches) {
       const values: (string | null)[] = []
@@ -303,7 +326,7 @@ export class TaskMaterializer<M extends Record<string, AnyMatcher>, R extends ke
     // fromEntries makes each name an own property, also a matcher named __proto__.
     const matched = Object.fromEntries(matchedEntries)
     const tasks: Task[] = []
-    for (const task of this.config.tasks(set.vars, matched as MatchedByName<M, R>)) {
+    for (const task of this.config.tasks(set.vars as JoinedVars<M, R>, matched as MatchedByName<M, R>)) {
       tasks.push(task)
     }
     this.setTasks(set.group, tasks)

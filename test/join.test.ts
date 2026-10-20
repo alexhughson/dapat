@@ -558,8 +558,9 @@ describe("build.each with required", () => {
     build.each({
       matchersByName: { page: pages, review: reviews },
       *tasks(vars, matched) {
-        // Every matcher is required, so the type has no undefined.
-        yield new Task({ id: `page:${vars.slug}`, inputs: [matched.page.data, matched.review.data], run: async () => {} })
+        // Every matcher is required, so the types have no undefined: not in matched, and not in vars.
+        const slug: string = vars.slug
+        yield new Task({ id: `page:${slug}`, inputs: [matched.page.data, matched.review.data], run: async () => {} })
       },
     })
 
@@ -574,7 +575,7 @@ describe("build.each with required", () => {
       matchersByName: { page: new PathMatcher("page:", ["lang", "slug"]), review: new PathMatcher("review:", ["lang", "slug"]) },
       required: ["page"],
       *tasks(vars, matched) {
-        // @ts-expect-error a var can be undefined: a matcher that is not required has it only with a match
+        // @ts-expect-error with a matcher that is not required, any var can be undefined
         const lang: string = vars.lang
         void lang
         void matched.page.data.id
@@ -959,6 +960,105 @@ describe("build.each with required: a matcher that is not required can have var 
     ])
   })
 
+  test("a matcher whose ON var comes from an earlier matcher that is undefined is undefined too, as NULL in SQL", () => {
+    const { taskMaterializer, found, gone, currentTasks } = materialize({
+      matchersByName: {
+        page: new PathMatcher("page:", ["slug"]),
+        comment: new PathMatcher("comment:", ["slug", "author"]),
+        info: new PathMatcher("info:", ["author"]),
+      },
+      required: ["page"],
+      *tasks(vars, matched) {
+        yield new Task({ id: `page:${vars.slug}:${vars.author}:${matched.info?.data.id ?? "-"}`, run: async () => {} })
+      },
+    })
+    found("info", { author: "ann" }, "info:ann")
+    found("info", { author: "bob" }, "info:bob")
+    found("page", { slug: "a" }, "page:a")
+    found("page", { slug: "b" }, "page:b")
+    found("comment", { slug: "a", author: "ann" }, "comment:a/ann")
+
+    // Page b has no comment, so it has no author, and no info agrees with it.
+    expect(currentTasks()).toEqual([
+      "build.each 1 slug=a author=ann: page:a:ann:info:ann",
+      "build.each 1 slug=b: page:b:undefined:-",
+    ])
+
+    // A comment by an author with no info: info is undefined, and author stays.
+    found("comment", { slug: "b", author: "cy" }, "comment:b/cy")
+    expect(currentTasks()).toEqual([
+      "build.each 1 slug=a author=ann: page:a:ann:info:ann",
+      "build.each 1 slug=b author=cy: page:b:cy:-",
+    ])
+
+    // An info found later joins the sets of its author.
+    found("info", { author: "cy" }, "info:cy")
+    expect(currentTasks()).toEqual([
+      "build.each 1 slug=a author=ann: page:a:ann:info:ann",
+      "build.each 1 slug=b author=cy: page:b:cy:info:cy",
+    ])
+
+    gone("comment", { slug: "a", author: "ann" })
+    gone("comment", { slug: "b", author: "cy" })
+    expect(currentTasks()).toEqual(["build.each 1 slug=a: page:a:undefined:-", "build.each 1 slug=b: page:b:undefined:-"])
+    for (const author of ["ann", "bob", "cy"]) {
+      gone("info", { author })
+    }
+    gone("page", { slug: "a" })
+    gone("page", { slug: "b" })
+    expect(currentTasks()).toEqual([])
+    expect(taskMaterializer.joinKeyCount).toBe(0)
+  })
+
+  test("a matcher with no ON var joins each set with each of its matches, as LEFT JOIN ON TRUE", () => {
+    const { taskMaterializer, found, gone, currentTasks } = materialize({
+      matchersByName: { page: new PathMatcher("page:", ["slug"]), tag: new PathMatcher("tag:", ["tag"]) },
+      required: ["page"],
+      *tasks(vars) {
+        yield new Task({ id: `page:${vars.slug}:${vars.tag}`, run: async () => {} })
+      },
+    })
+    found("page", { slug: "a" }, "page:a")
+    found("page", { slug: "b" }, "page:b")
+    expect(currentTasks()).toEqual(["build.each 1 slug=a: page:a:undefined", "build.each 1 slug=b: page:b:undefined"])
+
+    found("tag", { tag: "x" }, "tag:x")
+    found("tag", { tag: "y" }, "tag:y")
+    expect(currentTasks()).toEqual([
+      "build.each 1 slug=a tag=x: page:a:x",
+      "build.each 1 slug=a tag=y: page:a:y",
+      "build.each 1 slug=b tag=x: page:b:x",
+      "build.each 1 slug=b tag=y: page:b:y",
+    ])
+
+    gone("tag", { tag: "x" })
+    gone("tag", { tag: "y" })
+    gone("page", { slug: "a" })
+    gone("page", { slug: "b" })
+    expect(currentTasks()).toEqual([])
+    expect(taskMaterializer.joinKeyCount).toBe(0)
+  })
+
+  test("new data of a match in one of two branches calls tasks one time, for its set only", () => {
+    const made: string[] = []
+    const { found } = materialize({
+      matchersByName: { page: new PathMatcher("page:", ["slug"]), review: new PathMatcher("review:", ["slug", "reviewer"]) },
+      required: ["page"],
+      *tasks(vars, matched) {
+        made.push(`${vars.reviewer}: ${matched.review?.data.id}`)
+        yield new Task({ id: `page:${vars.slug}:${vars.reviewer}`, run: async () => {} })
+      },
+    })
+    found("page", { slug: "a" }, "page:a")
+    found("review", { slug: "a", reviewer: "ann" }, "review:a/ann")
+    found("review", { slug: "a", reviewer: "bob" }, "review:a/bob")
+
+    made.length = 0
+    found("review", { slug: "a", reviewer: "bob" }, "review:a/bob#2")
+
+    expect(made).toEqual(["bob: review:a/bob#2"])
+  })
+
   test("a later matcher that agrees with the var of an earlier one joins the same set", () => {
     const { taskMaterializer, found, gone, currentTasks } = materialize({
       matchersByName: {
@@ -980,10 +1080,10 @@ describe("build.each with required: a matcher that is not required can have var 
       "build.each 1 slug=a reviewer=bob: page:a:bob:rating:a/bob",
     ])
 
-    // With no review, each rating makes its own set.
+    // With no review, reviewer has no value, so no rating agrees: rating is undefined.
     gone("review", { slug: "a", reviewer: "ann" })
     gone("review", { slug: "a", reviewer: "bob" })
-    expect(currentTasks()).toEqual(["build.each 1 slug=a reviewer=bob: page:a:bob:rating:a/bob"])
+    expect(currentTasks()).toEqual(["build.each 1 slug=a: page:a:undefined:-"])
 
     gone("rating", { slug: "a", reviewer: "bob" })
     gone("page", { slug: "a" })

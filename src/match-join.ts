@@ -24,8 +24,6 @@ export type BaseSet = {
   // The vars of its required matches.
   vars: Vars
   requiredMembersByName: Map<string, StoredMatch>
-  // For each matcher that is not required: its current matches that agree with `vars`. Empty when it has none.
-  optionalMatchesByName: Map<string, Set<StoredMatch>>
   // The joined sets that the chain of left joins gives now, by the JSON of their vars in union order.
   joinedSetsByVarsKey: Map<string, JoinedSet>
 }

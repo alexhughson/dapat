@@ -908,18 +908,29 @@ On the first run, `tasks` can run more than one time for one set, for example wh
 
 #### Several matchers that are not required: the order of the names
 
-The matchers that are not required join one after the other, in the order of their names in `matchersByName`, like SQL with several LEFT JOINs. Each one joins on every var that the set already has: the vars of the required matchers, and the vars of the earlier matchers that have a match in the set. Each of its matches that agrees makes one set. If no match agrees, it is `undefined` in the set, and it adds no var.
+The matchers that are not required join one after the other, in the order of their names in `matchersByName`, as SQL does with several LEFT JOINs.
+
+The **ON vars** of a matcher that is not required are its var names that a required matcher or an earlier matcher that is not required has. `build.each` finds them one time, when you call it. A match joins a set only when the set has a value for each ON var, and the values are equal. Each match that joins makes one set, and adds its other vars to it. If no match joins, the matcher is `undefined` in the set, and it adds no var.
+
+A set that has no value for an ON var joins no match, as NULL equals nothing in SQL. Example: `page` has `slug` and is required. `comment` has `slug` and `author`. `info` has `author`. Both are not required, in the order `{ page, comment, info }`. The ON vars of `info` are `author`, from `comment`.
+
+| Page | Its comments | Its joined sets |
+| --- | --- | --- |
+| `a` | one, by ann | one set: `author=ann`, `matched.info` is the info of ann |
+| `b` | none | one set: `author` is `undefined`, and `matched.info` is `undefined`. No info joins, because the set has no author. |
 
 When two of them have different var names of their own, the sets are each pair of their matches. A page with 2 reviews (`reviewer`) and 2 comments (`commenter`) has 4 sets. A page with 2 reviews and no comment has 2 sets, with `matched.comment === undefined`.
 
-When two of them share a var name that no required matcher has, the order of the names changes the sets. Example: `review` and `rating` both have `lang`, `slug`, and `reviewer`. `en/about` has a review from ann and a rating from bob. It has no rating from ann.
+When two of them share a var name that no required matcher has, the order of the names changes the sets. Example: `review` and `rating` both have `lang`, `slug`, and `reviewer`, and both are not required. The ON vars of the second one include `reviewer`.
 
-| Names in `matchersByName` | Joined sets of `en/about` |
-| --- | --- |
-| `{ page, review, rating }` | one set: `reviewer=ann`, `matched.review` is the review of ann, `matched.rating` is `undefined` |
-| `{ page, rating, review }` | one set: `reviewer=bob`, `matched.rating` is the rating of bob, `matched.review` is `undefined` |
+| Page | Its reviews and ratings | `{ page, review, rating }` | `{ page, rating, review }` |
+| --- | --- | --- | --- |
+| `en/about` | a review by ann, a rating by bob | one set: `reviewer=ann`, `matched.review` is the review of ann, `matched.rating` is `undefined` | one set: `reviewer=bob`, `matched.rating` is the rating of bob, `matched.review` is `undefined` |
+| `en/hello` | a rating by bob, no review | one set: `reviewer` is `undefined`, both are `undefined`. The rating does not join, because the set has no reviewer. | one set: `reviewer=bob`, `matched.rating` is the rating of bob, `matched.review` is `undefined` |
 
-In the first order, `review` joins first and sets `reviewer` to `ann`. The rating of bob does not agree. In the second order, `rating` joins first and sets `reviewer` to `bob`. **So if you change the order of the names, the tasks can change.** Put the matcher that sets the var first.
+In the first order, `review` joins first. It sets `reviewer` to `ann` for `en/about`, and the rating of bob does not agree. For `en/hello`, it sets no `reviewer`, so no rating joins. In the second order, `rating` joins first and sets `reviewer` to `bob`. **So if you change the order of the names, the tasks can change.** Put the matcher that sets the var first.
+
+A matcher that is not required and has no ON vars joins each set with each of its matches, as `LEFT JOIN ... ON TRUE` does in SQL. For example, a `tag` matcher with only `tag`, after `page` with `slug`: 2 pages and 2 tags make 4 sets. With no tag, each page has one set with `matched.tag === undefined`. This is valid, but each found and gone of a tag changes the sets of every page.
 
 #### The rules
 
@@ -929,13 +940,16 @@ In the first order, `review` joins first and sets `reviewer` to `ann`. The ratin
 
 #### Types
 
-The `vars` argument of `tasks` has the type `Readonly<Record<string, string | undefined>>`. A var of a matcher that is not required is `undefined` in a set with no match of it. TypeScript does not know the var names, so **a var of a required matcher also needs a check or `!`**, for example `vars.lang!`. In a template string, as in `` `page:${vars.slug}` ``, you need no check.
+The `vars` argument of `tasks` has the type `JoinedVars<M, R>`:
 
-TypeScript knows which matched artifacts can be `undefined`, when `required` is one literal list. `matched.page` is a `MatchedArtifact`. `matched.review` is a `MatchedArtifact` or `undefined`, so you must check it before you read `matched.review.data`. If `required` has a wider type, for example `cond ? ["page", "review"] : ["page"]` or a variable of type `("page" | "review")[]`, TypeScript treats every name in that type as required. Then check for `undefined` yourself. TypeScript does not check an empty list. `build.each` checks it when you call it.
+- If every matcher is required, for example when you leave `required` out, it is `Vars`. Each var is a `string`.
+- Else it is `Readonly<Record<string, string | undefined>>`. A var of a matcher that is not required is `undefined` in a set with no match of it. TypeScript does not know the var names, so **when you give `required`, a var of a required matcher also needs a check or `!`**, for example `vars.lang!`. In a template string, as in `` `page:${vars.slug}` ``, you need no check.
+
+TypeScript knows which matched artifacts can be `undefined`, when `required` is one literal list. `matched.page` is a `MatchedArtifact`. `matched.review` is a `MatchedArtifact` or `undefined`, so you must check it before you read `matched.review.data`. If `required` has a wider type, for example `cond ? ["page", "review"] : ["page"]` or a variable of type `("page" | "review")[]`, TypeScript treats every name in that type as required. Then check `matched` and `vars` for `undefined` yourself. TypeScript does not check an empty list. `build.each` checks it when you call it.
 
 #### Cost
 
-`build.each` keeps an index of the required joins for each matcher that is not required, by the var names that it shares with the required matchers. A found or gone of such a match looks up its required joins in that index. For each one, it runs the left joins again over the matches of that join only, and changes only the sets that are different. A matcher that is not required and has no var names is in every set, so each of its found and gone events changes every set.
+`build.each` keeps an index of the required joins for each matcher that is not required, by the var names that it shares with the required matchers. A found or gone of such a match looks up its required joins in that index. For each one, it runs the left joins again over the matches of that join only, and changes only the sets that are different. A matcher that is not required and shares no var name with the required matchers, for example `info` or `tag` above, is in the index entry of every required join. So each of its found and gone events runs the left joins of every required join again.
 
 ### Example with one matcher
 
@@ -1575,21 +1589,24 @@ type MatchedArtifactEvent<D extends MatchedData = MatchedData> =
 
 The vars of a matched artifact are its key. A `found` with known vars and new data replaces the match, a `found` with the same artifact ids in the same order does nothing, and a `gone` removes it. One artifact and a list of one artifact are different data. A `gone` with wrong var names makes `build.run()` reject. See [Matched artifacts](#matched-artifacts).
 
-### `type TaskMaterializerConfig<M, R>` and `type MatchedByName<M, R>`
+### `type TaskMaterializerConfig<M, R>`, `type MatchedByName<M, R>`, and `type JoinedVars<M, R>`
 
 ```ts
 type TaskMaterializerConfig<M extends Record<string, AnyMatcher>, R extends keyof M & string = keyof M & string> = {
   matchersByName: M
   required?: readonly R[]
-  tasks: (vars: Readonly<Record<string, string | undefined>>, matched: MatchedByName<M, R>) => Iterable<Task>
+  tasks: (vars: JoinedVars<M, R>, matched: MatchedByName<M, R>) => Iterable<Task>
 }
+
+type JoinedVars<M extends Record<string, AnyMatcher>, R extends keyof M & string = keyof M & string> =
+  [Exclude<keyof M, R>] extends [never] ? Vars : Readonly<Record<string, string | undefined>>
 
 type MatchedByName<M extends Record<string, AnyMatcher>, R extends keyof M & string = keyof M & string> = {
   readonly [K in keyof M]: K extends R ? MatchedArtifact<DataOf<M[K]>> : MatchedArtifact<DataOf<M[K]>> | undefined
 }
 ```
 
-`R` is the names in `required`. If you leave `required` out, `R` is every name, so no matched artifact is `undefined`. A matcher that is not in `R` can be `undefined` in `matched`. It left-joins onto the matchers in `R`, after the earlier matchers that are not in `R`, in name order. Each of its matches that agrees makes its own joined set. `required` must name at least one matcher. See [`required`](#required-matchers-that-a-set-can-do-without).
+`R` is the names in `required`. If you leave `required` out, `R` is every name, so no matched artifact is `undefined`. A matcher that is not in `R` can be `undefined` in `matched`. It left-joins onto the matchers in `R`, after the earlier matchers that are not in `R`, in name order, on its ON vars. Each of its matches that agrees makes its own joined set. `JoinedVars` is `Vars` when every name is in `R`, else `Readonly<Record<string, string | undefined>>`. `required` must name at least one matcher. See [`required`](#required-matchers-that-a-set-can-do-without).
 
 `AnyMatcher` is `Matcher<any>`: a matcher of any data type. Each matched artifact has the data type of its own matcher: `DataOf` reads `D` from the matcher type. `matchersByName` must have at least one entry, and its required matchers must form one connected group by shared var names. `tasks` gets the vars of one joined set, which hold the vars of all its matches (a var of a matcher with no match in the set is `undefined`), and each matched artifact under its matcher's name. See [The `build.each` config](#the-buildeach-config).
 
