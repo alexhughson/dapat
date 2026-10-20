@@ -705,7 +705,7 @@ import { Build, Matcher, Task, type ArtifactEvent } from "dapat"
 import { FileArtifact, JsonStore } from "dapat/contrib"
 
 // Finds posts/<slug>.md, and sends one row for each file.
-class Posts extends Matcher {
+class Posts extends Matcher<FileArtifact> {
   readonly varNames = ["slug"]
   private readonly folder = path.resolve("posts")
 
@@ -739,7 +739,7 @@ const build = new Build({ store: new JsonStore(".dapat/state.json") })
 build.each({
   inputs: { post: new Posts() },
   *tasks(vars, input) {
-    const post = input.post.data as FileArtifact
+    const post = input.post.data // a FileArtifact, the data type of Posts
     const html = new FileArtifact(`site/${vars.slug}.html`)
     yield new Task({
       id: `page:${vars.slug}`,
@@ -762,14 +762,14 @@ With `posts/hello.md` and `posts/bye.md`, the first run does these steps:
 2. For each row, the rule calls `tasks`, and the build adds `page:hello` and `page:bye`.
 3. The scan returns. The build starts both tasks.
 
-A second run with no change skips both tasks. If you add a task with `build.add` that declares the output `posts/news.md`, `Posts` hears its `promised` event and sends `{ slug: "news" }`. The rule adds `page:news`, and `page:news` waits for the task that writes the post.
+The next time the program runs with no change, both tasks skip. If you add a task with `build.add` that declares the output `posts/news.md`, `Posts` hears its `promised` event and sends `{ slug: "news" }`. The rule adds `page:news`, and `page:news` waits for the task that writes the post.
 
 ### Matchers
 
-A matcher is a subclass of `Matcher`. It has three members:
+A matcher is a subclass of `Matcher<D>`. `D` is the data of each row, for example `FileArtifact`, or `readonly FileArtifact[]` for a list. It has three members:
 
 ```ts
-abstract class Matcher extends Emitter<RowEvent> {
+abstract class Matcher<D extends RowData = RowData> extends Emitter<RowEvent<D>> {
   abstract readonly varNames: readonly string[]
   abstract scan(signal: AbortSignal): Promise<void>
   sendArtifact(event: ArtifactEvent): void {}
@@ -777,10 +777,12 @@ abstract class Matcher extends Emitter<RowEvent> {
 ```
 
 - `varNames` are the names of the vars in each row. In the example, `["slug"]`.
-- `scan` looks at the world now, and sends a row for each thing that it finds. Disk reads and network calls go here. `signal` aborts when another scan fails.
+- `scan` looks at the world now, and sends a row for each thing that it finds. Disk reads and network calls go here. `signal` aborts when another scan fails, or when the build fails.
 - `sendArtifact` hears each event of the build ([section 9](#9-subscribe-to-artifact-events)). It can send a row for an output that a task declares or writes. It must be fast and do no I/O. The default does nothing, so the rows never change during a run.
 
-A matcher sends rows with `this.send(event)`. It knows nothing about the rules that listen to it. One matcher can feed several rules. It still hears each build event one time.
+A matcher sends rows with `this.send(event)`. It knows nothing about the rules that listen to it. One matcher can feed several rules of one build. It still hears each build event one time. A matcher belongs to the first build that uses it: give each `Build` its own matchers.
+
+A matcher may send a row again. The rule ignores a `put` whose data has the same artifact ids, in the same order, as the current row. So the `Posts` matcher can put a row for the `promised` event and again for the `produced` event of one file. The task is made one time, and a task that rewrites its own input in place does not run again.
 
 ### Rows
 
@@ -789,13 +791,15 @@ A row is one thing that a matcher found:
 ```ts
 type Vars = Readonly<Record<string, string>>
 
-type MatchRow = {
+type RowData = Artifact | readonly Artifact[]
+
+type MatchRow<D extends RowData = RowData> = {
   vars: Vars
-  data: Artifact | readonly Artifact[]
+  data: D
 }
 ```
 
-`vars` holds the values that name the thing, one for each name in `varNames`. `data` is the artifact that the task reads, or a list of artifacts. The type of `data` does not depend on the matcher, so `tasks` narrows it. In the example, `input.post.data as FileArtifact`.
+`vars` holds the values that name the thing, one for each name in `varNames`. `data` is the artifact that the task reads, or a list of artifacts. Its type comes from the matcher. In the example, `Posts` is a `Matcher<FileArtifact>`, so `input.post.data` is a `FileArtifact`, and it can go straight into `inputs`.
 
 The vars of a row are also its key. Two rows with the same vars are the same row.
 
@@ -812,7 +816,8 @@ type RowEvent =
 | The matcher sends | The rule does |
 | --- | --- |
 | `put` with new vars | adds the tasks of the row |
-| `put` with known vars | replaces the tasks of the row ([section 8](#replacement)) |
+| `put` with known vars and new data | replaces the tasks of the row ([section 8](#replacement)) |
+| `put` with known vars and the same artifact ids | nothing |
 | `drop` | removes the tasks of the row ([section 8](#removal)) |
 
 For example, a matcher sends `put { slug: "a" }`, then `put { slug: "a" }` with a new file, then `drop { slug: "a" }`. The rule adds the tasks of `a`, replaces them, and then removes them. A `drop` for a row that the rule does not know does nothing.
@@ -833,13 +838,13 @@ A rule can yield more than one task for a row:
 
 ```ts
 *tasks(vars, input) {
-  const post = input.post.data as FileArtifact
+  const post = input.post.data
   yield new Task({ id: `page:${vars.slug}`, inputs: [post], outputs: [new FileArtifact(`site/${vars.slug}.html`)], run: async () => {} })
   yield new Task({ id: `words:${vars.slug}`, inputs: [post], outputs: [new FileArtifact(`site/${vars.slug}.words`)], run: async () => {} })
 }
 ```
 
-Each row is one owner ([section 5](#5-tasks-and-dependencies)). The owner is `<rule number>:<var values>`, for example `1:hello`. dapat counts rules from 1, in the order of the `build.each` calls. Each var value is URI-encoded, and the values are joined with `/` in `varNames` order. A task id must be unique in the build. If two rows give one task id, or a row gives the id of a task that you added with `build.add`, the build throws ([Errors in rules](#errors-in-rules)). So put the vars in the task id, as `page:${vars.slug}` does.
+Each row is one owner ([section 5](#5-tasks-and-dependencies)). The owner is `<rule number>:<var values>`, for example `1:hello`. dapat counts rules from 1, in the order of the `build.each` calls. Each var value is URI-encoded, and the values are joined with `/` in `varNames` order. A task id must be unique in the build. If two rows give one task id, or a row gives the id of a task that you added with `build.add`, `build.run()` rejects ([Errors in rules](#errors-in-rules)). So put the vars in the task id, as `page:${vars.slug}` does.
 
 Call `build.each` before the first `build.run()`. After that, it throws.
 
@@ -853,7 +858,7 @@ The first `build.run()` does these steps:
 
 No task starts during a scan. A scan that is still running could find a thing whose task writes the input of another task.
 
-A later `build.run()` on the same build does not scan again.
+A later `build.run()` on the same build does not scan again. A `build.run()` that you call while the scans of the first one still run waits for the same scans, and then starts the tasks.
 
 ### Rows during the run
 
@@ -862,7 +867,7 @@ When a task calls `ctx.produced(artifact)`, the build sends the `produced` event
 This task splits a book into chapters. A rule makes one summary task for each chapter, while `split` runs:
 
 ```ts
-class Chapters extends Matcher {
+class Chapters extends Matcher<FileArtifact> {
   readonly varNames = ["n"]
   async scan(): Promise<void> {}
   override sendArtifact(event: ArtifactEvent): void {
@@ -891,7 +896,7 @@ build.add(
 build.each({
   inputs: { chapter: new Chapters() },
   *tasks(vars, input) {
-    yield new Task({ id: `summary:${vars.n}`, inputs: [input.chapter.data as FileArtifact], run: async () => {} })
+    yield new Task({ id: `summary:${vars.n}`, inputs: [input.chapter.data], run: async () => {} })
   },
 })
 ```
@@ -902,14 +907,22 @@ When `split` returns, `summary:0`, `summary:1`, and `summary:2` exist. They run 
 
 A rule and a matcher are part of your program, like a subscriber. A mistake in them makes `build.run()` reject ([Subscriber errors](#subscriber-errors)).
 
+A rule error is fatal for the build, as a subscriber error is. The `send` of the matcher does not throw it, so a matcher that catches errors cannot hide it. An error outside `build.run()`, for example from the `promised` event of a `build.add` after the run, makes the next `build.run()` reject.
+
 | Where | Example | What you see |
 | --- | --- | --- |
 | `build.each` | the rule has no input, or two inputs | `build.each` throws |
 | `build.each` | you call it after `build.run()` | `build.each` throws |
-| a scan | the folder does not exist | `build.run()` rejects, and no task runs. The other scans get an aborted `signal`. |
+| `build.each` | its matcher is used by another `Build` | `build.each` throws |
+| a scan | the folder does not exist | `build.run()` rejects at once, and no task runs. The other scans get an aborted `signal`. `build.run()` does not wait for them. |
 | a row | its vars are not the `varNames` of its matcher | `build.run()` rejects |
 | `tasks` | two rows give one task id | `build.run()` rejects with `task 'x' has two owners: '1:a' and '1:b'` |
 | `tasks` | it throws | `build.run()` rejects with that error |
+
+Two limits remain:
+
+- **A scan that never returns makes `build.run()` wait forever.** `build.run()` takes no signal, and the scan signal aborts only when the build fails.
+- **A rule that feeds itself is not bounded yet.** For example, a task reads `turns/<n>.txt` and writes `turns/<n+1>.txt`. Each produced file makes a new task, and the run does not end. A task limit comes in a later version.
 
 ## 11. Built-in artifacts
 
@@ -1103,8 +1116,8 @@ new Build(opts?: { store?: Store; sendLimit?: number })
 | `add(task: Task): void` | Adds a task. If a task with the same id exists, replaces it (see [section 8](#replacement)). If `run()` has started, sends a `promised` event for each declared output, and the task starts at once. Does not throw when a subscriber throws ([section 9](#subscriber-errors)). Throws if another task already declares one of its exact outputs, if the task declares one output twice, or if another owner holds that id ([section 5](#5-tasks-and-dependencies)). Throws before it changes anything. |
 | `remove(id: string): void` | Removes a task. Aborts it if it is running and sends a `withdrawn` event for each declared output. Does not throw when a subscriber throws. Starts to delete its store record. Does not wait for the delete, but `run()` does. A delete error goes into `result.errors`. Does nothing if the id is not known. The other tasks of the same owner stay. |
 | `subscribe(listener: (event: ArtifactEvent) => void): void` | From `Emitter`. Calls `listener` synchronously for each artifact event, in the order of the event queue. Does not replay earlier events. See [section 9](#9-subscribe-to-artifact-events). |
-| `protected setTasks(owner: string, tasks: readonly Task[]): void` | Makes `tasks` the tasks of `owner` ([section 5](#5-tasks-and-dependencies)). Adds each new id, replaces each known id, and removes each id that `owner` gave before and does not give now. Changes all state first, then puts the events on the queue: all `withdrawn` events of the call first, then the `promised` events, by id in list order. A dropped task ends as `cancelled` with the reason `"removed"` if it had not finished. Throws and changes nothing if another owner has one of the ids, if `tasks` has one id two times, or if two tasks declare one exact output. `add(task)` calls `setTasks("add:" + task.id, [task])`. Rules will call it; your code does not. |
-| `each<I extends Record<string, Matcher>>(config: RuleConfig<I>): void` | Adds a rule ([section 10](#10-rules-one-task-for-each-thing-a-matcher-finds)). The rule subscribes to the matcher of its one input and gives the tasks of each row through `setTasks`, with the owner `<rule number>:<var values>`. The build sends each artifact event to `matcher.sendArtifact`, one time for each matcher. Throws if the rule does not have exactly one input, or if `run()` has started. |
+| `protected setTasks(owner: string, tasks: readonly Task[]): void` | Makes `tasks` the tasks of `owner` ([section 5](#5-tasks-and-dependencies)). Adds each new id, replaces each known id, and removes each id that `owner` gave before and does not give now. Changes all state first, then puts the events on the queue: all `withdrawn` events of the call first, then the `promised` events, by id in list order. A dropped task ends as `cancelled` with the reason `"removed"` if it had not finished. Throws and changes nothing if another owner has one of the ids, if `tasks` has one id two times, or if two tasks declare one exact output. `add(task)` calls `setTasks("add:" + task.id, [task])`. Rules call it; your code does not. |
+| `each<I extends Record<string, AnyMatcher>>(config: RuleConfig<I>): void` | Adds a rule ([section 10](#10-rules-one-task-for-each-thing-a-matcher-finds)). The rule subscribes to the matcher of its one input and gives the tasks of each row through `setTasks`, with the owner `<rule number>:<var values>`. The build sends each artifact event to `matcher.sendArtifact`, one time for each matcher. A rule error is fatal for the build, like a subscriber error. Throws if the rule does not have exactly one input, if `run()` has started, or if another `Build` uses the matcher. |
 | `run(): Promise<Result>` | The first time, sends a `promised` event for each output of each task that is in the build, and then runs the scan of each matcher and waits for all of them. A scan error makes `run()` reject, and no task starts. Then starts every task and resolves when every started task has finished. Does not reject when a task fails. Rejects with the first subscriber error or send-limit error of the build, at once if that error happened before the call ([section 9](#subscriber-errors)). |
 
 ### `class Task`
@@ -1262,10 +1275,10 @@ type ArtifactEvent =
 
 `taskId` is the task that declares the output, or that produced or deleted the artifact. See [section 9](#9-subscribe-to-artifact-events).
 
-### `abstract class Matcher`
+### `abstract class Matcher<D extends RowData = RowData>`
 
 ```ts
-abstract class Matcher extends Emitter<RowEvent> {
+abstract class Matcher<D extends RowData = RowData> extends Emitter<RowEvent<D>> {
   abstract readonly varNames: readonly string[]
   abstract scan(signal: AbortSignal): Promise<void>
   sendArtifact(event: ArtifactEvent): void {}
@@ -1278,34 +1291,40 @@ abstract class Matcher extends Emitter<RowEvent> {
 | `scan(signal)` | Looks at the world now and sends a `put` for each thing that it finds. The first `build.run()` calls it, and waits for it before any task starts. `signal` aborts when another scan fails. |
 | `sendArtifact(event)` | Gets each artifact event of the build. It can send rows. It must be fast and do no I/O. The default does nothing. |
 
+A matcher belongs to one `Build`. `DataOf<M>` is the data type of a matcher type `M`, for example `FileArtifact` for a `Matcher<FileArtifact>`.
+
 See [section 10](#10-rules-one-task-for-each-thing-a-matcher-finds).
 
-### `type Vars`, `type MatchRow`, and `type RowEvent`
+### `type Vars`, `type RowData`, `type MatchRow`, and `type RowEvent`
 
 ```ts
 type Vars = Readonly<Record<string, string>>
 
-type MatchRow = { vars: Vars; data: Artifact | readonly Artifact[] }
+type RowData = Artifact | readonly Artifact[]
 
-type RowEvent =
-  | { kind: "put"; row: MatchRow }
+type MatchRow<D extends RowData = RowData> = { vars: Vars; data: D }
+
+type RowEvent<D extends RowData = RowData> =
+  | { kind: "put"; row: MatchRow<D> }
   | { kind: "drop"; vars: Vars }
 ```
 
-The vars of a row are its key. A `put` with known vars replaces the row, and a `drop` removes it. See [Rows](#rows).
+The vars of a row are its key. A `put` with known vars and new data replaces the row, a `put` with the same artifact ids in the same order does nothing, and a `drop` removes it. See [Rows](#rows).
 
 ### `type RuleConfig<I>` and `type RuleInput<I>`
 
 ```ts
-type RuleConfig<I extends Record<string, Matcher>> = {
+type RuleConfig<I extends Record<string, AnyMatcher>> = {
   inputs: I
   tasks: (vars: Vars, input: RuleInput<I>) => Iterable<Task>
 }
 
-type RuleInput<I extends Record<string, Matcher>> = { readonly [K in keyof I]: MatchRow }
+type RuleInput<I extends Record<string, AnyMatcher>> = {
+  readonly [K in keyof I]: MatchRow<DataOf<I[K]>>
+}
 ```
 
-`inputs` must have exactly one entry. `tasks` gets the vars of one row and the row under its input name. See [Rules: `build.each`](#rules-buildeach).
+`AnyMatcher` is `Matcher<any>`: a matcher of any data type. Each input row has the data type of its own matcher. `inputs` must have exactly one entry. `tasks` gets the vars of one row and the row under its input name. See [Rules: `build.each`](#rules-buildeach).
 
 ## Filesystem (`dapat/contrib`)
 

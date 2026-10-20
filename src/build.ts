@@ -1,6 +1,6 @@
 import type { Artifact } from "./artifact"
 import { Emitter } from "./emitter"
-import type { Matcher } from "./matcher"
+import type { AnyMatcher } from "./matcher"
 import type { Prefix } from "./prefix"
 import { Task, isArtifact, isPrefix, type Context, type Ref } from "./task"
 import type { Store, TaskState } from "./store"
@@ -19,6 +19,9 @@ type WaitResult = "ok" | "failed" | "cancelled" | "deadlock"
 
 /** The default number of events that subscribers can cause during one drain of the event queue. */
 export const SEND_LIMIT = 10_000
+
+// The build that each matcher belongs to. A matcher sends rows to the rules of one build only.
+const matcherBuilds = new WeakMap<AnyMatcher, Build>()
 
 // The outputs of no task. Shared, and never changed.
 const NO_OUTPUTS: ReadonlyMap<string, Ref> = new Map()
@@ -57,12 +60,16 @@ export class Build extends Emitter<ArtifactEvent> {
   private fatal: Error | null = null
 
   // The matchers of every rule, each one time, in the order that the rules named them.
-  private readonly matchers = new Set<Matcher>()
+  private readonly matchers = new Set<AnyMatcher>()
   private ruleCount = 0
 
   private started = false
   // True while the first run() waits for the scans. No task starts then.
   private scanning = false
+  // The scans of the first run(). Every run() waits for them before it starts a task.
+  private scans: Promise<void> | null = null
+  // Aborts the scans. fail() aborts it, so a fatal error ends the wait for the scans.
+  private readonly scanAbort = new AbortController()
   private runningCount = 0
   private workCount = 0
   private waiters: Array<() => void> = []
@@ -97,22 +104,32 @@ export class Build extends Emitter<ArtifactEvent> {
    * Adds a rule. The rule makes tasks from the rows of its matcher.
    * Call it before the first run(): that run scans each matcher before any task starts.
    */
-  each<I extends Record<string, Matcher>>(config: RuleConfig<I>): void {
+  each<I extends Record<string, AnyMatcher>>(config: RuleConfig<I>): void {
     if (this.started) {
       throw new Error("build.each must come before the first build.run()")
     }
     const number = this.ruleCount + 1
-    const rule = new Rule(number, config, (owner, tasks) => this.setTasks(owner, tasks))
+    const rule = new Rule(number, config, {
+      setTasks: (owner, tasks) => this.setTasks(owner, tasks),
+      fail: (error) => this.fail(error),
+    })
+    for (const matcher of rule.matchers) {
+      const owner = matcherBuilds.get(matcher)
+      if (owner !== undefined && owner !== this) {
+        throw new Error(`rule ${number}: its matcher belongs to another Build; make a new matcher for each Build`)
+      }
+    }
     rule.listen()
     this.ruleCount = number
-    for (const name in config.inputs) {
-      this.addMatcher(config.inputs[name]!)
+    for (const matcher of rule.matchers) {
+      this.addMatcher(matcher)
     }
   }
 
   /** Sends each artifact event to the matcher, one time even if several rules use it. */
-  private addMatcher(matcher: Matcher): void {
+  private addMatcher(matcher: AnyMatcher): void {
     if (this.matchers.has(matcher)) return
+    matcherBuilds.set(matcher, this)
     this.matchers.add(matcher)
     this.subscribe((event) => matcher.sendArtifact(event))
   }
@@ -242,8 +259,12 @@ export class Build extends Emitter<ArtifactEvent> {
       this.drain()
       // A build with no rules starts its tasks in this same call, as before rules existed.
       if (this.matchers.size > 0 && this.fatal === null) {
-        await this.scanAll()
+        this.scans = this.scanAll()
       }
+    }
+    // A run() that starts while the first run() scans waits for the same scans.
+    if (this.scans !== null) {
+      await this.scans
     }
     if (this.fatal !== null) throw this.fatal
     for (const slot of this.slots.values()) {
@@ -255,26 +276,29 @@ export class Build extends Emitter<ArtifactEvent> {
   }
 
   /**
-   * Runs the scan of each matcher at the same time and waits for all of them.
-   * The first scan error is fatal, and it aborts the other scans.
+   * Runs the scan of each matcher at the same time. Returns when every scan has
+   * returned, or at once when the build fails: the first scan error is fatal, and a
+   * scan that ignores its aborted signal must not keep run() waiting.
    */
   private async scanAll(): Promise<void> {
-    const controller = new AbortController()
+    const signal = this.scanAbort.signal
+    const aborted = new Promise<void>((resolve) => {
+      signal.addEventListener("abort", () => resolve(), { once: true })
+    })
     const scans: Promise<void>[] = []
     this.scanning = true
     for (const matcher of this.matchers) {
-      scans.push(this.scan(matcher, controller))
+      scans.push(this.scan(matcher, signal))
     }
-    await Promise.all(scans)
+    await Promise.race([Promise.all(scans), aborted])
     this.scanning = false
   }
 
-  private async scan(matcher: Matcher, controller: AbortController): Promise<void> {
+  private async scan(matcher: AnyMatcher, signal: AbortSignal): Promise<void> {
     try {
-      await matcher.scan(controller.signal)
+      await matcher.scan(signal)
     } catch (error) {
       this.fail(toError(error))
-      controller.abort()
     }
   }
 
@@ -335,6 +359,7 @@ export class Build extends Emitter<ArtifactEvent> {
     if (this.fatal !== null) return
     this.fatal = error
     this.queue = []
+    this.scanAbort.abort(error)
     for (const slot of this.slots.values()) {
       if (slot.phase === "running" && slot.abort) slot.abort.abort()
     }
@@ -839,12 +864,21 @@ function addOutputEvents(
   }
 }
 
-/** "<kind> <id> by <task id>", for error messages. */
+/** "<kind> <id> by <task id>", for error messages. Each id is cut to a readable length. */
 function eventLine(event: ArtifactEvent): string {
+  const taskId = shortId(event.taskId)
   if (event.kind === "produced" || event.kind === "deleted") {
-    return `${event.kind} ${event.artifact.id} by ${event.taskId}`
+    return `${event.kind} ${shortId(event.artifact.id)} by ${taskId}`
   }
-  return `${event.kind} ${event.output.id} by ${event.taskId}`
+  return `${event.kind} ${shortId(event.output.id)} by ${taskId}`
+}
+
+const MAX_SHOWN_ID = 200
+
+/** The id, or its first 200 characters and "…" when it is longer. */
+function shortId(id: string): string {
+  if (id.length <= MAX_SHOWN_ID) return id
+  return `${id.slice(0, MAX_SHOWN_ID)}…`
 }
 
 function toError(value: unknown): Error {
