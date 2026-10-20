@@ -109,7 +109,7 @@ Put `hello` into `in.txt`, and then run the script more than one time:
 
 [Section 6](#6-when-a-task-skips) gives the full rules.
 
-The repo has this build in `examples/first-build.ts`. Run it with `bun run examples/first-build.ts` from a directory that contains `in.txt`.
+The repo has this build in `examples/first-build.ts`. Run it from a folder that contains `in.txt`, with `bun run <path to dapat>/examples/first-build.ts`.
 
 ### Read the result
 
@@ -474,7 +474,7 @@ const build = new Build({ store })
 
 If the file is not valid JSON, each `get` throws, so each task fails. Call `store.clear()` or delete the file to start again.
 
-`SqliteStore` accepts an open `Database` from `bun:sqlite` or a file path. If you give a path, the store opens the database, and `close()` closes it. If you give a `Database`, `close()` does nothing.
+`SqliteStore` accepts an open `Database` from `bun:sqlite` or a file path. If you give a path, the store creates the folder of the path, opens the database, and `close()` closes it. If you give a `Database`, `close()` does nothing.
 
 The store keeps one stamp for each declared input and output. The key is `artifact <id>` or `prefix <id>`, so a prefix and an artifact with the same id cannot share a stamp. An artifact stamp is a string, or `null` for a missing artifact. A prefix with a `null` stamp has no key, because the task runs anyway. The store does not keep the artifacts that a task reported with `ctx.produced()` or `ctx.deleted()`.
 
@@ -1130,7 +1130,7 @@ Keeps every record in one JSON file with the shape `{ "tasks": { "<taskId>": { "
 new SqliteStore(db: Database | string)
 ```
 
-Creates the table `dapat_task_state (task_id TEXT PRIMARY KEY, payload TEXT)` if it does not exist. `payload` is the record as JSON. `close()` closes the database only if the store opened it from a path.
+Given a path, it creates the parent folder of the path. It creates the table `dapat_task_state (task_id TEXT PRIMARY KEY, payload TEXT)` if it does not exist. `payload` is the record as JSON. `close()` closes the database only if the store opened it from a path.
 
 ### `MemoryStore`
 

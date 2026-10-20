@@ -67,6 +67,20 @@ describe("stores", () => {
     second.close()
   })
 
+  test("SqliteStore creates the folders of its path", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "dapat-sqlstore-"))
+    temps.push(dir)
+    const dbPath = path.join(dir, "nested", "deeper", "state.db")
+    const first = new SqliteStore(dbPath)
+    await first.set("copy", sample)
+    first.close()
+
+    const second = new SqliteStore(dbPath)
+    const got = await second.get("copy")
+    expect(got).toEqual(sample)
+    second.close()
+  })
+
   test("JsonStore keeps every record when parallel tasks finish at the same time", async () => {
     const dir = await mkdtemp(path.join(tmpdir(), "dapat-json-"))
     temps.push(dir)
