@@ -17,6 +17,9 @@ gradle/wrapper/gradle-wrapper.jar
 .DS_Store
 Thumbs.db
 
+# Amp orbs
+.amp/portals/*
+
 # Build state
 .dapat-state.json
 

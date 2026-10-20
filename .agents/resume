@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# dapat needs only Bun and node_modules, both prepared by .agents/setup.
+# Nothing to authenticate or reconnect; just verify the toolchain is on PATH.
+command -v bun >/dev/null

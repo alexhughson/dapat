@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$(dirname "$BASH_SOURCE")/.."
+
+step() {
+  printf '[setup] %s\n' "$1"
+}
+
+# Bun is the toolchain: dapat runs on Bun only (see README).
+if ! command -v bun >/dev/null; then
+  step 'installing Bun'
+  curl -fsSL https://bun.sh/install | bash
+  export PATH="$HOME/.bun/bin:$PATH"
+fi
+
+step 'installing dependencies (bun install --frozen-lockfile)'
+bun install --frozen-lockfile
+
+step 'done'
