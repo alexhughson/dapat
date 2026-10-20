@@ -114,6 +114,9 @@ function parseSegment(raw: string, template: string): Segment {
     } else {
       const name = match[1]!
       const previous = parts[parts.length - 1]
+      if (previous !== undefined && previous.kind === "var" && previous.name === name) {
+        throw new Error(`pattern '${template}': the var <${name}> comes twice with nothing between`)
+      }
       if (previous !== undefined && previous.kind === "var") {
         throw new Error(
           `pattern '${template}': the vars <${previous.name}> and <${name}> have nothing between them, so a key has no single split`,
@@ -157,35 +160,72 @@ function collectMeta(segments: Segment[]): {
  * places of the var agree. `[^/]` also matches line breaks. The `u` flag keeps a surrogate pair whole.
  */
 function keyRegexOf(segments: Segment[]): RegExp {
+  // For each var name, the number of segments that hold it.
+  const segmentCountByVarName = new Map<string, number>()
+  for (const segment of segments) {
+    if (segment.kind !== "mix") continue
+    const namesInSegment = new Set<string>()
+    for (const part of segment.parts) {
+      if (part.kind === "var") namesInSegment.add(part.name)
+    }
+    for (const name of namesInSegment) {
+      const count = segmentCountByVarName.get(name) ?? 0
+      segmentCountByVarName.set(name, count + 1)
+    }
+  }
+
   let source = "^"
   const seenVarNames = new Set<string>()
-  for (const segment of segments) {
+  for (let index = 0; index < segments.length; index++) {
+    const segment = segments[index]!
     if (segment.kind === "rest") {
       // Lazy, so `**` takes as few segments as it can.
       source += "(?:/[^/]+)*?"
       continue
     }
-    source += "/"
     if (segment.kind === "lit") {
-      source += escapeRe(segment.value)
+      source += `/${escapeRe(segment.value)}`
       continue
     }
     if (segment.kind === "star") {
-      source += "[^/]+"
+      source += "/[^/]+"
       continue
     }
-    for (const part of segment.parts) {
+    // The parts after the last var that another segment also holds. Only those vars can make
+    // a later segment fail, so no other split of these parts can fix that failure.
+    let tailStart = 0
+    for (let partIndex = 0; partIndex < segment.parts.length; partIndex++) {
+      const part = segment.parts[partIndex]!
+      if (part.kind === "var" && segmentCountByVarName.get(part.name)! > 1) tailStart = partIndex + 1
+    }
+    let headSource = "/"
+    let tailSource = ""
+    for (let partIndex = 0; partIndex < segment.parts.length; partIndex++) {
+      const part = segment.parts[partIndex]!
+      let partSource: string
       if (part.kind === "lit") {
-        source += escapeRe(part.value)
+        partSource = escapeRe(part.value)
       } else if (part.kind === "star") {
-        source += "[^/]*"
+        partSource = "[^/]*"
       } else if (seenVarNames.has(part.name)) {
-        source += `\\k<${part.name}>`
+        partSource = `\\k<${part.name}>`
       } else {
         seenVarNames.add(part.name)
-        source += `(?<${part.name}>[^/]+)`
+        partSource = `(?<${part.name}>[^/]+)`
+      }
+      if (partIndex < tailStart) {
+        headSource += partSource
+      } else {
+        tailSource += partSource
       }
     }
+    source += headSource
+    if (tailSource === "") continue
+    // A failure later in the key must not try the other splits of the tail: that costs the
+    // product of the splits of all segments. A capture in a lookahead keeps the first split
+    // that fills the rest of the segment, like an atomic group. A var name cannot hold `$`.
+    const groupName = `$tail${index}`
+    source += `(?=(?<${groupName}>${tailSource})(?:/|$))\\k<${groupName}>`
   }
   source += "$"
   return new RegExp(source, "u")

@@ -935,7 +935,7 @@ abstract class Matcher<D extends MatchedData = MatchedData> extends Emitter<Matc
 
 A matcher sends events with `this.send(event)`. It knows nothing about the code that listens to it. One matcher can feed several `build.each` calls of one build. It still gets each build event one time. One `build.each` cannot use one matcher object under two names. A matcher belongs to the first build that uses it: give each `Build` its own matchers.
 
-A matcher may send `found` again for the same thing. `build.each` ignores a `found` whose data has the same artifact ids, in the same order, as the current match. One artifact and a list of one artifact are different data, so a change from one to the other replaces the tasks. So the `Posts` matcher can send `found` for the `promised` event and again for the `produced` event of one file. The task is made one time, and a task that rewrites its own input in place does not run again.
+A matcher may send `found` again for the same thing. `build.each` ignores a `found` whose data has the same artifact ids, in the same order, as the current match. So the `Posts` matcher can send `found` for the `promised` event and again for the `produced` event of one file. The task is made one time, and a task that rewrites its own input in place does not run again. One artifact and a list of one artifact are different data, so a change from one to the other replaces the tasks.
 
 A change to the content of an artifact is the job of its stamp, not of the match: the next build runs the task again because the stamp changed. To force the tasks of a match to be made again, a matcher sends `gone` and then `found`.
 
@@ -974,7 +974,8 @@ type MatchedArtifactEvent =
 | --- | --- |
 | `found` with new vars | joins the match with the matches of the other matchers, and adds the tasks of each new joined set |
 | `found` with known vars and new data | replaces the tasks of each joined set that holds the match ([section 8](#replacement)). The sets stay the same, because the vars stay the same. |
-| `found` with known vars and the same artifact ids | nothing. One artifact and a list of one artifact are different data, so they replace the tasks. |
+| `found` with known vars and the same artifact ids | nothing |
+| `found` that changes one artifact to a list of one artifact, or back | replaces the tasks |
 | `gone` | removes the tasks of each joined set that holds the match ([section 8](#removal)) |
 
 For example, a matcher sends `found { slug: "a" }`, then `found { slug: "a" }` with a new file, then `gone { slug: "a" }`. `build.each` adds the tasks of `a`, replaces them, and then removes them. A `gone` with the right var names for a match that `build.each` does not know does nothing. A `gone` with wrong var names is a bug in the matcher, so `build.run()` rejects.
@@ -1252,7 +1253,7 @@ A new checkout changes the modification time of each file. With the default `sta
 - **A prefix input that covers the store file runs on every build.** For example, a task reads `new FilesystemPrefix(".")`, and the store is `.dapat/state.json`. Each build writes the store, so the stamp of the prefix changes. Put the store outside the folders that tasks read, or read a narrower prefix.
 - **Only a missing path counts as missing.** `FileArtifact` returns a `null` stamp, and `FilesystemPrefix` returns the stamp of an empty list and lists no files, only for `ENOENT`. Every other error makes `stamp()` throw, so the task fails with that error, for example a permission error, or a file where a folder must be. In `"time"` mode, dapat reads only the metadata of a file. A file that the task cannot read still gets a stamp, and `read()` fails later.
 - **The skip rule ignores the order and the repeats of the inputs.** The record keeps the stamps by id. So a task that ran with the inputs `[a, b]` skips with `[b, a]`, and a task that ran with `[a]` skips with `[a, a]`. If the result of a task depends on the order of its inputs, put the order in the task id, or force the task to run ([section 12.1](#121-force-tasks-to-run-again)).
-- **A key pattern needs text between two vars.** `KeyPattern` (in `src/pattern.ts`, not exported yet) throws when two vars have nothing between them, for example `v/<lang><slug>.md`. A key such as `v/enintro.md` has more than one split. The error names the pattern and the two vars. Put text between the vars, for example `v/<lang>-<slug>.md`.
+- **A key pattern needs text between two vars.** `KeyPattern` (in `src/pattern.ts`, not exported yet) throws when two vars have nothing between them, for example `v/<lang><slug>.md`. A key such as `v/enintro.md` has more than one split. The error names the pattern and the two vars. Put text between the vars, for example `v/<lang>-<slug>.md`. A `*` between two vars is allowed, for example `v/<lang>*<slug>.md`. Then the first var takes the most text that it can.
 - **No timeout and no concurrency limit.** All ready tasks start at the same time. Add limits and timeouts in your task code ([section 12.2](#122-limit-parallel-work)), and use `ctx.signal` to stop work.
 - **Bun only.** The adapters use Bun APIs.
 

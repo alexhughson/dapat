@@ -108,7 +108,7 @@ export class MatchTable {
     }
     if (!sameNames) {
       throw new Error(
-        `matcher '${this.name}' of build.each ${this.eachNumber} matched an artifact with vars ` +
+        `matcher '${this.name}' of build.each ${this.eachNumber} sent vars ` +
           `[${given.join(", ")}]; its varNames are [${this.varNames.join(", ")}]`,
       )
     }

@@ -110,10 +110,42 @@ describe("KeyPattern", () => {
       "pattern 'v/<lang><slug>.md': the vars <lang> and <slug> have nothing between them, so a key has no single split",
     )
     expect(() => new KeyPattern("emoji/<a><b>.txt")).toThrow("the vars <a> and <b> have nothing between them")
+    expect(() => new KeyPattern("d/<x><x>.txt")).toThrow("pattern 'd/<x><x>.txt': the var <x> comes twice with nothing between")
   })
 
   test("a glob next to a var does not split a surrogate pair", () => {
     const vars = new KeyPattern("emoji/*<a>.txt").match("emoji/\u{1F600}.txt")
     expect(vars).toEqual({ a: "\u{1F600}" })
+  })
+
+  test("a key that does not match does not try every split of every segment", () => {
+    // 20 segments `<v0>-<w0>/.../z`, and a key whose segments have 3 dashes each, ending in y.
+    const templateSegments: string[] = []
+    const keySegments: string[] = []
+    for (let i = 0; i < 20; i++) {
+      templateSegments.push(`<v${i}>-<w${i}>`)
+      keySegments.push("x-x-x-x")
+    }
+    const pattern = new KeyPattern(`${templateSegments.join("/")}/z`)
+    const start = performance.now()
+    const missed = pattern.match(`${keySegments.join("/")}/y`)
+    const elapsedMs = performance.now() - start
+    expect(missed).toBeNull()
+    expect(elapsedMs).toBeLessThan(100)
+    expect(pattern.match(`${keySegments.join("/")}/z`)).toEqual(expect.objectContaining({ v0: "x-x-x", w0: "x", v19: "x-x-x" }))
+  })
+
+  test("a segment after ** still finds its split", () => {
+    expect(new KeyPattern("**/<a>-<b>/z").match("p/q-r-s/z")).toEqual({ a: "q-r", b: "s" })
+    expect(new KeyPattern("**/<a>-<b>.md").match("p/x/q-r.md")).toEqual({ a: "q", b: "r" })
+  })
+
+  test("a segment with a shared var tries each value of that var, and only one split of the rest", () => {
+    const pattern = new KeyPattern("<lang>*<a>/<lang>.md")
+    expect(pattern.match("en-x-y/en.md")).toEqual({ lang: "en", a: "y" })
+    const longName = `en${"-x".repeat(1000)}`
+    const start = performance.now()
+    expect(pattern.match(`${longName}/fr.md`)).toBeNull()
+    expect(performance.now() - start).toBeLessThan(100)
   })
 })

@@ -147,13 +147,13 @@ export class Build extends Emitter<ArtifactEvent> {
     this.eachCount = number
     for (const name of matcherNames) {
       const matcher = config.matchersByName[name]!
-      const hearer: MatcherHearer = { taskMaterializer, matcherName: name }
+      const newHearer: MatcherHearer = { taskMaterializer, matcherName: name }
       const knownHearers = this.hearersByMatcher.get(matcher)
       if (knownHearers !== undefined) {
-        knownHearers.push(hearer)
+        knownHearers.push(newHearer)
         continue
       }
-      const hearers: MatcherHearer[] = [hearer]
+      const hearers: MatcherHearer[] = [newHearer]
       matcherBuilds.set(matcher, this)
       this.hearersByMatcher.set(matcher, hearers)
       // Each matcher gets each artifact event one time, even if several build.each calls use it.
@@ -164,8 +164,8 @@ export class Build extends Emitter<ArtifactEvent> {
       matcher.subscribe((event) => {
         // A failed build makes no more tasks, so it does not call `tasks` again.
         if (this.fatal) return
-        for (const listening of hearers) {
-          this.matchEvents.push({ taskMaterializer: listening.taskMaterializer, matcherName: listening.matcherName, event })
+        for (const hearer of hearers) {
+          this.matchEvents.push({ taskMaterializer: hearer.taskMaterializer, matcherName: hearer.matcherName, event })
         }
         this.hearMatchEvents()
       })

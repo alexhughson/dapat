@@ -641,7 +641,7 @@ describe("build.each errors", () => {
     })
 
     await expect(build.run()).rejects.toThrow(
-      "matcher 'page' of build.each 1 matched an artifact with vars [slug]; its varNames are [name]",
+      "matcher 'page' of build.each 1 sent vars [slug]; its varNames are [name]",
     )
   })
 
@@ -656,7 +656,7 @@ describe("build.each errors", () => {
     const failing = new Build()
     failing.each({ matchersByName: { page: wrongGone }, *tasks() {} })
     await expect(failing.run()).rejects.toThrow(
-      "matcher 'page' of build.each 1 matched an artifact with vars [slug]; its varNames are [name]",
+      "matcher 'page' of build.each 1 sent vars [slug]; its varNames are [name]",
     )
   })
 
