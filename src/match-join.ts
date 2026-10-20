@@ -1,100 +1,110 @@
-import type { AnyMatcher } from "./matcher"
 import type { MatchedArtifact, Vars } from "./matched-artifact"
+import type { TaskGroup } from "./task-group"
 
 /** The var values of a match in its matcher's varNames order, each URI-encoded, joined with "/". */
-export type VarsKey = string
+type VarsKey = string
 
 /** The values of some join var names, in a fixed order, encoded like a VarsKey. */
 type JoinKey = string
 
-/** The current match of one vars key. */
+/** The current match of one vars key of one matcher. */
 export type StoredMatch = {
   matched: MatchedArtifact
   // A found event with the same artifact ids does nothing.
   artifactIds: string
-  // The keys of the joined sets that hold this match.
-  setKeys: Set<string>
+  // The joined sets that hold this match.
+  sets: Set<JoinedSet>
+}
+
+/** One match of each matcher, where the var names that two matchers share have the same values. */
+export type JoinedSet = {
+  // The vars of all its matches, in the union var name order of the build.each.
+  vars: Vars
+  membersByName: Map<string, StoredMatch>
+  group: TaskGroup
 }
 
 /**
- * One lookup of the join: the vars keys of the matches of one matcher, by the values
- * of some of its var names. A changed match of another matcher finds its partners here.
+ * One index of a matcher: its matches by the values of some of its var names.
+ * A changed match of another matcher finds its partners here.
  */
 type JoinIndex = {
   lookupVarNames: readonly string[]
-  varsKeysByJoinKey: Map<JoinKey, Set<VarsKey>>
+  matchesByJoinKey: Map<JoinKey, Set<StoredMatch>>
 }
 
-/** The matches of one matcher in one build.each, and the indexes that the join looks them up by. */
+/**
+ * The matches of one matcher in one build.each. It has one index for each set of
+ * var names that the join looks it up by, so a matcher can have several indexes.
+ */
 export class MatchTable {
-  readonly varNames: readonly string[]
   private readonly matchesByVarsKey = new Map<VarsKey, StoredMatch>()
   // By the JSON of lookupVarNames. Two join steps with the same var names share one index.
   private readonly indexesByVarNames = new Map<string, JoinIndex>()
 
   constructor(
     readonly name: string,
-    readonly matcher: AnyMatcher,
+    readonly varNames: readonly string[],
     private readonly eachNumber: number,
-  ) {
-    this.varNames = matcher.varNames
-  }
+  ) {}
 
   addIndex(lookupVarNames: readonly string[]): void {
     const indexName = JSON.stringify(lookupVarNames)
     if (this.indexesByVarNames.has(indexName)) return
-    this.indexesByVarNames.set(indexName, { lookupVarNames, varsKeysByJoinKey: new Map() })
+    this.indexesByVarNames.set(indexName, { lookupVarNames, matchesByJoinKey: new Map() })
   }
 
-  get(varsKey: VarsKey): StoredMatch | undefined {
-    return this.matchesByVarsKey.get(varsKey)
+  /** The match with these vars. Throws if the var names are not this matcher's varNames. */
+  get(vars: Vars): StoredMatch | undefined {
+    return this.matchesByVarsKey.get(this.varsKeyOf(vars))
   }
 
   /** Adds a match with new vars. A match with known vars changes in place, so it needs no put. */
-  put(varsKey: VarsKey, stored: StoredMatch): void {
-    this.matchesByVarsKey.set(varsKey, stored)
+  put(stored: StoredMatch): void {
+    this.matchesByVarsKey.set(this.varsKeyOf(stored.matched.vars), stored)
     for (const index of this.indexesByVarNames.values()) {
       const joinKey = keyOfVars(stored.matched.vars, index.lookupVarNames)
-      let varsKeys = index.varsKeysByJoinKey.get(joinKey)
-      if (varsKeys === undefined) {
-        varsKeys = new Set()
-        index.varsKeysByJoinKey.set(joinKey, varsKeys)
+      let matches = index.matchesByJoinKey.get(joinKey)
+      if (matches === undefined) {
+        matches = new Set()
+        index.matchesByJoinKey.set(joinKey, matches)
       }
-      varsKeys.add(varsKey)
+      matches.add(stored)
     }
   }
 
-  delete(varsKey: VarsKey): void {
-    const stored = this.matchesByVarsKey.get(varsKey)
-    if (stored === undefined) return
-    this.matchesByVarsKey.delete(varsKey)
+  delete(stored: StoredMatch): void {
+    this.matchesByVarsKey.delete(this.varsKeyOf(stored.matched.vars))
     for (const index of this.indexesByVarNames.values()) {
       const joinKey = keyOfVars(stored.matched.vars, index.lookupVarNames)
-      const varsKeys = index.varsKeysByJoinKey.get(joinKey)
-      if (varsKeys === undefined) continue
-      varsKeys.delete(varsKey)
-      if (varsKeys.size === 0) {
-        index.varsKeysByJoinKey.delete(joinKey)
+      const matches = index.matchesByJoinKey.get(joinKey)!
+      matches.delete(stored)
+      if (matches.size === 0) {
+        index.matchesByJoinKey.delete(joinKey)
       }
     }
   }
 
-  /** The vars keys of the matches whose lookupVarNames have the values in `vars`. */
-  lookup(lookupVarNames: readonly string[], vars: Vars): ReadonlySet<VarsKey> {
+  /** The matches whose lookupVarNames have the values in `vars`. */
+  lookup(lookupVarNames: readonly string[], vars: Vars): ReadonlySet<StoredMatch> {
     const index = this.indexesByVarNames.get(JSON.stringify(lookupVarNames))!
-    const joinKey = keyOfVars(vars, lookupVarNames)
-    return index.varsKeysByJoinKey.get(joinKey) ?? new Set()
+    return index.matchesByJoinKey.get(keyOfVars(vars, lookupVarNames)) ?? new Set()
   }
 
-  /** The vars key of a match. Throws if its var names are not this matcher's varNames. */
-  varsKeyOf(vars: Vars): VarsKey {
+  /** The number of join keys in all indexes. A join key with no match is deleted, so this is 0 when the table is empty. */
+  get joinKeyCount(): number {
+    let count = 0
+    for (const index of this.indexesByVarNames.values()) {
+      count += index.matchesByJoinKey.size
+    }
+    return count
+  }
+
+  private varsKeyOf(vars: Vars): VarsKey {
     const given = Object.keys(vars)
     let sameNames = given.length === this.varNames.length
     for (const name of this.varNames) {
-      if (!Object.hasOwn(vars, name)) {
-        sameNames = false
-        break
-      }
+      if (!Object.hasOwn(vars, name)) sameNames = false
     }
     if (!sameNames) {
       throw new Error(
@@ -117,10 +127,10 @@ export type JoinStep = {
   lookupVarNames: readonly string[]
 }
 
-/** A joined set before it has a task group: its vars, and the vars key of the match of each matcher. */
-export type JoinedMatches = {
+/** A joined set before it has a task group. */
+export type JoinedMembers = {
   vars: Record<string, string>
-  varsKeyByName: Map<string, VarsKey>
+  membersByName: Map<string, StoredMatch>
 }
 
 /**
@@ -153,19 +163,14 @@ export function planJoins(tables: readonly MatchTable[], eachNumber: number): Ma
         placedOne = true
       }
     }
-    if (placedNames.size < tables.length) {
-      const joined: string[] = []
-      const apart: string[] = []
-      for (const table of tables) {
-        if (placedNames.has(table.name)) {
-          joined.push(`'${table.name}'`)
-        } else {
-          apart.push(`'${table.name}'`)
-        }
-      }
+    const unplacedNames: string[] = []
+    for (const table of tables) {
+      if (!placedNames.has(table.name)) unplacedNames.push(`'${table.name}'`)
+    }
+    if (unplacedNames.length > 0) {
       throw new Error(
-        `build.each ${eachNumber}: the matchers [${joined.join(", ")}] share no var name with the matchers ` +
-          `[${apart.join(", ")}]; each matcher must share a var name with another matcher, or the join is a cross product`,
+        `build.each ${eachNumber}: the matchers [${unplacedNames.join(", ")}] share no var name with matcher '${start.name}' ` +
+          `or its partners; each matcher must share a var name with another matcher`,
       )
     }
     stepsByName.set(start.name, steps)
@@ -173,25 +178,19 @@ export function planJoins(tables: readonly MatchTable[], eachNumber: number): Ma
   return stepsByName
 }
 
-/** Every joined set that holds the match `startVarsKey` of `start`. */
-export function joinFrom(start: MatchTable, startVarsKey: VarsKey, steps: readonly JoinStep[]): JoinedMatches[] {
-  const startMatch = start.get(startVarsKey)!
-  let partialSets: JoinedMatches[] = [
-    {
-      vars: { ...startMatch.matched.vars },
-      varsKeyByName: new Map([[start.name, startVarsKey]]),
-    },
+/** Every joined set that holds `start`, a match of `table`. */
+export function joinFrom(table: MatchTable, start: StoredMatch, steps: readonly JoinStep[]): JoinedMembers[] {
+  let partialSets: JoinedMembers[] = [
+    { vars: { ...start.matched.vars }, membersByName: new Map([[table.name, start]]) },
   ]
   for (const step of steps) {
-    const longerSets: JoinedMatches[] = []
+    const longerSets: JoinedMembers[] = []
     for (const partial of partialSets) {
-      const partnerKeys = step.table.lookup(step.lookupVarNames, partial.vars)
-      for (const partnerKey of partnerKeys) {
-        const partner = step.table.get(partnerKey)!
+      for (const partner of step.table.lookup(step.lookupVarNames, partial.vars)) {
         const vars = { ...partial.vars, ...partner.matched.vars }
-        const varsKeyByName = new Map(partial.varsKeyByName)
-        varsKeyByName.set(step.table.name, partnerKey)
-        longerSets.push({ vars, varsKeyByName })
+        const membersByName = new Map(partial.membersByName)
+        membersByName.set(step.table.name, partner)
+        longerSets.push({ vars, membersByName })
       }
     }
     partialSets = longerSets
@@ -200,7 +199,7 @@ export function joinFrom(start: MatchTable, startVarsKey: VarsKey, steps: readon
 }
 
 /** The values of `varNames` in that order, each URI-encoded, joined with "/". */
-export function keyOfVars(vars: Vars, varNames: readonly string[]): string {
+function keyOfVars(vars: Vars, varNames: readonly string[]): string {
   const parts: string[] = []
   for (const name of varNames) {
     parts.push(encodeURIComponent(vars[name]!))

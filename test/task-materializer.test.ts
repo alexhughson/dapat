@@ -577,7 +577,7 @@ describe("build.each errors", () => {
         matchersByName: { a: new MemMatcher("a:"), b: new EventMatcher<Mem>(["slug"], []) },
         *tasks() {},
       }),
-    ).toThrow("build.each 1: the matchers ['a'] share no var name with the matchers ['b']")
+    ).toThrow("build.each 1: the matchers ['b'] share no var name with matcher 'a' or its partners")
   })
 
   test("build.each after run() throws", async () => {
@@ -595,7 +595,7 @@ describe("build.each errors", () => {
     const second = new Build()
 
     expect(() => second.each({ matchersByName: { page: matcher }, *tasks() {} })).toThrow(
-      "build.each 1: its matcher belongs to another Build; make a new matcher for each Build",
+      "build.each 1: its matcher 'page' belongs to another Build; make a new matcher for each Build",
     )
   })
 })

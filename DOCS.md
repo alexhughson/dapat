@@ -836,12 +836,16 @@ A matcher does not need to share a var name with every other matcher. It needs t
 If the matchers do not form one connected group, `build.each` throws. Without a shared var name, each match of one group would join with each match of the other group, and the number of tasks would be the product of the two. Example: `page` has only `slug`, and `template` has only `lang`:
 
 ```
-build.each 1: the matchers ['page'] share no var name with the matchers ['template']; each matcher must share a var name with another matcher, or the join is a cross product
+build.each 1: the matchers ['template'] share no var name with matcher 'page' or its partners; each matcher must share a var name with another matcher
 ```
 
-One matcher alone is always valid. Each of its matches is a joined set with one member.
+One matcher alone is always valid. Each of its matches is a joined set with one member. A matcher with no var names shares no var, so it fails this check when the `build.each` has another matcher.
 
-`build.each` keeps an **index** for each matcher: a map from the values of the var names that it shares to its matches. When one match changes, `build.each` looks up only the matches that join with it. It does not scan all the matches again. So one changed template among 1000 pages replaces the 500 tasks of its `lang`, and the time grows with the number of tasks that change, not with the square of all matches. `bun bench/join.ts` measures this.
+`build.each` keeps **indexes** for each matcher. An index maps the values of some var names to the matches that have them. A matcher has one index for each set of var names that the join looks it up by. In the example, `page` has an index by `lang`. When one match changes, `build.each` looks up its partners in these indexes. It does not scan all the matches again. So the join costs one index lookup for each other matcher, and the work for each partner that it finds.
+
+The build itself has a cost that grows with all its tasks. After each change of tasks, it checks every task to see which one can start. So one changed template among many pages can still take a long time in a large build. `build.add` has the same cost. `bun bench/join.ts` measures both.
+
+A matcher event that comes while `build.each` handles another one waits. It comes from `tasks`, or from a subscriber of the events of the change. `build.each` handles the waiting events in order, after the current one. Each `build.each` call thus sees each event alone. The tasks still exist before the outermost `send` of the matcher returns.
 
 ### Example with one matcher
 
@@ -929,7 +933,7 @@ abstract class Matcher<D extends MatchedData = MatchedData> extends Emitter<Matc
 - `scan` looks at the world now, and sends `found` for each thing that it finds. Disk reads and network calls go here. `signal` aborts when another scan fails, or when the build fails.
 - `receiveArtifactEvent` gets each event of the build ([section 9](#9-subscribe-to-artifact-events)). It can send `found` for an output that a task declares or writes. It must be fast and do no I/O. The default does nothing, so the matches never change during a run.
 
-A matcher sends events with `this.send(event)`. It knows nothing about the code that listens to it. One matcher can feed several `build.each` calls of one build. It still gets each build event one time. A matcher belongs to the first build that uses it: give each `Build` its own matchers.
+A matcher sends events with `this.send(event)`. It knows nothing about the code that listens to it. One matcher can feed several `build.each` calls of one build. It still gets each build event one time. One `build.each` cannot use one matcher object under two names. A matcher belongs to the first build that uses it: give each `Build` its own matchers.
 
 A matcher may send `found` again for the same thing. `build.each` ignores a `found` whose data has the same artifact ids, in the same order, as the current match. So the `Posts` matcher can send `found` for the `promised` event and again for the `produced` event of one file. The task is made one time, and a task that rewrites its own input in place does not run again.
 
@@ -1065,9 +1069,10 @@ An error in `build.each` is fatal for the build, as a subscriber error is. The `
 | Where | Example | What you see |
 | --- | --- | --- |
 | `build.each` | `matchersByName` has no matcher | `build.each` throws |
-| `build.each` | the matchers do not form one connected group by shared var names | `build.each` throws, and names the matchers of each part |
+| `build.each` | the matchers do not form one connected group by shared var names | `build.each` throws, and names the matchers that do not connect |
+| `build.each` | one matcher object is under two names | `build.each` throws |
 | `build.each` | you call it after `build.run()` | `build.each` throws |
-| `build.each` | its matcher is used by another `Build` | `build.each` throws |
+| `build.each` | one of its matchers is used by another `Build` | `build.each` throws, and names the matcher |
 | a scan | the folder does not exist | `build.run()` rejects at once, and no task runs. The other scans get an aborted `signal`. `build.run()` does not wait for them. |
 | a matched artifact | its vars are not the `varNames` of its matcher | `build.run()` rejects |
 | `tasks` | two matches give one task id | `build.run()` rejects with `task 'x' is in two groups: 'build.each 1 slug=a' and 'build.each 1 slug=b'` |
@@ -1271,7 +1276,7 @@ new Build(opts?: { store?: Store; sendLimit?: number })
 | `remove(id: string): void` | Removes a task. Aborts it if it is running and sends a `withdrawn` event for each declared output. Does not throw when a subscriber throws. Starts to delete its store record. Does not wait for the delete, but `run()` does. A delete error goes into `result.errors`. Does nothing if the id is not known. The other tasks of the same task group stay. |
 | `subscribe(listener: (event: ArtifactEvent) => void): void` | From `Emitter`. Calls `listener` synchronously for each artifact event, in the order of the event queue. Does not replay earlier events. See [section 9](#9-subscribe-to-artifact-events). |
 | `protected setTasks(group: TaskGroup, tasks: readonly Task[]): void` | Makes `tasks` the tasks of `group` ([Task groups](#task-groups)). Adds each new id, replaces each known id, and removes each id that `group` had before and does not get now. Changes all state first, then puts the events on the queue: all `withdrawn` events of the call first, then the `promised` events, by id in list order. A dropped task ends as `cancelled` with the reason `"removed"` if it had not finished. Throws and changes nothing if another group has one of the ids, if `tasks` has one id two times, or if two tasks declare one exact output. `add(task)` calls it with one group for each task id. `build.each` calls it with one group for each match. A subclass of `Build` can call it with its own `new TaskGroup(label)`. |
-| `each<M extends Record<string, AnyMatcher>>(config: TaskMaterializerConfig<M>): void` | Makes tasks for each joined set of matched artifacts ([section 10](#10-buildeach-tasks-for-each-matched-artifact)). Subscribes to each matcher in `matchersByName`, joins their matches on shared var names, and gives the tasks of each joined set through `setTasks`, with one task group for each set, labeled `build.each <number> <var name>=<var value> ...`. The build sends each artifact event to `matcher.receiveArtifactEvent`, one time for each matcher. An error in `tasks` or in a matched artifact is fatal for the build, like a subscriber error. Throws if `matchersByName` has no matcher, if its matchers do not form one connected group by shared var names, if `run()` has started, or if another `Build` uses a matcher. |
+| `each<M extends Record<string, AnyMatcher>>(config: TaskMaterializerConfig<M>): void` | Makes tasks for each joined set of matched artifacts ([section 10](#10-buildeach-tasks-for-each-matched-artifact)). Subscribes to each matcher in `matchersByName`, joins their matches on shared var names, and gives the tasks of each joined set through `setTasks`, with one task group for each set, labeled `build.each <number> <var name>=<var value> ...`. The build sends each artifact event to `matcher.receiveArtifactEvent`, one time for each matcher. An error in `tasks` or in a matched artifact is fatal for the build, like a subscriber error. Throws if `matchersByName` has no matcher, if one matcher object is under two names, if its matchers do not form one connected group by shared var names, if `run()` has started, or if another `Build` uses a matcher. |
 | `run(): Promise<Result>` | The first time, sends a `promised` event for each output of each task that is in the build, and then runs the scan of each matcher and waits for all of them. A call during the scans waits for the same scans. Then starts every task and resolves when every started task has finished. Does not reject when a task fails. Rejects with the first subscriber error, `build.each` error, scan error, or send-limit error of the build, at once if that error happened before the call ([section 9](#subscriber-errors)). After a scan error, no task starts. |
 
 ### `class TaskGroup`

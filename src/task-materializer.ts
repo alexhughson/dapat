@@ -1,7 +1,7 @@
 import type { Artifact } from "./artifact"
 import type { AnyMatcher, DataOf } from "./matcher"
 import type { MatchedArtifact, MatchedArtifactEvent, MatchedData, Vars } from "./matched-artifact"
-import { MatchTable, joinFrom, keyOfVars, planJoins, type JoinStep, type StoredMatch, type VarsKey } from "./match-join"
+import { MatchTable, joinFrom, planJoins, type JoinStep, type JoinedSet, type StoredMatch } from "./match-join"
 import type { Task } from "./task"
 import { TaskGroup } from "./task-group"
 
@@ -19,31 +19,18 @@ export type TaskMaterializerConfig<M extends Record<string, AnyMatcher>> = {
 
 type SetTasks = (group: TaskGroup, tasks: readonly Task[]) => void
 
-/** The union vars of a joined set, in unionVarNames order, encoded like a VarsKey. */
-type SetKey = string
-
-/** One match of each matcher, where the var names that two matchers share have the same values. */
-type JoinedSet = {
-  // The vars of all its matches, in unionVarNames order.
-  vars: Vars
-  varsKeyByName: ReadonlyMap<string, VarsKey>
-  group: TaskGroup
-  // False when a match of the set changed and the group does not have its new tasks yet.
-  tasksAreCurrent: boolean
-}
-
 /**
  * A materialized view of the matches: listens to the found and gone events of its matchers,
  * joins their matches on shared var names, and keeps one task list in the build for each joined set.
  * Each joined set has one task group, so `setTasks` replaces the tasks
  * of a set that changes and removes the tasks of a set that is gone.
+ * The build never calls `hear` while another `hear` runs (see build.each).
  */
 export class TaskMaterializer<M extends Record<string, AnyMatcher>> {
   private readonly tablesByName = new Map<string, MatchTable>()
   private readonly joinStepsByName: Map<string, JoinStep[]>
   // The var names of all matchers: in name order, then varNames order, each one time.
   private readonly unionVarNames: string[] = []
-  private readonly setsByKey = new Map<SetKey, JoinedSet>()
 
   constructor(
     readonly number: number,
@@ -54,9 +41,16 @@ export class TaskMaterializer<M extends Record<string, AnyMatcher>> {
     if (names.length === 0) {
       throw new Error(`build.each ${number} has no matcher; build.each needs at least one matcher`)
     }
+    const namesByMatcher = new Map<AnyMatcher, string>()
     const tables: MatchTable[] = []
     for (const name of names) {
-      const table = new MatchTable(name, config.matchersByName[name]!, number)
+      const matcher = config.matchersByName[name]!
+      const otherName = namesByMatcher.get(matcher)
+      if (otherName !== undefined) {
+        throw new Error(`build.each ${number}: '${otherName}' and '${name}' are one matcher object; give each name its own matcher`)
+      }
+      namesByMatcher.set(matcher, name)
+      const table = new MatchTable(name, matcher.varNames, number)
       tables.push(table)
       this.tablesByName.set(name, table)
       for (const varName of table.varNames) {
@@ -73,85 +67,58 @@ export class TaskMaterializer<M extends Record<string, AnyMatcher>> {
       return
     }
     const found = event.matched
-    const varsKey = table.varsKeyOf(found.vars)
     const artifactIds = artifactIdsOf(found.data)
-    const current = table.get(varsKey)
+    const current = table.get(found.vars)
     if (current !== undefined) {
       if (current.artifactIds === artifactIds) return
       // The vars are the same, so the match is in the same joined sets. Only their tasks change.
       current.matched = found
       current.artifactIds = artifactIds
-      const changedSetKeys = [...current.setKeys]
-      for (const setKey of changedSetKeys) {
-        this.setsByKey.get(setKey)!.tasksAreCurrent = false
+      for (const set of current.sets) {
+        this.giveTasks(set)
       }
-      this.giveTasks(changedSetKeys)
       return
     }
-    const stored: StoredMatch = { matched: found, artifactIds, setKeys: new Set() }
-    table.put(varsKey, stored)
+    const stored: StoredMatch = { matched: found, artifactIds, sets: new Set() }
+    table.put(stored)
     const joinSteps = this.joinStepsByName.get(matcherName)!
-    const newSetKeys: SetKey[] = []
-    for (const joined of joinFrom(table, varsKey, joinSteps)) {
+    for (const joined of joinFrom(table, stored, joinSteps)) {
       const vars: Record<string, string> = {}
       for (const varName of this.unionVarNames) {
         vars[varName] = joined.vars[varName]!
       }
-      const setKey = keyOfVars(vars, this.unionVarNames)
-      const group = new TaskGroup(this.labelOf(vars))
-      this.setsByKey.set(setKey, { vars, varsKeyByName: joined.varsKeyByName, group, tasksAreCurrent: false })
-      for (const [name, memberVarsKey] of joined.varsKeyByName) {
-        this.tablesByName.get(name)!.get(memberVarsKey)!.setKeys.add(setKey)
+      const set: JoinedSet = { vars, membersByName: joined.membersByName, group: new TaskGroup(this.labelOf(vars)) }
+      for (const member of set.membersByName.values()) {
+        member.sets.add(set)
       }
-      newSetKeys.push(setKey)
+      this.giveTasks(set)
     }
-    this.giveTasks(newSetKeys)
   }
 
   /** Forgets the match and removes the tasks of each joined set that holds it. */
   private hearGone(table: MatchTable, vars: Vars): void {
-    const varsKey = table.varsKeyOf(vars)
-    const gone = table.get(varsKey)
+    const gone = table.get(vars)
     if (gone === undefined) return
-    table.delete(varsKey)
-    // Forget every set before setTasks: its events can make a matcher send again.
-    const goneGroups: TaskGroup[] = []
-    for (const setKey of gone.setKeys) {
-      const set = this.setsByKey.get(setKey)!
-      this.setsByKey.delete(setKey)
-      for (const [name, memberVarsKey] of set.varsKeyByName) {
-        if (name === table.name) continue
-        this.tablesByName.get(name)!.get(memberVarsKey)!.setKeys.delete(setKey)
+    table.delete(gone)
+    for (const set of gone.sets) {
+      for (const member of set.membersByName.values()) {
+        if (member !== gone) member.sets.delete(set)
       }
-      goneGroups.push(set.group)
-    }
-    for (const group of goneGroups) {
-      this.setTasks(group, [])
+      this.setTasks(set.group, [])
     }
   }
 
-  /**
-   * Gives the build the tasks of each set that is not current. The events of one setTasks
-   * can make a matcher send again, and that send can change or remove a later set in the list,
-   * or give it its tasks already. So each set is looked up again just before its turn.
-   */
-  private giveTasks(setKeys: readonly SetKey[]): void {
-    for (const setKey of setKeys) {
-      const set = this.setsByKey.get(setKey)
-      if (set === undefined) continue
-      if (set.tasksAreCurrent) continue
-      // Mark before setTasks: its events can make a matcher find the same artifacts again.
-      set.tasksAreCurrent = true
-      const matched: Record<string, MatchedArtifact> = {}
-      for (const [name, memberVarsKey] of set.varsKeyByName) {
-        matched[name] = this.tablesByName.get(name)!.get(memberVarsKey)!.matched
-      }
-      const tasks: Task[] = []
-      for (const task of this.config.tasks(set.vars, matched as MatchedByName<M>)) {
-        tasks.push(task)
-      }
-      this.setTasks(set.group, tasks)
+  /** Gives the build the tasks of the set, from its current matches. */
+  private giveTasks(set: JoinedSet): void {
+    const matched: Record<string, MatchedArtifact> = {}
+    for (const [name, member] of set.membersByName) {
+      matched[name] = member.matched
     }
+    const tasks: Task[] = []
+    for (const task of this.config.tasks(set.vars, matched as MatchedByName<M>)) {
+      tasks.push(task)
+    }
+    this.setTasks(set.group, tasks)
   }
 
   /** `build.each <number> <name>=<value> ...`, in unionVarNames order. Only for error messages. */

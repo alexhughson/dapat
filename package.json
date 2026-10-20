@@ -8,8 +8,7 @@
     "./contrib": "./contrib/index.ts"
   },
   "scripts": {
-    "test": "bun test",
-    "bench:join": "bun bench/join.ts"
+    "test": "bun test"
   },
   "devDependencies": {
     "@types/bun": "latest"

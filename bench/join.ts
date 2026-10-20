@@ -5,8 +5,8 @@
  *    `n` tasks added with build.add. Both include build.run().
  * 2. One changed template among `n` pages: the time of its found event, which replaces n/2 tasks.
  *
- * The join looks up the partners of one match in an index, so the time must grow about
- * linearly with `n`, not with n².
+ * The join itself costs one index lookup for each partner matcher. The build's own scheduling
+ * checks every task after each change of tasks, so the build.add column grows faster than linear too.
  */
 import { Build, Matcher, Task } from "../src/index"
 import { Mem } from "../test/mem"
