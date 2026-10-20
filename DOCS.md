@@ -474,7 +474,7 @@ const build = new Build({ store })
 
 If the file is not valid JSON, each `get` throws, so each task fails. Call `store.clear()` or delete the file to start again.
 
-`SqliteStore` accepts an open `Database` from `bun:sqlite` or a file path. If you give a path, the store opens the database, and `close()` closes it. If you give a `Database`, `close()` does nothing.
+`SqliteStore` accepts an open `Database` from `bun:sqlite` or a file path. If you give a path, the store creates the folder of the path, opens the database, and `close()` closes it. If you give a `Database`, `close()` does nothing.
 
 The store keeps one stamp for each declared input and output. The key is `artifact <id>` or `prefix <id>`, so a prefix and an artifact with the same id cannot share a stamp. An artifact stamp is a string, or `null` for a missing artifact. A prefix with a `null` stamp has no key, because the task runs anyway. The store does not keep the artifacts that a task reported with `ctx.produced()` or `ctx.deleted()`.
 
