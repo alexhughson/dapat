@@ -6,7 +6,7 @@ import type { Prefix } from "./prefix"
 import { Task, isArtifact, isPrefix, type Context, type Ref } from "./task"
 import type { Store, TaskState } from "./store"
 import { Outcome, Result } from "./result"
-import { TaskGroup } from "./task-group"
+import { TaskGroup, type GroupTasks } from "./task-group"
 import { TaskMaterializer, type TaskMaterializerConfig } from "./task-materializer"
 
 export type ArtifactEvent =
@@ -122,7 +122,7 @@ export class Build extends Emitter<ArtifactEvent> {
   remove(id: string): void {
     const slot = this.slots.get(id)
     if (!slot) return
-    this.change(slot.group, [], [slot])
+    this.change([], [slot])
   }
 
   /**
@@ -136,7 +136,7 @@ export class Build extends Emitter<ArtifactEvent> {
       throw new Error("build.each must come before the first build.run()")
     }
     const number = this.eachCount + 1
-    const taskMaterializer = new TaskMaterializer(number, config, (group, tasks) => this.setTasks(group, tasks))
+    const taskMaterializer = new TaskMaterializer(number, config, (changes) => this.setTasksOfGroups(changes))
     const matcherNames = Object.keys(config.matchersByName)
     for (const name of matcherNames) {
       const matcherBuild = matcherBuilds.get(config.matchersByName[name]!)
@@ -206,26 +206,40 @@ export class Build extends Emitter<ArtifactEvent> {
    * build.add and build.each call it. Throws, with no change, if another group has one of the ids.
    */
   protected setTasks(group: TaskGroup, tasks: readonly Task[]): void {
-    this.assertSettable(group, tasks)
-    const given = new Set<string>()
-    for (const task of tasks) {
-      given.add(task.id)
-    }
-    const dropped: Slot[] = []
-    const before = this.taskIdsByGroup.get(group) ?? new Set<string>()
-    for (const id of before) {
-      if (given.has(id)) continue
-      dropped.push(this.slots.get(id)!)
-    }
-    this.change(group, tasks, dropped)
+    this.setTasksOfGroups([{ group, tasks }])
   }
 
   /**
-   * Adds or replaces each task in `tasks` and removes each slot in `dropped`.
+   * setTasks for several groups in one step. The rules apply to the state after the whole step.
+   * A task id can move from one group of the step to another one: that is a replacement, as a
+   * known id in one group is, so its store record stays. An id that a group had before and that
+   * no group of the step gets now is removed. build.each gives all the changes of one matcher event here.
+   */
+  protected setTasksOfGroups(changes: readonly GroupTasks[]): void {
+    this.assertSettable(changes)
+    const given = new Set<string>()
+    for (const change of changes) {
+      for (const task of change.tasks) {
+        given.add(task.id)
+      }
+    }
+    const dropped: Slot[] = []
+    for (const change of changes) {
+      const before = this.taskIdsByGroup.get(change.group) ?? new Set<string>()
+      for (const id of before) {
+        if (given.has(id)) continue
+        dropped.push(this.slots.get(id)!)
+      }
+    }
+    this.change(changes, dropped)
+  }
+
+  /**
+   * Adds or replaces each task of `changes` and removes each slot in `dropped`.
    * It changes the state, puts the events on the queue, and then ends the stopped tasks.
    * It drains the queue last.
    */
-  private change(group: TaskGroup, tasks: readonly Task[], dropped: readonly Slot[]): void {
+  private change(changes: readonly GroupTasks[], dropped: readonly Slot[]): void {
     const replaced: Slot[] = []
     // All withdrawn events of the call go before any promised event. Thus an output
     // that moves from one task to another in one call is withdrawn before it is promised.
@@ -239,33 +253,41 @@ export class Build extends Emitter<ArtifactEvent> {
       this.slots.delete(slot.task.id)
       addOutputEvents(withdrawn, "withdrawn", slot.task.id, outputsByKey(slot.task), NO_OUTPUTS)
     }
-    for (const task of tasks) {
-      let before = NO_OUTPUTS
-      const existing = this.slots.get(task.id)
-      if (existing) {
-        existing.generation += 1
-        this.unindex(existing.task)
-        replaced.push(existing)
-        before = outputsByKey(existing.task)
+    for (const { group, tasks } of changes) {
+      for (const task of tasks) {
+        let before = NO_OUTPUTS
+        const existing = this.slots.get(task.id)
+        if (existing) {
+          existing.generation += 1
+          this.unindex(existing.task)
+          replaced.push(existing)
+          before = outputsByKey(existing.task)
+        }
+        this.slots.set(task.id, new Slot(task, group))
+        this.index(task)
+        const after = outputsByKey(task)
+        addOutputEvents(withdrawn, "withdrawn", task.id, before, after)
+        addOutputEvents(promised, "promised", task.id, after, before)
       }
-      this.slots.set(task.id, new Slot(task, group))
-      this.index(task)
-      const after = outputsByKey(task)
-      addOutputEvents(withdrawn, "withdrawn", task.id, before, after)
-      addOutputEvents(promised, "promised", task.id, after, before)
     }
 
-    const ids = new Set(this.taskIdsByGroup.get(group))
+    // build.remove drops one slot of a group that is not in `changes`.
     for (const slot of dropped) {
+      const ids = this.taskIdsByGroup.get(slot.group)!
       ids.delete(slot.task.id)
+      if (ids.size === 0) this.taskIdsByGroup.delete(slot.group)
     }
-    for (const task of tasks) {
-      ids.add(task.id)
-    }
-    if (ids.size === 0) {
-      this.taskIdsByGroup.delete(group)
-    } else {
-      this.taskIdsByGroup.set(group, ids)
+    // Each group of the step has exactly its new ids. An id that moved to another group left it.
+    for (const { group, tasks } of changes) {
+      const ids = new Set<string>()
+      for (const task of tasks) {
+        ids.add(task.id)
+      }
+      if (ids.size === 0) {
+        this.taskIdsByGroup.delete(group)
+      } else {
+        this.taskIdsByGroup.set(group, ids)
+      }
     }
     // An abort listener below can change tasks too. Its events must come after these.
     this.push(withdrawn)
@@ -433,40 +455,54 @@ export class Build extends Emitter<ArtifactEvent> {
     this.wake()
   }
 
-  /** Throws if `setTasks(group, tasks)` would break a rule of the build. */
-  private assertSettable(group: TaskGroup, tasks: readonly Task[]): void {
-    const ids = new Set<string>()
-    // Each exact output id in `tasks`, and the task that declares it.
+  /** Throws if `setTasksOfGroups(changes)` would break a rule of the build. */
+  private assertSettable(changes: readonly GroupTasks[]): void {
+    const groupsOfStep = new Set<TaskGroup>()
+    for (const { group } of changes) {
+      if (groupsOfStep.has(group)) {
+        throw new Error(`group '${group.label}' is in one setTasks step twice`)
+      }
+      groupsOfStep.add(group)
+    }
+    // Each id in the step, and its group.
+    const groupsById = new Map<string, TaskGroup>()
+    // Each exact output id in the step, and the task that declares it.
     const claims = new Map<string, string>()
-    for (const task of tasks) {
-      if (ids.has(task.id)) {
-        throw new Error(`group '${group.label}' gives task '${task.id}' twice`)
-      }
-      ids.add(task.id)
-      const existing = this.slots.get(task.id)
-      if (existing && existing.group !== group) {
-        throw new Error(
-          `task '${task.id}' is in two groups: '${existing.group.label}' and '${group.label}'`,
-        )
-      }
-      for (const output of task.outputs) {
-        if (!isArtifact(output)) continue
-        const claimedBy = claims.get(output.id)
-        if (claimedBy === task.id) {
-          throw new Error(`task '${task.id}' declares output '${output.id}' twice`)
+    for (const { group, tasks } of changes) {
+      for (const task of tasks) {
+        const otherGroup = groupsById.get(task.id)
+        if (otherGroup === group) {
+          throw new Error(`group '${group.label}' gives task '${task.id}' twice`)
         }
-        if (claimedBy !== undefined) {
+        if (otherGroup !== undefined) {
+          throw new Error(`task '${task.id}' is in two groups: '${otherGroup.label}' and '${group.label}'`)
+        }
+        groupsById.set(task.id, group)
+        // The tasks of the groups of the step are all replaced or removed, so only another group holds an id.
+        const existing = this.slots.get(task.id)
+        if (existing && !groupsOfStep.has(existing.group)) {
           throw new Error(
-            `duplicate output '${output.id}': claimed by '${claimedBy}' and '${task.id}'`,
+            `task '${task.id}' is in two groups: '${existing.group.label}' and '${group.label}'`,
           )
         }
-        claims.set(output.id, task.id)
-        // The tasks of this group are all replaced or removed, so their outputs are free.
-        const claimer = this.exactOutputs.get(output.id)
-        if (claimer && this.slots.get(claimer.taskId)!.group !== group) {
-          throw new Error(
-            `duplicate output '${output.id}': claimed by '${claimer.taskId}' and '${task.id}'`,
-          )
+        for (const output of task.outputs) {
+          if (!isArtifact(output)) continue
+          const claimedBy = claims.get(output.id)
+          if (claimedBy === task.id) {
+            throw new Error(`task '${task.id}' declares output '${output.id}' twice`)
+          }
+          if (claimedBy !== undefined) {
+            throw new Error(
+              `duplicate output '${output.id}': claimed by '${claimedBy}' and '${task.id}'`,
+            )
+          }
+          claims.set(output.id, task.id)
+          const claimer = this.exactOutputs.get(output.id)
+          if (claimer && !groupsOfStep.has(this.slots.get(claimer.taskId)!.group)) {
+            throw new Error(
+              `duplicate output '${output.id}': claimed by '${claimer.taskId}' and '${task.id}'`,
+            )
+          }
         }
       }
     }

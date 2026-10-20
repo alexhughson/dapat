@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { Build, Matcher, Task } from "../src/index"
+import { Build, Matcher, MemoryStore, Task } from "../src/index"
 import type { AnyMatcher, ArtifactEvent, Ref, TaskMaterializerConfig } from "../src/index"
 import { MatchTable, type StoredMatch } from "../src/match-join"
 import { TaskGroup } from "../src/task-group"
@@ -638,12 +638,14 @@ describe("build.each with required: indexes, shared matchers, re-entrant events"
           yield new Task({ id: `page:${vars.lang}/${vars.slug}:${matched.review?.data.id}:${matched.branch?.data.id}`, run: async () => {} })
         },
       },
-      (group, tasks) => {
-        const ids: string[] = []
-        for (const task of tasks) {
-          ids.push(task.id)
+      (changes) => {
+        for (const { group, tasks } of changes) {
+          const ids: string[] = []
+          for (const task of tasks) {
+            ids.push(task.id)
+          }
+          taskIdsByGroup.set(group, ids)
         }
-        taskIdsByGroup.set(group, ids)
       },
     )
     function found(name: string, vars: Record<string, string>, id: string): void {
@@ -754,16 +756,18 @@ describe("build.each with required: a matcher that is not required can have var 
   /** The ids of the current tasks, each with the label of its task group, from a TaskMaterializer. */
   function materialize<M extends Record<string, AnyMatcher>, R extends keyof M & string>(config: TaskMaterializerConfig<M, R>) {
     const taskIdsByGroup = new Map<TaskGroup, string[]>()
-    const taskMaterializer = new TaskMaterializer(1, config, (group, tasks) => {
-      if (tasks.length === 0) {
-        taskIdsByGroup.delete(group)
-        return
+    const taskMaterializer = new TaskMaterializer(1, config, (changes) => {
+      for (const { group, tasks } of changes) {
+        if (tasks.length === 0) {
+          taskIdsByGroup.delete(group)
+          continue
+        }
+        const ids: string[] = []
+        for (const task of tasks) {
+          ids.push(task.id)
+        }
+        taskIdsByGroup.set(group, ids)
       }
-      const ids: string[] = []
-      for (const task of tasks) {
-        ids.push(task.id)
-      }
-      taskIdsByGroup.set(group, ids)
     })
     function found(name: string, vars: Record<string, string>, id: string): void {
       taskMaterializer.hear(name, { kind: "found", matched: { vars, data: new Mem(id) } })
@@ -916,7 +920,11 @@ describe("build.each with required: a matcher that is not required can have var 
         required: ["page"],
         *tasks() {},
       },
-      (group) => void groups.push(group),
+      (changes) => {
+        for (const { group } of changes) {
+          groups.push(group)
+        }
+      },
     )
     taskMaterializer.hear("page", { kind: "found", matched: { vars: { slug: "a" }, data: new Mem("page:a") } })
     taskMaterializer.hear("review", { kind: "found", matched: { vars: { slug: "a", reviewer: "ann" }, data: new Mem("review:a/ann") } })
@@ -1089,6 +1097,64 @@ describe("build.each with required: a matcher that is not required can have var 
     gone("page", { slug: "a" })
     expect(currentTasks()).toEqual([])
     expect(taskMaterializer.joinKeyCount).toBe(0)
+  })
+})
+
+describe("build.each gives the changes of one matcher event to the build in one step", () => {
+  test("a page found before its review keeps its store record when the review replaces its set, so the next build skips", async () => {
+    const store = new MemoryStore()
+    const page = new Mem("page:a", "A")
+    const review = new Mem("review:a/ann", "5")
+    async function buildOnce() {
+      const build = new Build({ store })
+      // page comes first, so its scan sends the page before the review: the set with no review comes first.
+      build.each({
+        matchersByName: { page: new PathMatcher("page:", ["slug"], [page]), review: new PathMatcher("review:", ["slug", "reviewer"], [review]) },
+        required: ["page"],
+        *tasks(vars, matched) {
+          const inputs: Ref[] = [matched.page.data]
+          if (matched.review !== undefined) {
+            inputs.push(matched.review.data)
+          }
+          yield new Task({ id: `page:${vars.slug}`, inputs, run: async () => {} })
+        },
+      })
+      return build.run()
+    }
+
+    const first = await buildOnce()
+    expect(sortedIds(first.executed)).toEqual(["page:a"])
+
+    const second = await buildOnce()
+    expect(second.executed).toEqual([])
+    expect(sortedIds(second.skipped)).toEqual(["page:a"])
+  })
+
+  test("two sets that swap their task ids in one event do not clash", async () => {
+    const pages = new PathMatcher("page:", ["slug"], [new Mem("page:a", "A"), new Mem("page:b", "B")])
+    // order has no ON var, so its one match joins the set of each page.
+    const orders = new PathMatcher("order:", ["flip"])
+    const build = new Build()
+    const ran: string[] = []
+    build.each({
+      matchersByName: { page: pages, order: orders },
+      required: ["page"],
+      *tasks(vars) {
+        // With no order: a gives "first" and b gives "second". With flip=yes, they swap.
+        const slugOfFirst = vars.flip === "yes" ? "b" : "a"
+        const id = vars.slug === slugOfFirst ? "first" : "second"
+        yield new Task({ id, run: async () => void ran.push(`${id}:${vars.slug}`) })
+      },
+    })
+    await build.run()
+    expect(ran.sort()).toEqual(["first:a", "second:b"])
+
+    ran.length = 0
+    orders.foundArtifact(new Mem("order:yes", "Y"))
+    const later = await build.run()
+
+    expect(later.success).toBe(true)
+    expect(ran.sort()).toEqual(["first:b", "second:a"])
   })
 })
 
