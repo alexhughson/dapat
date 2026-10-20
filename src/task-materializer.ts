@@ -191,6 +191,18 @@ export class TaskMaterializer<M extends Record<string, AnyMatcher>, R extends ke
     }
   }
 
+  /** The join keys in the indexes of all matchers and of the joined sets. 0 when no match is left. */
+  get joinKeyCount(): number {
+    let count = 0
+    for (const table of this.tablesByName.values()) {
+      count += table.joinKeyCount
+    }
+    for (const setIndex of this.setIndexesByOptionalName.values()) {
+      count += setIndex.joinKeyCount
+    }
+    return count
+  }
+
   /** Gives the build the tasks of the set, from its current matches. */
   private giveTasks(set: JoinedSet): void {
     const matchedEntries: [string, MatchedArtifact][] = []

@@ -159,7 +159,7 @@ export type JoinedMembers = {
 /**
  * For each matcher, the join steps that start from one of its matches, in an order where
  * each step shares a var name with an earlier one. Adds the index that each step needs.
- * Throws if the matchers do not form one connected group by shared var names.
+ * `tables` are the required matchers. Throws if they do not form one connected group by shared var names.
  */
 export function planJoins(tables: readonly MatchTable[], eachNumber: number): Map<string, JoinStep[]> {
   const stepsByName = new Map<string, JoinStep[]>()
@@ -192,8 +192,9 @@ export function planJoins(tables: readonly MatchTable[], eachNumber: number): Ma
     }
     if (unplacedNames.length > 0) {
       throw new Error(
-        `build.each ${eachNumber}: the matchers [${unplacedNames.join(", ")}] share no var name with matcher '${start.name}' ` +
-          `or its partners; each matcher must share a var name with another matcher`,
+        `build.each ${eachNumber}: the required matchers [${unplacedNames.join(", ")}] share no var name with required matcher ` +
+          `'${start.name}' or its required partners; each required matcher must share a var name with another required matcher, ` +
+          `and a matcher that is not required does not connect them`,
       )
     }
     stepsByName.set(start.name, steps)

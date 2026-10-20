@@ -670,7 +670,7 @@ describe("build.each errors", () => {
         matchersByName: { a: new MemMatcher("a:"), b: new EventMatcher<Mem>(["slug"], []) },
         *tasks() {},
       }),
-    ).toThrow("build.each 1: the matchers ['b'] share no var name with matcher 'a' or its partners")
+    ).toThrow("build.each 1: the required matchers ['b'] share no var name with required matcher 'a' or its required partners")
   })
 
   test("build.each after run() throws", async () => {
