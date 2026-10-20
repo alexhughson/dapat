@@ -38,7 +38,7 @@ export type TaskMaterializerConfig<M extends Record<string, AnyMatcher>, R exten
   tasks: (vars: JoinedVars<M, R>, matched: MatchedByName<M, R>) => Iterable<Task>
 }
 
-/** Gives the new tasks of one group to the build. The build applies all of them of one matcher event as one step. */
+/** Gives the new tasks of one group to the build. The build applies them in steps: see Build.setTasksOfGroups. */
 type SetGroupTasks = (group: TaskGroup, tasks: readonly Task[]) => void
 
 /** A matcher that is not required, and how it finds the base sets that its matches can join. */
@@ -249,7 +249,8 @@ export class TaskMaterializer<M extends Record<string, AnyMatcher>, R extends ke
    * Makes the joined sets of the base set the result of its chain of LEFT JOINs. A set with the same vars
    * and the same matches does not change. A set with the same vars and other matches gets new tasks in its
    * group. A set with new vars gets a new group. A set whose vars are gone is removed. The build applies
-   * all the changes of one matcher event as one step, so a task id can move from a removed set to a new set.
+   * the changes of the scans, of one pass of a drain, or of an event sent from outside a drain as one step
+   * (see Build.setTasksOfGroups), so a task id can move from a removed set to a new set.
    */
   private refreshJoinedSets(base: BaseSet): void {
     const branches = this.leftJoinChain(base)

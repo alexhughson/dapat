@@ -848,9 +848,19 @@ One matcher alone is always valid. Each of its matches is a joined set with one 
 
 `build.each` keeps **indexes** for each matcher. An index maps the values of some var names to the matches that have them. A matcher has one index for each set of var names that the join looks it up by. In the example, `page` has an index by `lang`. When one match changes, `build.each` looks up its partners in these indexes. It does not scan all the matches again. So the join costs one index lookup for each other matcher, and the work for each partner that it finds.
 
-The build itself has a cost that grows with all its tasks. After each change of tasks, it checks every task to see which one can start. `build.each` gives all the changes of one matcher event as one change, so one changed template among many pages is one check. Each `build.add` is one change, so many `build.add` calls during a run cost more. `bun bench/join.ts` measures both.
+The build itself has a cost that grows with all its tasks. After each change of tasks, it checks every task to see which one can start. `build.each` gives all the changes of one step (the scans, or one pass of a drain) as one change ([Steps of task changes](#steps-of-task-changes)), so one changed template among many pages is one check. Each `build.add` is one change, so many `build.add` calls during a run cost more. `bun bench/join.ts` measures both.
 
 A matcher event that comes while `build.each` handles another one waits. It comes from `tasks`, or from a subscriber of the events of the change. `build.each` handles the waiting events in order, after the current one. Each `build.each` call thus sees each event alone. The tasks still exist before the outermost `send` of the matcher returns.
+
+### Steps of task changes
+
+`build.each` does not change the tasks of the build at once. It gives its changes to an open step ([`setTasksOfGroups`](#class-build)), and the build applies the step later, as one change:
+
+- During the scans of the first `build.run()`, all the changes until the last scan returns are one step.
+- After that, all the changes of one pass over the event queue are one step. The events that the step makes, for example the `promised` events of its new tasks, then make the next pass and the next step. So when the outputs of one `build.each` feed another `build.each`, the second one gets all of them before its changes are applied.
+- A matcher event that your code sends outside a drain, for example from a file watcher, is one step.
+
+So a task id can move from one set to another set in one step. For example, take the review example in [`required`](#required-matchers-that-a-set-can-do-without), but with a task id that does not hold `vars.reviewer`, such as `page:${vars.lang}/${vars.slug}`. Then the task `page:en/hello` of the set with no review moves to the set `reviewer=ann` when the review is found. The build treats this as a replacement: the task keeps its store record, and the next build can skip it. Two sets can also swap their task ids in one step. The rule that two sets cannot give one task id applies after the step. Thus the order in which the scans find the pages and the reviews does not change the result of the first run: a set that exists only for a while during the scans never gets its tasks. Matches that come in separate steps after the scans can still pass through such a set ([Limits](#13-limits)).
 
 ### `required`: matchers that a set can do without
 
@@ -911,13 +921,7 @@ A matcher that is not required and has only var names that the required matchers
 
 On the first run, `tasks` can run more than one time for one set, for example when the scan finds the page before its review. Each set ends with one task list, and no task starts before the scans finish.
 
-`build.each` does not change the tasks of the build at once. It gives its changes to an open step ([`setTasksOfGroups`](#class-build)), and the build applies the step later, as one change:
-
-- During the scans of the first `build.run()`, all the changes until the last scan returns are one step.
-- After that, all the changes of one pass over the event queue are one step. The events that the step makes, for example the `promised` events of its new tasks, then make the next pass and the next step. So when the outputs of one `build.each` feed another `build.each`, the second one gets all of them before its changes are applied.
-- A matcher event that your code sends outside a drain, for example from a file watcher, is one step.
-
-So a task id can move from one set to another set in one step. For example, the task `page:en/hello` of the set with no review moves to the set `reviewer=ann` when the review is found during the run. The build treats this as a replacement: the task keeps its store record, and the next build can skip it. Two sets can also swap their task ids in one step. The rule that two sets cannot give one task id applies after the step. Thus the order in which the scans find the pages and the reviews does not change the result of the first run: a set that exists only for a while during the scans never gets its tasks. Matches that come in separate steps after the scans can still pass through such a set ([Limits](#13-limits)).
+`build.each` gives its task changes to the build in steps ([Steps of task changes](#steps-of-task-changes)). If a task id does not hold `vars.reviewer`, for example `page:${vars.lang}/${vars.slug}`, the task can move from the set with no review to the set `reviewer=ann` in one step, and keep its store record.
 
 #### Several matchers that are not required: the order of the names
 
