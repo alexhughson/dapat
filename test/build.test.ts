@@ -1894,7 +1894,7 @@ describe("promised and withdrawn events", () => {
       )
     })
 
-    test("the send-limit error cuts each long id", async () => {
+    test("the send-limit error cuts a long event line", async () => {
       const longId = `mem:${"x".repeat(20_000)}`
       const make = () => new Task({ id: "t", outputs: [new Mem(longId)], run: async () => {} })
       const build = new Build({ sendLimit: 5 })
@@ -1910,8 +1910,8 @@ describe("promised and withdrawn events", () => {
       )
 
       expect(error).not.toBeNull()
-      expect(error!.message).toContain(`'withdrawn ${longId.slice(0, 200)}… by t'`)
-      expect(error!.message.length).toBeLessThan(400)
+      expect(error!.message).toContain(`the last sent was 'withdrawn ${longId.slice(0, 300)}`)
+      expect(error!.message.length).toBeLessThan(600)
     })
 
     test("the sendLimit option sets the limit", async () => {

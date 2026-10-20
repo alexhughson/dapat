@@ -15,12 +15,7 @@ export type RuleConfig<I extends Record<string, AnyMatcher>> = {
   tasks: (vars: Vars, input: RuleInput<I>) => Iterable<Task>
 }
 
-/** What a rule may call on the build. */
-export type RuleHost = {
-  setTasks(owner: string, tasks: readonly Task[]): void
-  /** Makes the error fatal for the build, as a subscriber error is. */
-  fail(error: Error): void
-}
+type SetTasks = (owner: string, tasks: readonly Task[]) => void
 
 /**
  * Listens to the matcher of its one input, and gives the build the tasks of each row.
@@ -28,15 +23,15 @@ export type RuleHost = {
  * of a row that changes and removes the tasks of a row that is dropped.
  */
 export class Rule<I extends Record<string, AnyMatcher>> {
+  readonly matcher: AnyMatcher
   private readonly inputName: string
-  private readonly matcher: AnyMatcher
-  // The current row of each owner. A put with the same data as the current row does nothing.
-  private readonly rows = new Map<string, MatchRow>()
+  // The data key of the current row of each owner. A put with the same key does nothing.
+  private readonly keys = new Map<string, string>()
 
   constructor(
     readonly number: number,
     private readonly config: RuleConfig<I>,
-    private readonly host: RuleHost,
+    private readonly setTasks: SetTasks,
   ) {
     const names = Object.keys(config.inputs)
     if (names.length !== 1) {
@@ -46,59 +41,26 @@ export class Rule<I extends Record<string, AnyMatcher>> {
     this.matcher = config.inputs[this.inputName]!
   }
 
-  get matchers(): readonly AnyMatcher[] {
-    return [this.matcher]
-  }
-
-  /** Subscribes to the matcher. From then on, each row change gives the build new tasks. */
-  listen(): void {
-    this.matcher.subscribe((event) => this.hear(event))
-  }
-
-  /**
-   * A rule error is fatal for the build, like a subscriber error. The build records it
-   * here, so a matcher that catches errors cannot hide it. The matcher's send does not
-   * throw, as a build call that causes a failing send does not throw.
-   */
-  private hear(event: RowEvent): void {
-    try {
-      this.apply(event)
-    } catch (error) {
-      this.host.fail(toError(error))
-    }
-  }
-
-  private apply(event: RowEvent): void {
+  hear(event: RowEvent): void {
     if (event.kind === "drop") {
       const owner = this.ownerOf(event.vars)
-      this.rows.delete(owner)
-      this.host.setTasks(owner, [])
+      this.keys.delete(owner)
+      this.setTasks(owner, [])
       return
     }
     const row = event.row
     const owner = this.ownerOf(row.vars)
-    const current = this.rows.get(owner)
-    if (current !== undefined && sameData(current.data, row.data)) return
+    const key = dataKey(row.data)
+    if (this.keys.get(owner) === key) return
     // The rule has one input, so the input object holds only that row.
     const input = { [this.inputName]: row } as RuleInput<I>
     const tasks: Task[] = []
     for (const task of this.config.tasks(row.vars, input)) {
       tasks.push(task)
     }
-    // The row is current before setTasks, because setTasks sends events, and a matcher
-    // can put the same row again while it hears them. If setTasks throws, it changed
-    // nothing, so the old row is current again.
-    this.rows.set(owner, row)
-    try {
-      this.host.setTasks(owner, tasks)
-    } catch (error) {
-      if (current === undefined) {
-        this.rows.delete(owner)
-      } else {
-        this.rows.set(owner, current)
-      }
-      throw error
-    }
+    // Set before setTasks: its events can make the matcher put this row again.
+    this.keys.set(owner, key)
+    this.setTasks(owner, tasks)
   }
 
   /** `<rule number>:<values>`: the var values in varNames order, each URI-encoded, joined with "/". */
@@ -124,22 +86,14 @@ export class Rule<I extends Record<string, AnyMatcher>> {
   }
 }
 
-/** True when both hold the same artifact ids, in the same order. A list never equals one artifact. */
-function sameData(a: RowData, b: RowData): boolean {
-  if (!isList(a) && !isList(b)) return a.id === b.id
-  if (!isList(a) || !isList(b)) return false
-  if (a.length !== b.length) return false
-  for (let i = 0; i < a.length; i++) {
-    if (a[i]!.id !== b[i]!.id) return false
+/** The artifact ids of the data. Two rows with the same key hold the same data. */
+function dataKey(data: RowData): string {
+  if (Array.isArray(data)) {
+    const ids: string[] = []
+    for (const artifact of data as readonly Artifact[]) {
+      ids.push(artifact.id)
+    }
+    return JSON.stringify(ids)
   }
-  return true
-}
-
-function isList(data: RowData): data is readonly Artifact[] {
-  return Array.isArray(data)
-}
-
-function toError(value: unknown): Error {
-  if (value instanceof Error) return value
-  return new Error(String(value))
+  return JSON.stringify((data as Artifact).id)
 }

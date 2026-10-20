@@ -109,29 +109,27 @@ export class Build extends Emitter<ArtifactEvent> {
       throw new Error("build.each must come before the first build.run()")
     }
     const number = this.ruleCount + 1
-    const rule = new Rule(number, config, {
-      setTasks: (owner, tasks) => this.setTasks(owner, tasks),
-      fail: (error) => this.fail(error),
-    })
-    for (const matcher of rule.matchers) {
-      const owner = matcherBuilds.get(matcher)
-      if (owner !== undefined && owner !== this) {
-        throw new Error(`rule ${number}: its matcher belongs to another Build; make a new matcher for each Build`)
-      }
+    const rule = new Rule(number, config, (owner, tasks) => this.setTasks(owner, tasks))
+    const matcher = rule.matcher
+    const owner = matcherBuilds.get(matcher)
+    if (owner !== undefined && owner !== this) {
+      throw new Error(`rule ${number}: its matcher belongs to another Build; make a new matcher for each Build`)
     }
-    rule.listen()
     this.ruleCount = number
-    for (const matcher of rule.matchers) {
-      this.addMatcher(matcher)
+    matcher.subscribe((event) => {
+      // A rule error is fatal, like a subscriber error. The matcher's send never sees it.
+      try {
+        rule.hear(event)
+      } catch (error) {
+        this.fail(toError(error))
+      }
+    })
+    // Each matcher hears each artifact event one time, even if several rules use it.
+    if (!this.matchers.has(matcher)) {
+      matcherBuilds.set(matcher, this)
+      this.matchers.add(matcher)
+      this.subscribe((event) => matcher.sendArtifact(event))
     }
-  }
-
-  /** Sends each artifact event to the matcher, one time even if several rules use it. */
-  private addMatcher(matcher: AnyMatcher): void {
-    if (this.matchers.has(matcher)) return
-    matcherBuilds.set(matcher, this)
-    this.matchers.add(matcher)
-    this.subscribe((event) => matcher.sendArtifact(event))
   }
 
   /**
@@ -344,7 +342,7 @@ export class Build extends Emitter<ArtifactEvent> {
       if (caused >= this.sendLimit && this.queue.length > 0) {
         const message =
           `send limit: subscribers caused ${caused} events in one drain, and more wait; ` +
-          `the last sent was '${eventLine(event)}'`
+          `the last sent was '${eventLine(event).slice(0, 400)}'`
         this.fail(new Error(message))
         return
       }
@@ -864,21 +862,12 @@ function addOutputEvents(
   }
 }
 
-/** "<kind> <id> by <task id>", for error messages. Each id is cut to a readable length. */
+/** "<kind> <id> by <task id>", for error messages. */
 function eventLine(event: ArtifactEvent): string {
-  const taskId = shortId(event.taskId)
   if (event.kind === "produced" || event.kind === "deleted") {
-    return `${event.kind} ${shortId(event.artifact.id)} by ${taskId}`
+    return `${event.kind} ${event.artifact.id} by ${event.taskId}`
   }
-  return `${event.kind} ${shortId(event.output.id)} by ${taskId}`
-}
-
-const MAX_SHOWN_ID = 200
-
-/** The id, or its first 200 characters and "…" when it is longer. */
-function shortId(id: string): string {
-  if (id.length <= MAX_SHOWN_ID) return id
-  return `${id.slice(0, MAX_SHOWN_ID)}…`
+  return `${event.kind} ${event.output.id} by ${event.taskId}`
 }
 
 function toError(value: unknown): Error {

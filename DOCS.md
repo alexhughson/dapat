@@ -784,6 +784,10 @@ A matcher sends rows with `this.send(event)`. It knows nothing about the rules t
 
 A matcher may send a row again. The rule ignores a `put` whose data has the same artifact ids, in the same order, as the current row. So the `Posts` matcher can put a row for the `promised` event and again for the `produced` event of one file. The task is made one time, and a task that rewrites its own input in place does not run again.
 
+A change to the content of an artifact is the job of its stamp, not of the row: the next build runs the task again because the stamp changed. To force the tasks of a row to be made again, a matcher sends a `drop` and then a `put`.
+
+A task that has finished does not run again in the same run when a task it waits for is replaced and writes its output again. The next build runs it again, because the stamp of its input changed. Plain tasks work the same way.
+
 ### Rows
 
 A row is one thing that a matcher found:
@@ -1118,7 +1122,7 @@ new Build(opts?: { store?: Store; sendLimit?: number })
 | `subscribe(listener: (event: ArtifactEvent) => void): void` | From `Emitter`. Calls `listener` synchronously for each artifact event, in the order of the event queue. Does not replay earlier events. See [section 9](#9-subscribe-to-artifact-events). |
 | `protected setTasks(owner: string, tasks: readonly Task[]): void` | Makes `tasks` the tasks of `owner` ([section 5](#5-tasks-and-dependencies)). Adds each new id, replaces each known id, and removes each id that `owner` gave before and does not give now. Changes all state first, then puts the events on the queue: all `withdrawn` events of the call first, then the `promised` events, by id in list order. A dropped task ends as `cancelled` with the reason `"removed"` if it had not finished. Throws and changes nothing if another owner has one of the ids, if `tasks` has one id two times, or if two tasks declare one exact output. `add(task)` calls `setTasks("add:" + task.id, [task])`. Rules call it; your code does not. |
 | `each<I extends Record<string, AnyMatcher>>(config: RuleConfig<I>): void` | Adds a rule ([section 10](#10-rules-one-task-for-each-thing-a-matcher-finds)). The rule subscribes to the matcher of its one input and gives the tasks of each row through `setTasks`, with the owner `<rule number>:<var values>`. The build sends each artifact event to `matcher.sendArtifact`, one time for each matcher. A rule error is fatal for the build, like a subscriber error. Throws if the rule does not have exactly one input, if `run()` has started, or if another `Build` uses the matcher. |
-| `run(): Promise<Result>` | The first time, sends a `promised` event for each output of each task that is in the build, and then runs the scan of each matcher and waits for all of them. A scan error makes `run()` reject, and no task starts. Then starts every task and resolves when every started task has finished. Does not reject when a task fails. Rejects with the first subscriber error or send-limit error of the build, at once if that error happened before the call ([section 9](#subscriber-errors)). |
+| `run(): Promise<Result>` | The first time, sends a `promised` event for each output of each task that is in the build, and then runs the scan of each matcher and waits for all of them. A call during the scans waits for the same scans. Then starts every task and resolves when every started task has finished. Does not reject when a task fails. Rejects with the first subscriber error, rule error, scan error, or send-limit error of the build, at once if that error happened before the call ([section 9](#subscriber-errors)). After a scan error, no task starts. |
 
 ### `class Task`
 
@@ -1288,10 +1292,10 @@ abstract class Matcher<D extends RowData = RowData> extends Emitter<RowEvent<D>>
 | Member | Description |
 | --- | --- |
 | `varNames` | The var names of each row that the matcher sends. Each row must have exactly these vars. |
-| `scan(signal)` | Looks at the world now and sends a `put` for each thing that it finds. The first `build.run()` calls it, and waits for it before any task starts. `signal` aborts when another scan fails. |
+| `scan(signal)` | Looks at the world now and sends a `put` for each thing that it finds. The first `build.run()` calls it, and waits for it before any task starts. `signal` aborts when another scan fails or when the build fails. |
 | `sendArtifact(event)` | Gets each artifact event of the build. It can send rows. It must be fast and do no I/O. The default does nothing. |
 
-A matcher belongs to one `Build`. `DataOf<M>` is the data type of a matcher type `M`, for example `FileArtifact` for a `Matcher<FileArtifact>`.
+A matcher belongs to one `Build`.
 
 See [section 10](#10-rules-one-task-for-each-thing-a-matcher-finds).
 
@@ -1324,7 +1328,7 @@ type RuleInput<I extends Record<string, AnyMatcher>> = {
 }
 ```
 
-`AnyMatcher` is `Matcher<any>`: a matcher of any data type. Each input row has the data type of its own matcher. `inputs` must have exactly one entry. `tasks` gets the vars of one row and the row under its input name. See [Rules: `build.each`](#rules-buildeach).
+`AnyMatcher` is `Matcher<any>`: a matcher of any data type. Each input row has the data type of its own matcher: `DataOf` reads `D` from the matcher type. `inputs` must have exactly one entry. `tasks` gets the vars of one row and the row under its input name. See [Rules: `build.each`](#rules-buildeach).
 
 ## Filesystem (`dapat/contrib`)
 
