@@ -1,9 +1,11 @@
 import type { Artifact } from "./artifact"
 import { Emitter } from "./emitter"
+import type { Matcher } from "./matcher"
 import type { Prefix } from "./prefix"
 import { Task, isArtifact, isPrefix, type Context, type Ref } from "./task"
 import type { Store, TaskState } from "./store"
 import { Outcome, Result } from "./result"
+import { Rule, type RuleConfig } from "./rule"
 
 export type ArtifactEvent =
   | { kind: "promised"; output: Ref; taskId: string }
@@ -54,7 +56,13 @@ export class Build extends Emitter<ArtifactEvent> {
   // The first subscriber error or send-limit error. Each later run() rejects with it.
   private fatal: Error | null = null
 
+  // The matchers of every rule, each one time, in the order that the rules named them.
+  private readonly matchers = new Set<Matcher>()
+  private ruleCount = 0
+
   private started = false
+  // True while the first run() waits for the scans. No task starts then.
+  private scanning = false
   private runningCount = 0
   private workCount = 0
   private waiters: Array<() => void> = []
@@ -83,6 +91,30 @@ export class Build extends Emitter<ArtifactEvent> {
     const slot = this.slots.get(id)
     if (!slot) return
     this.change(slot.owner, [], [slot])
+  }
+
+  /**
+   * Adds a rule. The rule makes tasks from the rows of its matcher.
+   * Call it before the first run(): that run scans each matcher before any task starts.
+   */
+  each<I extends Record<string, Matcher>>(config: RuleConfig<I>): void {
+    if (this.started) {
+      throw new Error("build.each must come before the first build.run()")
+    }
+    const number = this.ruleCount + 1
+    const rule = new Rule(number, config, (owner, tasks) => this.setTasks(owner, tasks))
+    rule.listen()
+    this.ruleCount = number
+    for (const name in config.inputs) {
+      this.addMatcher(config.inputs[name]!)
+    }
+  }
+
+  /** Sends each artifact event to the matcher, one time even if several rules use it. */
+  private addMatcher(matcher: Matcher): void {
+    if (this.matchers.has(matcher)) return
+    this.matchers.add(matcher)
+    this.subscribe((event) => matcher.sendArtifact(event))
   }
 
   /**
@@ -208,6 +240,10 @@ export class Build extends Emitter<ArtifactEvent> {
       }
       this.push(events)
       this.drain()
+      // A build with no rules starts its tasks in this same call, as before rules existed.
+      if (this.matchers.size > 0 && this.fatal === null) {
+        await this.scanAll()
+      }
     }
     if (this.fatal !== null) throw this.fatal
     for (const slot of this.slots.values()) {
@@ -216,6 +252,30 @@ export class Build extends Emitter<ArtifactEvent> {
     await this.idle()
     if (this.fatal !== null) throw this.fatal
     return new Result(this.outcomes, this.errors)
+  }
+
+  /**
+   * Runs the scan of each matcher at the same time and waits for all of them.
+   * The first scan error is fatal, and it aborts the other scans.
+   */
+  private async scanAll(): Promise<void> {
+    const controller = new AbortController()
+    const scans: Promise<void>[] = []
+    this.scanning = true
+    for (const matcher of this.matchers) {
+      scans.push(this.scan(matcher, controller))
+    }
+    await Promise.all(scans)
+    this.scanning = false
+  }
+
+  private async scan(matcher: Matcher, controller: AbortController): Promise<void> {
+    try {
+      await matcher.scan(controller.signal)
+    } catch (error) {
+      this.fail(toError(error))
+      controller.abort()
+    }
   }
 
   /** Puts `events` at the end of the queue. Before the first run(), the build sends no events. */
@@ -420,6 +480,7 @@ export class Build extends Emitter<ArtifactEvent> {
 
   private kick(slot: Slot): void {
     if (this.fatal !== null) return
+    if (this.scanning) return
     if (slot.launched === slot.generation) return
     if (slot.phase !== "pending") return
     slot.launched = slot.generation
