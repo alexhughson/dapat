@@ -1940,7 +1940,7 @@ describe("promised and withdrawn events", () => {
 
       class GroupBuild extends Build {
         give(tasks: Task[]): void {
-          this.setTasks(new TaskGroup("test"), tasks)
+          this.setTasksOfGroups([{ group: new TaskGroup("test"), tasks }])
         }
       }
       const groupBuild = new GroupBuild({ sendLimit: 3 })

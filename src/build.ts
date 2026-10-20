@@ -79,6 +79,9 @@ export class Build extends Emitter<ArtifactEvent> {
   // The matcher events that wait for a TaskMaterializer.hear, oldest first. See hearMatchEvents.
   private matchEvents: MatchEventToHear[] = []
   private hearing = false
+  // The open step of task changes: the new tasks of each group, which the build applies at the end
+  // of the step. null when no step is open. See setTasksOfGroups.
+  private pendingTasksByGroup: Map<TaskGroup, readonly Task[]> | null = null
 
   private started = false
   // True while the first run() waits for the scans. No task starts then.
@@ -115,7 +118,8 @@ export class Build extends Emitter<ArtifactEvent> {
       group = new TaskGroup(`build.add ${task.id}`)
       this.addedTaskGroups.add(group)
     }
-    this.setTasks(group, [task])
+    // add never joins the open step: it throws at once, before it changes anything.
+    this.applyTasksOfGroups([{ group, tasks: [task] }])
   }
 
   /** Removes the task from its group. The other tasks of the group stay. */
@@ -136,7 +140,7 @@ export class Build extends Emitter<ArtifactEvent> {
       throw new Error("build.each must come before the first build.run()")
     }
     const number = this.eachCount + 1
-    const taskMaterializer = new TaskMaterializer(number, config, (changes) => this.setTasksOfGroups(changes))
+    const taskMaterializer = new TaskMaterializer(number, config, (group, tasks) => this.setTasksOfGroups([{ group, tasks }]))
     const matcherNames = Object.keys(config.matchersByName)
     for (const name of matcherNames) {
       const matcherBuild = matcherBuilds.get(config.matchersByName[name]!)
@@ -177,8 +181,9 @@ export class Build extends Emitter<ArtifactEvent> {
   /**
    * Gives each waiting matcher event to its TaskMaterializer, oldest first, until none waits.
    * A hear never runs inside another hear: a matcher event that comes during a hear, from
-   * `tasks` or from a subscriber of the events of setTasks, waits here, and this loop hears it
+   * `tasks` or from a subscriber of the events of a task change, waits here, and this loop hears it
    * next. So the outermost matcher send still returns only after every task it caused exists.
+   * Each event is one step of task changes, or a part of the step of the scans when that step is open.
    * An error here is fatal, like a subscriber error. The matcher's send never sees it.
    */
   private hearMatchEvents(): void {
@@ -187,10 +192,14 @@ export class Build extends Emitter<ArtifactEvent> {
     try {
       while (this.matchEvents.length > 0 && this.fatal === null) {
         const next = this.matchEvents.shift()!
+        const ownStep = this.pendingTasksByGroup === null
+        if (ownStep) this.pendingTasksByGroup = new Map()
         next.taskMaterializer.hear(next.matcherName, next.event)
+        if (ownStep) this.applyOpenStep()
       }
     } catch (error) {
       this.matchEvents = []
+      this.pendingTasksByGroup = null
       this.fail(toError(error))
     } finally {
       this.hearing = false
@@ -201,21 +210,38 @@ export class Build extends Emitter<ArtifactEvent> {
   }
 
   /**
-   * Makes `tasks` the tasks of `group`. Adds each new id, replaces each known id,
-   * and removes each id that the group had before and does not get now.
-   * build.add and build.each call it. Throws, with no change, if another group has one of the ids.
-   */
-  protected setTasks(group: TaskGroup, tasks: readonly Task[]): void {
-    this.setTasksOfGroups([{ group, tasks }])
-  }
-
-  /**
-   * setTasks for several groups in one step. The rules apply to the state after the whole step.
-   * A task id can move from one group of the step to another one: that is a replacement, as a
-   * known id in one group is, so its store record stays. An id that a group had before and that
-   * no group of the step gets now is removed. build.each gives all the changes of one matcher event here.
+   * Makes the tasks of each group in `changes` its new tasks: adds each new id, replaces each known id,
+   * and removes each id that the group had before and that no group of the step gets now.
+   * While a step is open, the changes join it, and the build applies them all at the end of the step.
+   * A later change of a group in the same step replaces its earlier one. A step is open while the
+   * first run() scans, and during each matcher event. Else the changes are a step of their own.
+   * The rules apply to the state after the whole step. A task id can move from one group of the
+   * step to another one: that is a replacement, as a known id in one group is, so its store record stays.
+   * Throws, with no change, if a step of its own breaks a rule. An open step that breaks a rule is a fatal error.
    */
   protected setTasksOfGroups(changes: readonly GroupTasks[]): void {
+    if (this.pendingTasksByGroup !== null) {
+      for (const { group, tasks } of changes) {
+        this.pendingTasksByGroup.set(group, tasks)
+      }
+      return
+    }
+    this.applyTasksOfGroups(changes)
+  }
+
+  /** Closes the open step and applies its changes. A change that a subscriber makes then is a step of its own. */
+  private applyOpenStep(): void {
+    const pending = this.pendingTasksByGroup!
+    this.pendingTasksByGroup = null
+    const changes: GroupTasks[] = []
+    for (const [group, tasks] of pending) {
+      changes.push({ group, tasks })
+    }
+    if (changes.length > 0) this.applyTasksOfGroups(changes)
+  }
+
+  /** Applies one step of task changes now. Throws, with no change, if the step breaks a rule. */
+  private applyTasksOfGroups(changes: readonly GroupTasks[]): void {
     this.assertSettable(changes)
     const given = new Set<string>()
     for (const change of changes) {
@@ -343,6 +369,9 @@ export class Build extends Emitter<ArtifactEvent> {
       for (const slot of this.slots.values()) {
         addOutputEvents(events, "promised", slot.task.id, outputsByKey(slot.task), NO_OUTPUTS)
       }
+      // No task starts before the scans return, so all the task changes until then are one step.
+      // So a set that exists only for a while during the scans never shows.
+      if (this.hearersByMatcher.size > 0) this.pendingTasksByGroup = new Map()
       this.push(events)
       this.drain()
       // A build with no matchers starts its tasks in this same call, as before build.each existed.
@@ -380,6 +409,15 @@ export class Build extends Emitter<ArtifactEvent> {
     }
     await Promise.race([Promise.all(scans), aborted])
     this.scanning = false
+    if (this.fatal !== null) {
+      this.pendingTasksByGroup = null
+      return
+    }
+    try {
+      this.applyOpenStep()
+    } catch (error) {
+      this.fail(toError(error))
+    }
   }
 
   private async scan(matcher: AnyMatcher, signal: AbortSignal): Promise<void> {
@@ -460,7 +498,7 @@ export class Build extends Emitter<ArtifactEvent> {
     const groupsOfStep = new Set<TaskGroup>()
     for (const { group } of changes) {
       if (groupsOfStep.has(group)) {
-        throw new Error(`group '${group.label}' is in one setTasks step twice`)
+        throw new Error(`group '${group.label}' is in one setTasksOfGroups step twice`)
       }
       groupsOfStep.add(group)
     }
@@ -690,7 +728,7 @@ export class Build extends Emitter<ArtifactEvent> {
   }
 
   /**
-   * Ends a task that `setTasks`, `add`, or `remove` stopped while it ran. They already sent
+   * Ends a task that `setTasksOfGroups`, `add`, or `remove` stopped while it ran. They already sent
    * its withdrawn events. Returns false when the task is still current.
    */
   private endIfStopped(slot: Slot, generation: number): boolean {

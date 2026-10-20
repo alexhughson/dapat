@@ -1,12 +1,16 @@
 import { describe, expect, test } from "bun:test"
 import { Build, IdPrefix, Matcher, MemoryStore, Task, TaskGroup } from "../src/index"
-import type { ArtifactEvent } from "../src/index"
+import type { ArtifactEvent, GroupTasks } from "../src/index"
 import { Mem } from "./mem"
 
 /** A real build that stands for build.each: it gives tasks to a group that it picks. */
 class GroupBuild extends Build {
   give(group: TaskGroup, tasks: Task[]): void {
-    this.setTasks(group, tasks)
+    this.setTasksOfGroups([{ group, tasks }])
+  }
+
+  giveAll(changes: GroupTasks[]): void {
+    this.setTasksOfGroups(changes)
   }
 }
 
@@ -70,8 +74,83 @@ function ids(tasks: readonly Task[]): string[] {
   return tasks.map((task) => task.id)
 }
 
+describe("setTasksOfGroups: several groups in one step", () => {
+  test("an output that moves from a task of one group to a task of another group is withdrawn before it is promised", async () => {
+    const shared = new Mem("mem:shared")
+    const log: string[] = []
+    const build = new GroupBuild()
+    const x = new TaskGroup("x")
+    const y = new TaskGroup("y")
+    build.subscribe((event) => {
+      if (event.kind === "produced") return
+      log.push(line(event))
+    })
+    build.give(x, [writer("tx", [shared])])
+    build.give(y, [writer("ty", [])])
+    await build.run()
+    log.length = 0
+
+    // As two separate steps, the second one would throw: tx still claims mem:shared.
+    build.giveAll([
+      { group: y, tasks: [writer("ty", [shared])] },
+      { group: x, tasks: [] },
+    ])
+
+    expect(log).toEqual(["withdrawn mem:shared by tx", "promised mem:shared by ty"])
+    const later = await build.run()
+    expect(later.success).toBe(true)
+    expect(shared.value).toBe("ty")
+  })
+
+  test("a task id that moves to another group while its task runs is a replacement: cancelled, and its record stays", async () => {
+    const deletedIds: string[] = []
+    // A real MemoryStore that also logs each delete.
+    class LoggedStore extends MemoryStore {
+      override async delete(id: string): Promise<void> {
+        deletedIds.push(id)
+        await super.delete(id)
+      }
+    }
+    const store = new LoggedStore()
+    const build = new GroupBuild({ store })
+    const x = new TaskGroup("x")
+    const y = new TaskGroup("y")
+    let started!: () => void
+    const firstRunStarted = new Promise<void>((resolve) => {
+      started = resolve
+    })
+    const runs: string[] = []
+    build.give(x, [
+      new Task({
+        id: "t",
+        outputs: [new Mem("mem:t")],
+        run: async (ctx) => {
+          started()
+          await new Promise<void>((resolve) => ctx.signal.addEventListener("abort", () => resolve(), { once: true }))
+          runs.push(`x aborted: ${ctx.signal.aborted}`)
+        },
+      }),
+    ])
+    const running = build.run()
+    await firstRunStarted
+
+    build.giveAll([
+      { group: x, tasks: [] },
+      { group: y, tasks: [new Task({ id: "t", outputs: [new Mem("mem:t")], run: async () => void runs.push("y ran") })] },
+    ])
+    const result = await running
+
+    expect(runs).toEqual(["x aborted: true", "y ran"])
+    expect(result.cancelled.map((task) => task.id)).toEqual(["t"])
+    expect(result.executed.map((task) => task.id)).toEqual(["t"])
+    // Removed, the id would lose its record. Moved, it is replaced, so nothing is deleted.
+    expect(deletedIds).toEqual([])
+    expect(await store.get("t")).not.toBeNull()
+  })
+})
+
 describe("task groups", () => {
-  test("setTasks adds, replaces, and removes by difference", async () => {
+  test("setTasksOfGroups adds, replaces, and removes by difference", async () => {
     const a = new Mem("mem:a")
     const b = new Mem("mem:b")
     const c = new Mem("mem:c")
@@ -197,7 +276,7 @@ describe("task groups", () => {
     )
   })
 
-  test("setTasks with no tasks removes every task of the group and stops the running one", async () => {
+  test("setTasksOfGroups with no tasks removes every task of the group and stops the running one", async () => {
     let release!: () => void
     const gate = new Promise<void>((resolve) => {
       release = resolve
@@ -348,7 +427,7 @@ describe("task groups", () => {
     expect(ids(result.cancelled)).toEqual(["a"])
   })
 
-  test("setTasks from a subscriber during ctx.produced adds tasks that run", async () => {
+  test("setTasksOfGroups from a subscriber during ctx.produced adds tasks that run", async () => {
     const page = new Mem("mem:p/1")
     const shotA = new Mem("mem:shot/a")
     const shotB = new Mem("mem:shot/b")

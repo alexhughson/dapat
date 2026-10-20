@@ -3,7 +3,7 @@ import type { AnyMatcher, DataOf } from "./matcher"
 import type { MatchedArtifact, MatchedArtifactEvent, MatchedData, Vars } from "./matched-artifact"
 import { JoinIndex, MatchTable, joinFrom, planJoins, type BaseSet, type JoinStep, type JoinedSet, type StoredMatch } from "./match-join"
 import type { Task } from "./task"
-import { TaskGroup, type GroupTasks } from "./task-group"
+import { TaskGroup } from "./task-group"
 
 /**
  * What `tasks` gets: the matched artifact of each matcher, by name, with the data type of that matcher.
@@ -38,7 +38,8 @@ export type TaskMaterializerConfig<M extends Record<string, AnyMatcher>, R exten
   tasks: (vars: JoinedVars<M, R>, matched: MatchedByName<M, R>) => Iterable<Task>
 }
 
-type SetTasksOfGroups = (changes: readonly GroupTasks[]) => void
+/** Gives the new tasks of one group to the build. The build applies all of them of one matcher event as one step. */
+type SetGroupTasks = (group: TaskGroup, tasks: readonly Task[]) => void
 
 /** A matcher that is not required, and how it finds the base sets that its matches can join. */
 type OptionalMatcher = {
@@ -63,7 +64,7 @@ type Branch = {
  * joins their matches on shared var names, and keeps one task list in the build for each joined set.
  * The required matchers join to base sets. The matchers that are not required left-join onto
  * each base set, one after the other in name order, so a base set can have several joined sets.
- * Each joined set has one task group, so `setTasksOfGroups` replaces the tasks
+ * Each joined set has one task group, so `setGroupTasks` replaces the tasks
  * of a set that changes and removes the tasks of a set that is gone.
  * The build never calls `hear` while another `hear` runs (see build.each).
  */
@@ -75,13 +76,11 @@ export class TaskMaterializer<M extends Record<string, AnyMatcher>, R extends ke
   private readonly optionalMatchersByName = new Map<string, OptionalMatcher>()
   // The var names of all matchers: in name order, then varNames order, each one time.
   private readonly unionVarNames: string[] = []
-  // The new tasks of each set that the current event changes. hear gives them to the build at its end.
-  private tasksByChangedGroup = new Map<TaskGroup, readonly Task[]>()
 
   constructor(
     readonly number: number,
     private readonly config: TaskMaterializerConfig<M, R>,
-    private readonly setTasksOfGroups: SetTasksOfGroups,
+    private readonly setGroupTasks: SetGroupTasks,
   ) {
     const names = Object.keys(config.matchersByName)
     if (names.length === 0) {
@@ -138,21 +137,7 @@ export class TaskMaterializer<M extends Record<string, AnyMatcher>, R extends ke
     this.joinStepsByName = planJoins(requiredTables, number)
   }
 
-  /**
-   * Hears one matcher event, and then gives the build the new tasks of every set that it changed, in one step.
-   * So a task id that moves from one set to another set in the event is a replacement, and keeps its store record.
-   */
   hear(matcherName: string, event: MatchedArtifactEvent): void {
-    this.tasksByChangedGroup = new Map()
-    this.hearEvent(matcherName, event)
-    const changes: GroupTasks[] = []
-    for (const [group, tasks] of this.tasksByChangedGroup) {
-      changes.push({ group, tasks })
-    }
-    if (changes.length > 0) this.setTasksOfGroups(changes)
-  }
-
-  private hearEvent(matcherName: string, event: MatchedArtifactEvent): void {
     const table = this.tablesByName.get(matcherName)!
     const optional = this.optionalMatchersByName.get(matcherName)
     if (event.kind === "gone") {
@@ -263,8 +248,8 @@ export class TaskMaterializer<M extends Record<string, AnyMatcher>, R extends ke
   /**
    * Makes the joined sets of the base set the result of its chain of LEFT JOINs. A set with the same vars
    * and the same matches does not change. A set with the same vars and other matches gets new tasks in its
-   * group. A set with new vars gets a new group. A set whose vars are gone is removed first, so that a new
-   * set can give the same task id.
+   * group. A set with new vars gets a new group. A set whose vars are gone is removed. The build applies
+   * all the changes of one matcher event as one step, so a task id can move from a removed set to a new set.
    */
   private refreshJoinedSets(base: BaseSet): void {
     const branches = this.leftJoinChain(base)
@@ -318,7 +303,7 @@ export class TaskMaterializer<M extends Record<string, AnyMatcher>, R extends ke
       member.sets.delete(set)
     }
     set.base.joinedSetsByVarsKey.delete(set.varsKey)
-    this.tasksByChangedGroup.set(set.group, [])
+    this.setGroupTasks(set.group, [])
   }
 
   /** The join keys in the indexes of all matchers and of the base sets. 0 when no match is left. */
@@ -333,7 +318,7 @@ export class TaskMaterializer<M extends Record<string, AnyMatcher>, R extends ke
     return count
   }
 
-  /** Makes the tasks of the set, from its current matches. hear gives them to the build. */
+  /** Gives the build the tasks of the set, from its current matches. */
   private giveTasks(set: JoinedSet): void {
     const matchedEntries: [string, MatchedArtifact][] = []
     for (const [name, member] of set.membersByName) {
@@ -345,7 +330,7 @@ export class TaskMaterializer<M extends Record<string, AnyMatcher>, R extends ke
     for (const task of this.config.tasks(set.vars as JoinedVars<M, R>, matched as MatchedByName<M, R>)) {
       tasks.push(task)
     }
-    this.tasksByChangedGroup.set(set.group, tasks)
+    this.setGroupTasks(set.group, tasks)
   }
 
   /** `build.each <number> <name>=<value> ...`, for each var of the set, in unionVarNames order. Only for error messages. */

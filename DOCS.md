@@ -309,7 +309,7 @@ The rules:
 - Each task id is in exactly one group, so `build.add` throws if `build.each` already made a task with that id.
 - `build.add(task)` makes one group for the task id. When you add the same id again, the replacement stays in the same group.
 - `build.each` makes one group for each joined set of matches ([section 10](#10-buildeach-tasks-for-each-matched-artifact)).
-- A subclass of `Build` can call `setTasks(group, tasks)`. It replaces the whole list of the group. It adds each new id, replaces each known id, and removes each id that it does not get again.
+- A subclass of `Build` can call `setTasksOfGroups([{ group, tasks }, ...])`. It replaces the whole list of each group. It adds each new id, replaces each known id, and removes each id that no group of the call gets again.
 - `build.remove(id)` removes the task from its group. The other tasks of the group stay, and the group can get the same id again later.
 - After `build.remove(id)`, a later `build.add` with that id makes a new group. A task that `build.each` made and that you remove comes back only when its match changes, or after `gone` and then `found`.
 - A group is an object, a `TaskGroup`. Its label is only for error messages. Two groups with the same label are two different groups. Thus two parts of your code cannot share a group only because they use the same label.
@@ -364,7 +364,7 @@ After `build.run()` starts, a new task looks for its producers when the current 
 To make sure that a consumer waits for its producer, use one of these ways:
 
 - Add the producer first.
-- Give the producer and the consumer in one `setTasks` call.
+- Give the producer and the consumer in one `setTasksOfGroups` call.
 - Add the producer from a subscriber, when it gets the `promised` event of the consumer.
 
 Adding both in the same synchronous code also works:
@@ -616,7 +616,7 @@ dapat sends a `withdrawn` event for each declared output when it removes the tas
 
 For one output of one task, a subscriber gets the events in this order: `promised`, then `produced` or `deleted` for each report of the task, then `withdrawn` if the task leaves the build. A subscriber gets no `produced` or `deleted` event before the `promised` event, and no event after the `withdrawn` event. A task that you remove before the first `build.run()` sends no events.
 
-Each `add`, `remove`, and `setTasks` compares the old and the new outputs of each task id that it changes. One call puts all its `withdrawn` events on the queue before any `promised` event. Thus an output that moves from one task to another in one call is withdrawn before it is promised again. Each output is promised one time, even if a task declares it two times. For the order across calls, see [The event queue](#the-event-queue).
+Each `add`, `remove`, and `setTasksOfGroups` step compares the old and the new outputs of each task id that it changes. One call puts all its `withdrawn` events on the queue before any `promised` event. Thus an output that moves from one task to another in one call is withdrawn before it is promised again. Each output is promised one time, even if a task declares it two times. For the order across calls, see [The event queue](#the-event-queue).
 
 Delivery is synchronous. dapat calls each subscriber in the order that it subscribed, and it waits for each call to return. Thus, when `ctx.produced` returns, each task that a subscriber added is already in the build. A subscriber must not return a promise. If it returns one, dapat does not wait for it: the send fails with `subscriber returned a promise; subscribers must be synchronous`, and `build.run()` rejects with that error ([Subscriber errors](#subscriber-errors)). If the promise then rejects, dapat drops that rejection, because it keeps only the first error.
 
@@ -688,7 +688,7 @@ try {
 
 ### The event queue
 
-dapat keeps one queue of events for the build. A call that changes the state first changes the state, and then puts its events at the end of the queue. These calls are `add`, `remove`, `setTasks`, `ctx.produced`, `ctx.deleted`, the end of a task, and the start of the first `build.run()`. If no drain is in progress, the call then drains the queue: it sends one event at a time to every subscriber, until the queue is empty. The call returns after the drain.
+dapat keeps one queue of events for the build. A call that changes the state first changes the state, and then puts its events at the end of the queue. These calls are `add`, `remove`, a `setTasksOfGroups` step, `ctx.produced`, `ctx.deleted`, the end of a task, and the start of the first `build.run()`. If no drain is in progress, the call then drains the queue: it sends one event at a time to every subscriber, until the queue is empty. The call returns after the drain.
 
 A subscriber that changes tasks during a send does not start a new drain. Its events go at the end of the queue. The current event first reaches every subscriber, and then the new events follow. Thus every subscriber gets every event in the same order, and that order is the order of the state changes.
 
@@ -703,7 +703,7 @@ produced y by t
 
 Subscriber 2 gets `promised x by t` after `t` stopped declaring `x`, and then `withdrawn x by t`. A subscriber that applies every event in order ends with the true state. Do not act on one event in a way that a later event cannot undo.
 
-**The send limit.** During one drain, subscribers can cause at most 10,000 events (`SEND_LIMIT`). The limit counts only the events that subscribers cause during the drain. It does not count the events of the call that started the drain. Thus a `setTasks` call or a first `build.run()` with more than 10,000 outputs does not reach it. To change the limit, use `new Build({ sendLimit })`. The value must be a positive integer. You cannot turn the limit off.
+**The send limit.** During one drain, subscribers can cause at most 10,000 events (`SEND_LIMIT`). The limit counts only the events that subscribers cause during the drain. It does not count the events of the call that started the drain. Thus a `setTasksOfGroups` step or a first `build.run()` with more than 10,000 outputs does not reach it. To change the limit, use `new Build({ sendLimit })`. The value must be a positive integer. You cannot turn the limit off.
 
 The limit counts all events that subscribers cause in one drain, also correct ones. For example, a subscriber adds one task for each `promised` event. On a first `build.run()` with more than `sendLimit` outputs, the start of the run sends more than `sendLimit` `promised` events in one drain, and the subscriber causes one more `promised` event for each of them. That build reaches the limit. Set a higher `sendLimit` for such a build.
 
@@ -906,7 +906,7 @@ A matcher that is not required and has only var names that the required matchers
 
 On the first run, `tasks` can run more than one time for one set, for example when the scan finds the page before its review. Each set ends with one task list, and no task starts before the scans finish.
 
-`build.each` gives the build all the changes of one matcher event in one step ([`setTasksOfGroups`](#class-build)). So a task id can move from one set to another set in one event. For example, the task `page:en/hello` of the set with no review moves to the set `reviewer=ann` when the review is found. The build treats this as a replacement: the task keeps its store record, and the next build can skip it. Two sets can also swap their task ids in one event. The rule that two sets cannot give one task id applies after the event.
+`build.each` gives the build all the changes of one matcher event in one step ([`setTasksOfGroups`](#class-build)). During the scans of the first `build.run()`, all the changes until the last scan returns are one step. So a task id can move from one set to another set in one step. For example, the task `page:en/hello` of the set with no review moves to the set `reviewer=ann` when the review is found during the run. The build treats this as a replacement: the task keeps its store record, and the next build can skip it. Two sets can also swap their task ids in one step. The rule that two sets cannot give one task id applies after the step. Thus the order in which the scans find the pages and the reviews does not change the result of the first run: a set that exists only for a while during the scans never gets its tasks.
 
 #### Several matchers that are not required: the order of the names
 
@@ -1018,8 +1018,8 @@ const result = await build.run()
 With `posts/hello.md` and `posts/bye.md`, the first run does these steps:
 
 1. `Posts.scan` reads the folder and sends `found` for `{ slug: "hello" }` and `{ slug: "bye" }`.
-2. For each matched artifact, `build.each` calls `tasks`, and the build adds `page:hello` and `page:bye`.
-3. The scan returns. The build starts both tasks.
+2. For each matched artifact, `build.each` calls `tasks`.
+3. The scan returns. The build adds `page:hello` and `page:bye` in one step, and starts both tasks.
 
 The next time the program runs with no change, both tasks skip. If you add a task with `build.add` that declares the output `posts/news.md`, `Posts` gets its `promised` event and sends `found` for `{ slug: "news" }`. `build.each` adds `page:news`, and `page:news` waits for the task that writes the post.
 
@@ -1119,9 +1119,10 @@ The first `build.run()` does these steps:
 
 1. It sends a `promised` event for each output of each task that you added with `build.add`. Matchers get them, so `build.each` can make tasks for them.
 2. It starts the scan of each matcher, all at the same time, and waits until every scan has returned.
-3. It starts the tasks.
+3. It gives the build all the task changes of `build.each` since step 1, as one step ([`setTasksOfGroups`](#class-build)). The build sends their `promised` events, so the matchers get them now. A clash of two task ids is an error only if it is still there at this point.
+4. It starts the tasks.
 
-No task starts during a scan. A scan that is still running could find a thing whose task writes the input of another task.
+No task starts during a scan. A scan that is still running could find a thing whose task writes the input of another task. A scan that never returns thus also makes no task of `build.each` exist.
 
 A later `build.run()` on the same build does not scan again. A `build.run()` that you call while the scans of the first one still run waits for the same scans, and then starts the tasks.
 
@@ -1385,12 +1386,11 @@ new Build(opts?: { store?: Store; sendLimit?: number })
 
 | Member | Description |
 | --- | --- |
-| `add(task: Task): void` | Adds a task. If a task with the same id exists, replaces it (see [section 8](#replacement)). If `run()` has started, sends a `promised` event for each declared output, and the task starts at once. Does not throw when a subscriber throws ([section 9](#subscriber-errors)). Throws if another task already declares one of its exact outputs, if the task declares one output twice, or if another task group has that id ([Task groups](#task-groups)). Throws before it changes anything. |
+| `add(task: Task): void` | Adds a task. If a task with the same id exists, replaces it (see [section 8](#replacement)). If `run()` has started, sends a `promised` event for each declared output, and the task starts at once. Does not throw when a subscriber throws ([section 9](#subscriber-errors)). Throws if another task already declares one of its exact outputs, if the task declares one output twice, or if another task group has that id ([Task groups](#task-groups)). Throws before it changes anything. It is one step of its own, also while the build keeps a step open for `build.each` ([`setTasksOfGroups`](#class-build)). |
 | `remove(id: string): void` | Removes a task. Aborts it if it is running and sends a `withdrawn` event for each declared output. Does not throw when a subscriber throws. Starts to delete its store record. Does not wait for the delete, but `run()` does. A delete error goes into `result.errors`. Does nothing if the id is not known. The other tasks of the same task group stay. |
 | `subscribe(listener: (event: ArtifactEvent) => void): void` | From `Emitter`. Calls `listener` synchronously for each artifact event, in the order of the event queue. Does not replay earlier events. See [section 9](#9-subscribe-to-artifact-events). |
-| `protected setTasks(group: TaskGroup, tasks: readonly Task[]): void` | Makes `tasks` the tasks of `group` ([Task groups](#task-groups)). Adds each new id, replaces each known id, and removes each id that `group` had before and does not get now. Changes all state first, then puts the events on the queue: all `withdrawn` events of the call first, then the `promised` events, by id in list order. A dropped task ends as `cancelled` with the reason `"removed"` if it had not finished. Throws and changes nothing if another group has one of the ids, if `tasks` has one id two times, or if two tasks declare one exact output. `add(task)` calls it with one group for each task id. `build.each` calls it with one group for each match. A subclass of `Build` can call it with its own `new TaskGroup(label)`. |
-| `protected setTasksOfGroups(changes: readonly GroupTasks[]): void` | `setTasks` for several groups in one step. `GroupTasks` is `{ group: TaskGroup; tasks: readonly Task[] }`. The rules of `setTasks` apply to the state after the whole step. A task id can move from one group of the step to another group of the step. That is a replacement, as a known id in one group is: the task ends as `cancelled` with the reason `"replaced"` if it had not finished, and its store record stays. An id that a group had before and that no group of the step gets now is removed, and its store record is deleted. Throws and changes nothing if a group is in `changes` two times. `setTasks(group, tasks)` is `setTasksOfGroups([{ group, tasks }])`. `build.each` calls it one time for each matcher event, with all the sets that the event changed. |
-| `each<M extends Record<string, AnyMatcher>, const R extends keyof M & string = keyof M & string>(config: TaskMaterializerConfig<M, R>): void` | Makes tasks for each joined set of matched artifacts ([section 10](#10-buildeach-tasks-for-each-matched-artifact)). TypeScript gets `R` from `required`. Subscribes to each matcher in `matchersByName`, joins their matches on shared var names, and gives the tasks of each joined set through `setTasks`, with one task group for each set, labeled `build.each <number> <var name>=<var value> ...`. The build sends each artifact event to `matcher.receiveArtifactEvent`, one time for each matcher. An error in `tasks` or in a matched artifact is fatal for the build, like a subscriber error. Throws if `matchersByName` has no matcher, if one matcher object is under two names, if `required` is empty or has a name that is not in `matchersByName`, if its required matchers do not form one connected group by shared var names, if `run()` has started, or if another `Build` uses a matcher. |
+| `protected setTasksOfGroups(changes: readonly GroupTasks[]): void` | Makes the tasks of each group in `changes` its new tasks, in one step ([Task groups](#task-groups)). `GroupTasks` is `{ group: TaskGroup; tasks: readonly Task[] }`. Adds each new id, replaces each known id, and removes each id that a group had before and that no group of the step gets now. A task id can move from one group of the step to another group of the step. That is a replacement, as a known id in one group is: the task ends as `cancelled` with the reason `"replaced"` if it had not finished, and its store record stays. A removed task ends as `cancelled` with the reason `"removed"` if it had not finished, and its store record is deleted. Changes all state first, then puts the events on the queue: all `withdrawn` events of the step first, then the `promised` events, by id in list order. Throws and changes nothing if two groups of the step or another group have one id, if a group gets one id two times, if two tasks declare one exact output, or if a group is in `changes` two times. The checks use the state after the whole step. **An open step:** while the first `run()` scans, and during each matcher event, the build keeps a step open. Then a call does not throw: its changes join the open step, a later change of a group replaces its earlier one, and the build applies the step when the scans return or when the event ends. An error then is fatal for the build. `build.each` gives its changes here. `add` never joins an open step. A subclass of `Build` can call it with its own `new TaskGroup(label)`. |
+| `each<M extends Record<string, AnyMatcher>, const R extends keyof M & string = keyof M & string>(config: TaskMaterializerConfig<M, R>): void` | Makes tasks for each joined set of matched artifacts ([section 10](#10-buildeach-tasks-for-each-matched-artifact)). TypeScript gets `R` from `required`. Subscribes to each matcher in `matchersByName`, joins their matches on shared var names, and gives the tasks of each joined set through `setTasksOfGroups`, with one task group for each set, labeled `build.each <number> <var name>=<var value> ...`. All the changes of one matcher event are one step, and all the changes during the scans of the first `run()` are one step. The build sends each artifact event to `matcher.receiveArtifactEvent`, one time for each matcher. An error in `tasks` or in a matched artifact is fatal for the build, like a subscriber error. Throws if `matchersByName` has no matcher, if one matcher object is under two names, if `required` is empty or has a name that is not in `matchersByName`, if its required matchers do not form one connected group by shared var names, if `run()` has started, or if another `Build` uses a matcher. |
 | `run(): Promise<Result>` | The first time, sends a `promised` event for each output of each task that is in the build, and then runs the scan of each matcher and waits for all of them. A call during the scans waits for the same scans. Then starts every task and resolves when every started task has finished. Does not reject when a task fails. Rejects with the first subscriber error, `build.each` error, scan error, or send-limit error of the build, at once if that error happened before the call ([section 9](#subscriber-errors)). After a scan error, no task starts. |
 
 ### `class TaskGroup`
@@ -1399,7 +1399,7 @@ new Build(opts?: { store?: Store; sendLimit?: number })
 new TaskGroup(label: string)
 ```
 
-A group of tasks for `setTasks` ([Task groups](#task-groups)). The object is the identity. `label` is only for error messages.
+A group of tasks for `setTasksOfGroups` ([Task groups](#task-groups)). The object is the identity. `label` is only for error messages.
 
 ### `class Task`
 

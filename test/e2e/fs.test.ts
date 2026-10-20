@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test"
 import { mkdtemp, rm, writeFile, mkdir } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import path from "node:path"
-import { Build, Task } from "../../src/index"
+import { Build, Matcher, Task } from "../../src/index"
 import { FileArtifact, FilesystemPrefix } from "../../contrib/fs"
 import { JsonStore, SqliteStore } from "../../contrib/store"
 
@@ -233,4 +233,85 @@ describe("filesystem artifacts", () => {
     expect(result.success).toBe(true)
     expect(await Bun.file(reportPath).text()).toBe("{\"ok\":true}")
   })
+})
+
+/** A matcher of files that a test sends one at a time, so the test sets the scan order across matchers. */
+class SentFiles extends Matcher<FileArtifact> {
+  constructor(
+    readonly varNames: readonly string[],
+    private readonly scanSteps: () => Promise<void> = async () => {},
+  ) {
+    super()
+  }
+
+  async scan(): Promise<void> {
+    await this.scanSteps()
+  }
+
+  foundFile(vars: Record<string, string>, filePath: string): void {
+    this.send({ kind: "found", matched: { vars, data: new FileArtifact(filePath) } })
+  }
+}
+
+describe("build.each with required, over files", () => {
+  // The page of a lang that has no review is the draft of that lang. Page a has a review, page b has none.
+  for (const scanOrder of [
+    ["review a", "page a", "page b"],
+    ["page a", "review a", "page b"],
+    ["page a", "page b", "review a"],
+  ]) {
+    test(`the drafts example skips on build 2 with the scan order ${scanOrder.join(", ")}`, async () => {
+      const root = await tempDir()
+      const pageAPath = path.join(root, "content", "en", "a.md")
+      const pageBPath = path.join(root, "content", "en", "b.md")
+      const reviewPath = path.join(root, "reviews", "en", "a", "ann.json")
+      await mkdir(path.dirname(pageAPath), { recursive: true })
+      await mkdir(path.dirname(reviewPath), { recursive: true })
+      await writeFile(pageAPath, "A")
+      await writeFile(pageBPath, "B")
+      await writeFile(reviewPath, "ok")
+      const store = new JsonStore(path.join(root, "state.json"))
+
+      async function buildOnce() {
+        const reviews = new SentFiles(["lang", "slug", "reviewer"])
+        const sendByStep: Record<string, () => void> = {
+          "page a": () => pages.foundFile({ lang: "en", slug: "a" }, pageAPath),
+          "page b": () => pages.foundFile({ lang: "en", slug: "b" }, pageBPath),
+          "review a": () => reviews.foundFile({ lang: "en", slug: "a", reviewer: "ann" }, reviewPath),
+        }
+        const pages: SentFiles = new SentFiles(["lang", "slug"], async () => {
+          for (const step of scanOrder) {
+            sendByStep[step]!()
+            await Promise.resolve()
+          }
+        })
+        const build = new Build({ store })
+        build.each({
+          matchersByName: { page: pages, review: reviews },
+          required: ["page"],
+          *tasks(vars, matched) {
+            const page = matched.page.data
+            if (matched.review === undefined) {
+              const draft = new FileArtifact(path.join(root, "drafts", `${vars.lang}.html`))
+              yield new Task({ id: `draft:${vars.lang}`, inputs: [page], outputs: [draft], run: async () => void (await Bun.write(draft.path, "draft")) })
+            } else {
+              const html = new FileArtifact(path.join(root, "site", `${vars.lang}`, `${vars.slug}.html`))
+              const inputs = [page, matched.review.data]
+              yield new Task({ id: `page:${vars.lang}/${vars.slug}`, inputs, outputs: [html], run: async () => void (await Bun.write(html.path, "page")) })
+            }
+          },
+        })
+        return build.run()
+      }
+
+      const first = await buildOnce()
+      expect(first.success).toBe(true)
+      expect(first.executed.map((task) => task.id).sort()).toEqual(["draft:en", "page:en/a"])
+
+      const second = await buildOnce()
+      expect(second.success).toBe(true)
+      expect(second.executed).toEqual([])
+      expect(second.skipped.map((task) => task.id).sort()).toEqual(["draft:en", "page:en/a"])
+    })
+  }
 })

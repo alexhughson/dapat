@@ -638,14 +638,12 @@ describe("build.each with required: indexes, shared matchers, re-entrant events"
           yield new Task({ id: `page:${vars.lang}/${vars.slug}:${matched.review?.data.id}:${matched.branch?.data.id}`, run: async () => {} })
         },
       },
-      (changes) => {
-        for (const { group, tasks } of changes) {
-          const ids: string[] = []
-          for (const task of tasks) {
-            ids.push(task.id)
-          }
-          taskIdsByGroup.set(group, ids)
+      (group, tasks) => {
+        const ids: string[] = []
+        for (const task of tasks) {
+          ids.push(task.id)
         }
+        taskIdsByGroup.set(group, ids)
       },
     )
     function found(name: string, vars: Record<string, string>, id: string): void {
@@ -756,18 +754,16 @@ describe("build.each with required: a matcher that is not required can have var 
   /** The ids of the current tasks, each with the label of its task group, from a TaskMaterializer. */
   function materialize<M extends Record<string, AnyMatcher>, R extends keyof M & string>(config: TaskMaterializerConfig<M, R>) {
     const taskIdsByGroup = new Map<TaskGroup, string[]>()
-    const taskMaterializer = new TaskMaterializer(1, config, (changes) => {
-      for (const { group, tasks } of changes) {
-        if (tasks.length === 0) {
-          taskIdsByGroup.delete(group)
-          continue
-        }
-        const ids: string[] = []
-        for (const task of tasks) {
-          ids.push(task.id)
-        }
-        taskIdsByGroup.set(group, ids)
+    const taskMaterializer = new TaskMaterializer(1, config, (group, tasks) => {
+      if (tasks.length === 0) {
+        taskIdsByGroup.delete(group)
+        return
       }
+      const ids: string[] = []
+      for (const task of tasks) {
+        ids.push(task.id)
+      }
+      taskIdsByGroup.set(group, ids)
     })
     function found(name: string, vars: Record<string, string>, id: string): void {
       taskMaterializer.hear(name, { kind: "found", matched: { vars, data: new Mem(id) } })
@@ -920,11 +916,7 @@ describe("build.each with required: a matcher that is not required can have var 
         required: ["page"],
         *tasks() {},
       },
-      (changes) => {
-        for (const { group } of changes) {
-          groups.push(group)
-        }
-      },
+      (group) => void groups.push(group),
     )
     taskMaterializer.hear("page", { kind: "found", matched: { vars: { slug: "a" }, data: new Mem("page:a") } })
     taskMaterializer.hear("review", { kind: "found", matched: { vars: { slug: "a", reviewer: "ann" }, data: new Mem("review:a/ann") } })
