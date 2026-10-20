@@ -49,8 +49,8 @@ export class Build extends Emitter<ArtifactEvent> {
   private readonly slots = new Map<string, Slot>()
   // For each group, the ids of its tasks. Slot.group is the reverse.
   private readonly taskIdsByGroup = new Map<TaskGroup, Set<string>>()
-  // The group that build.add made for each task id. A replacement with the same id keeps its group.
-  private readonly addedTaskGroups = new Map<string, TaskGroup>()
+  // The groups that build.add made. A replacement with the same id keeps its group.
+  private readonly addedTaskGroups = new WeakSet<TaskGroup>()
   private readonly exactOutputs = new Map<string, { artifact: Artifact; taskId: string }>()
   // The prefix outputs of all tasks. The producer lookup scans them; exact outputs are in exactOutputs.
   private readonly prefixOutputs: PrefixOutput[] = []
@@ -93,31 +93,21 @@ export class Build extends Emitter<ArtifactEvent> {
   }
 
   add(task: Task): void {
-    const knownGroup = this.addedTaskGroups.get(task.id)
-    let group = knownGroup
-    if (group === undefined) {
+    const slot = this.slots.get(task.id)
+    let group: TaskGroup
+    if (slot && this.addedTaskGroups.has(slot.group)) {
+      group = slot.group
+    } else {
       group = new TaskGroup(`build.add ${task.id}`)
-      // Set before setTasks: a subscriber or an abort listener can add the same id during the call.
-      this.addedTaskGroups.set(task.id, group)
+      this.addedTaskGroups.add(group)
     }
-    try {
-      this.setTasks(group, [task])
-    } catch (error) {
-      // setTasks throws only before it changes anything, so the new group has no task.
-      if (knownGroup === undefined) {
-        this.addedTaskGroups.delete(task.id)
-      }
-      throw error
-    }
+    this.setTasks(group, [task])
   }
 
   /** Removes the task from its group. The other tasks of the group stay. */
   remove(id: string): void {
     const slot = this.slots.get(id)
     if (!slot) return
-    // A group of build.add has one task, so it is now empty and a later add makes a new one.
-    // If build.each made the task, the map has no entry for the id.
-    this.addedTaskGroups.delete(id)
     this.change(slot.group, [], [slot])
   }
 
