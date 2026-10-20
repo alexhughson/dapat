@@ -1889,7 +1889,7 @@ describe("promised and withdrawn events", () => {
 
       // The first event started the drain. The subscriber caused each later one.
       await expect(build.run()).rejects.toThrow(
-        `send limit: subscribers caused ${SEND_LIMIT} events in one drain, and more wait; ` +
+        `send limit: subscribers caused ${SEND_LIMIT} events in one pass of a drain, and more wait; ` +
           "the last sent was 'promised mem:x by t'",
       )
     })
@@ -1925,7 +1925,7 @@ describe("promised and withdrawn events", () => {
       build.add(new Task({ id: "t", outputs: [new Mem("mem:x")], run: async () => {} }))
 
       await expect(build.run()).rejects.toThrow(
-        "send limit: subscribers caused 5 events in one drain, and more wait; the last sent was 'withdrawn mem:x by t'",
+        "send limit: subscribers caused 5 events in one pass of a drain, and more wait; the last sent was 'withdrawn mem:x by t'",
       )
       expect(sent).toBe(6)
     })
@@ -1940,7 +1940,7 @@ describe("promised and withdrawn events", () => {
 
       class GroupBuild extends Build {
         give(tasks: Task[]): void {
-          this.setTasks(new TaskGroup("test"), tasks)
+          this.setTasksOfGroups([{ group: new TaskGroup("test"), tasks }])
         }
       }
       const groupBuild = new GroupBuild({ sendLimit: 3 })

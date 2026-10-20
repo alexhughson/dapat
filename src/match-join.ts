@@ -16,21 +16,70 @@ export type StoredMatch = {
   sets: Set<JoinedSet>
 }
 
-/** One match of each matcher, where the var names that two matchers share have the same values. */
-export type JoinedSet = {
-  // The vars of all its matches, in the union var name order of the build.each.
+/**
+ * One result of the join of the required matchers: one match of each, where the var names that
+ * two of them share have the same values. The matchers that are not required left-join onto it.
+ */
+export type BaseSet = {
+  // The vars of its required matches.
   vars: Vars
+  requiredMembersByName: Map<string, StoredMatch>
+  // The joined sets that the chain of left joins gives now, by the JSON of their vars in union order.
+  joinedSetsByVarsKey: Map<string, JoinedSet>
+}
+
+/** A base set with the matches that the left joins add to it. It has the task group. */
+export type JoinedSet = {
+  base: BaseSet
+  // Its key in base.joinedSetsByVarsKey.
+  varsKey: string
+  // The vars of all its matches, in the union var name order of the build.each.
+  // A var of a matcher that is not required and has no match in the set is not here.
+  vars: Vars
+  // A matcher that is not required is not here when the set has no match of it.
   membersByName: Map<string, StoredMatch>
   group: TaskGroup
 }
 
 /**
- * One index of a matcher: its matches by the values of some of its var names.
- * A changed match of another matcher finds its partners here.
+ * Items by the values of some var names. A MatchTable keeps its matches in these indexes,
+ * so a changed match of another matcher finds its partners here. A matcher that is not
+ * required keeps the base sets in one, by the var names that it shares with the required matchers.
  */
-type JoinIndex = {
-  lookupVarNames: readonly string[]
-  matchesByJoinKey: Map<JoinKey, Set<StoredMatch>>
+export class JoinIndex<T> {
+  private readonly itemsByJoinKey = new Map<JoinKey, Set<T>>()
+
+  constructor(readonly lookupVarNames: readonly string[]) {}
+
+  /** `vars` must have a value for each of lookupVarNames. */
+  add(vars: Vars, item: T): void {
+    const joinKey = keyOfVars(vars, this.lookupVarNames)
+    let items = this.itemsByJoinKey.get(joinKey)
+    if (items === undefined) {
+      items = new Set()
+      this.itemsByJoinKey.set(joinKey, items)
+    }
+    items.add(item)
+  }
+
+  delete(vars: Vars, item: T): void {
+    const joinKey = keyOfVars(vars, this.lookupVarNames)
+    const items = this.itemsByJoinKey.get(joinKey)!
+    items.delete(item)
+    if (items.size === 0) {
+      this.itemsByJoinKey.delete(joinKey)
+    }
+  }
+
+  /** The items whose lookupVarNames have the values in `vars`. */
+  lookup(vars: Vars): ReadonlySet<T> {
+    return this.itemsByJoinKey.get(keyOfVars(vars, this.lookupVarNames)) ?? new Set()
+  }
+
+  /** A join key with no item is deleted, so this is 0 when the index is empty. */
+  get joinKeyCount(): number {
+    return this.itemsByJoinKey.size
+  }
 }
 
 /**
@@ -40,7 +89,7 @@ type JoinIndex = {
 export class MatchTable {
   private readonly matchesByVarsKey = new Map<VarsKey, StoredMatch>()
   // By the JSON of lookupVarNames. Two join steps with the same var names share one index.
-  private readonly indexesByVarNames = new Map<string, JoinIndex>()
+  private readonly indexesByVarNames = new Map<string, JoinIndex<StoredMatch>>()
 
   constructor(
     readonly name: string,
@@ -51,7 +100,7 @@ export class MatchTable {
   addIndex(lookupVarNames: readonly string[]): void {
     const indexName = JSON.stringify(lookupVarNames)
     if (this.indexesByVarNames.has(indexName)) return
-    this.indexesByVarNames.set(indexName, { lookupVarNames, matchesByJoinKey: new Map() })
+    this.indexesByVarNames.set(indexName, new JoinIndex(lookupVarNames))
   }
 
   /** The match with these vars. Throws if the var names are not this matcher's varNames. */
@@ -63,39 +112,27 @@ export class MatchTable {
   put(stored: StoredMatch): void {
     this.matchesByVarsKey.set(this.varsKeyOf(stored.matched.vars), stored)
     for (const index of this.indexesByVarNames.values()) {
-      const joinKey = keyOfVars(stored.matched.vars, index.lookupVarNames)
-      let matches = index.matchesByJoinKey.get(joinKey)
-      if (matches === undefined) {
-        matches = new Set()
-        index.matchesByJoinKey.set(joinKey, matches)
-      }
-      matches.add(stored)
+      index.add(stored.matched.vars, stored)
     }
   }
 
   delete(stored: StoredMatch): void {
     this.matchesByVarsKey.delete(this.varsKeyOf(stored.matched.vars))
     for (const index of this.indexesByVarNames.values()) {
-      const joinKey = keyOfVars(stored.matched.vars, index.lookupVarNames)
-      const matches = index.matchesByJoinKey.get(joinKey)!
-      matches.delete(stored)
-      if (matches.size === 0) {
-        index.matchesByJoinKey.delete(joinKey)
-      }
+      index.delete(stored.matched.vars, stored)
     }
   }
 
   /** The matches whose lookupVarNames have the values in `vars`. */
   lookup(lookupVarNames: readonly string[], vars: Vars): ReadonlySet<StoredMatch> {
-    const index = this.indexesByVarNames.get(JSON.stringify(lookupVarNames))!
-    return index.matchesByJoinKey.get(keyOfVars(vars, lookupVarNames)) ?? new Set()
+    return this.indexesByVarNames.get(JSON.stringify(lookupVarNames))!.lookup(vars)
   }
 
   /** The number of join keys in all indexes. A join key with no match is deleted, so this is 0 when the table is empty. */
   get joinKeyCount(): number {
     let count = 0
     for (const index of this.indexesByVarNames.values()) {
-      count += index.matchesByJoinKey.size
+      count += index.joinKeyCount
     }
     return count
   }
@@ -136,7 +173,7 @@ export type JoinedMembers = {
 /**
  * For each matcher, the join steps that start from one of its matches, in an order where
  * each step shares a var name with an earlier one. Adds the index that each step needs.
- * Throws if the matchers do not form one connected group by shared var names.
+ * `tables` are the required matchers. Throws if they do not form one connected group by shared var names.
  */
 export function planJoins(tables: readonly MatchTable[], eachNumber: number): Map<string, JoinStep[]> {
   const stepsByName = new Map<string, JoinStep[]>()
@@ -169,8 +206,9 @@ export function planJoins(tables: readonly MatchTable[], eachNumber: number): Ma
     }
     if (unplacedNames.length > 0) {
       throw new Error(
-        `build.each ${eachNumber}: the matchers [${unplacedNames.join(", ")}] share no var name with matcher '${start.name}' ` +
-          `or its partners; each matcher must share a var name with another matcher`,
+        `build.each ${eachNumber}: the required matchers [${unplacedNames.join(", ")}] share no var name with required matcher ` +
+          `'${start.name}' or its required partners; each required matcher must share a var name with another required matcher, ` +
+          `and a matcher that is not required does not connect them`,
       )
     }
     stepsByName.set(start.name, steps)

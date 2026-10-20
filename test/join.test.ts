@@ -1,7 +1,9 @@
 import { describe, expect, test } from "bun:test"
-import { Build, Matcher, Task } from "../src/index"
-import type { ArtifactEvent } from "../src/index"
+import { Build, Matcher, MemoryStore, Task } from "../src/index"
+import type { AnyMatcher, ArtifactEvent, Ref, TaskMaterializerConfig } from "../src/index"
 import { MatchTable, type StoredMatch } from "../src/match-join"
+import { TaskGroup } from "../src/task-group"
+import { TaskMaterializer } from "../src/task-materializer"
 import { Mem } from "./mem"
 
 /**
@@ -48,7 +50,8 @@ class PathMatcher extends Matcher<Mem> {
   private varsOf(id: string): Record<string, string> | null {
     if (!id.startsWith(this.prefix)) return null
     const withoutVersion = id.slice(this.prefix.length).split("#")[0]!
-    const values = withoutVersion.split("/")
+    // A matcher with no var has the id `<prefix>` alone.
+    const values = withoutVersion === "" ? [] : withoutVersion.split("/")
     if (values.length !== this.varNames.length) return null
     const vars: Record<string, string> = {}
     for (let i = 0; i < this.varNames.length; i++) {
@@ -266,8 +269,8 @@ describe("build.each joins matchers on shared var names", () => {
         *tasks() {},
       }),
     ).toThrow(
-      "build.each 1: the matchers ['template'] share no var name with matcher 'page' or its partners; " +
-        "each matcher must share a var name with another matcher",
+      "build.each 1: the required matchers ['template'] share no var name with required matcher 'page' or its required partners; " +
+        "each required matcher must share a var name with another required matcher, and a matcher that is not required does not connect them",
     )
   })
 
@@ -391,7 +394,860 @@ describe("build.each joins matchers on shared var names", () => {
         matchersByName: { page: new PathMatcher("page:", ["slug"]), site: new PathMatcher("site:", []) },
         *tasks() {},
       }),
-    ).toThrow("build.each 1: the matchers ['site'] share no var name with matcher 'page' or its partners")
+    ).toThrow("build.each 1: the required matchers ['site'] share no var name with required matcher 'page' or its required partners")
+  })
+})
+
+/**
+ * Pages {lang, section, slug} and templates {lang} are required. A branch `changes-<lang>` {lang}
+ * and a review {lang, slug} are not. `made` logs each tasks() call with the ids of the set's matches.
+ */
+function siteWithOptionalBranchAndReview(made: string[]) {
+  const pages = new PathMatcher("page:", ["lang", "section", "slug"], [
+    new Mem("page:en/blog/hello", "H"),
+    new Mem("page:en/docs/install", "I"),
+    new Mem("page:fr/blog/hello", "B"),
+  ])
+  const templates = new PathMatcher("template:", ["lang"], [new Mem("template:en", "E"), new Mem("template:fr", "F")])
+  // main does not match the prefix, so only changes-en is found.
+  const branches = new PathMatcher("branch:changes-", ["lang"], [new Mem("branch:main", "m1"), new Mem("branch:changes-en", "c1")])
+  const reviews = new PathMatcher("review:", ["lang", "slug"], [new Mem("review:en/hello", "5")])
+  const build = new Build()
+  build.each({
+    matchersByName: { page: pages, template: templates, branch: branches, review: reviews },
+    required: ["page", "template"],
+    *tasks(vars, matched) {
+      const name = `${vars.lang}/${vars.section}/${vars.slug}`
+      const inputs: Ref[] = [matched.page.data, matched.template.data]
+      if (matched.branch !== undefined) {
+        inputs.push(matched.branch.data)
+      }
+      if (matched.review !== undefined) {
+        inputs.push(matched.review.data)
+      }
+      const inputIds: string[] = []
+      for (const input of inputs) {
+        inputIds.push(input.id)
+      }
+      made.push(`${name}: ${inputIds.join(" ")}`)
+      yield new Task({ id: `page:${name}`, inputs, outputs: [new Mem(`html:${name}`)], run: async () => {} })
+    },
+  })
+  return { build, pages, templates, branches, reviews }
+}
+
+describe("build.each with required", () => {
+  test("a set needs only the required matchers; the others join when they have a match", async () => {
+    const made: string[] = []
+    const { build } = siteWithOptionalBranchAndReview(made)
+
+    const result = await build.run()
+
+    expect(result.success).toBe(true)
+    expect(sortedIds(result.executed)).toEqual(["page:en/blog/hello", "page:en/docs/install", "page:fr/blog/hello"])
+    // The scans send one match at a time, so a set gets new tasks each time a branch or review joins it.
+    // The last tasks of each set are the ones that ran.
+    const lastMadeByName = new Map<string, string>()
+    for (const line of made) {
+      lastMadeByName.set(line.split(":")[0]!, line)
+    }
+    expect([...lastMadeByName.values()].sort()).toEqual([
+      "en/blog/hello: page:en/blog/hello template:en branch:changes-en review:en/hello",
+      "en/docs/install: page:en/docs/install template:en branch:changes-en",
+      "fr/blog/hello: page:fr/blog/hello template:fr",
+    ])
+  })
+
+  test("a match that is not required replaces the tasks of only its sets when it is found, changes, or is gone", async () => {
+    const made: string[] = []
+    const { build, branches, reviews } = siteWithOptionalBranchAndReview(made)
+    const currentTaskIds = watchTaskIds(build)
+    await build.run()
+    const allTaskIds = ["page:en/blog/hello", "page:en/docs/install", "page:fr/blog/hello"]
+
+    made.length = 0
+    reviews.foundArtifact(new Mem("review:en/install", "4"))
+    expect(made).toEqual(["en/docs/install: page:en/docs/install template:en branch:changes-en review:en/install"])
+
+    made.length = 0
+    reviews.foundArtifact(new Mem("review:en/install#2", "3"))
+    expect(made).toEqual(["en/docs/install: page:en/docs/install template:en branch:changes-en review:en/install#2"])
+
+    made.length = 0
+    reviews.goneArtifact("review:en/install")
+    expect(made).toEqual(["en/docs/install: page:en/docs/install template:en branch:changes-en"])
+    expect(currentTaskIds()).toEqual(allTaskIds)
+
+    // A branch with vars {lang} joins every set of its lang, and only those.
+    made.length = 0
+    branches.foundArtifact(new Mem("branch:changes-fr", "c2"))
+    expect(made).toEqual(["fr/blog/hello: page:fr/blog/hello template:fr branch:changes-fr"])
+
+    made.length = 0
+    branches.goneArtifact("branch:changes-en")
+    expect(made.sort()).toEqual([
+      "en/blog/hello: page:en/blog/hello template:en review:en/hello",
+      "en/docs/install: page:en/docs/install template:en",
+    ])
+    expect(currentTaskIds()).toEqual(allTaskIds)
+
+    // A gone review with no match does nothing.
+    made.length = 0
+    reviews.goneArtifact("review:fr/nothing")
+    expect(made).toEqual([])
+    const later = await build.run()
+    expect(later.success).toBe(true)
+  })
+
+  test("a match that is not required and has no set now joins the sets that come later", async () => {
+    const made: string[] = []
+    const { build, pages, templates, reviews } = siteWithOptionalBranchAndReview(made)
+    const currentTaskIds = watchTaskIds(build)
+    await build.run()
+
+    // A gone template removes the fr set. A review of that set then makes no task.
+    templates.goneArtifact("template:fr")
+    expect(currentTaskIds()).toEqual(["page:en/blog/hello", "page:en/docs/install"])
+    made.length = 0
+    reviews.foundArtifact(new Mem("review:fr/hello", "2"))
+    expect(made).toEqual([])
+
+    // The template comes back, and its set gets the review that waited.
+    templates.foundArtifact(new Mem("template:fr#2", "F2"))
+    expect(made).toEqual(["fr/blog/hello: page:fr/blog/hello template:fr#2 review:fr/hello"])
+
+    // A new page joins the reviews of its lang and slug, also in another section.
+    made.length = 0
+    pages.foundArtifact(new Mem("page:fr/news/hello", "N"))
+    expect(made).toEqual(["fr/news/hello: page:fr/news/hello template:fr#2 review:fr/hello"])
+
+    // A changed review replaces the tasks of both sets that hold it.
+    made.length = 0
+    reviews.foundArtifact(new Mem("review:fr/hello#2", "1"))
+    expect(made.sort()).toEqual([
+      "fr/blog/hello: page:fr/blog/hello template:fr#2 review:fr/hello#2",
+      "fr/news/hello: page:fr/news/hello template:fr#2 review:fr/hello#2",
+    ])
+  })
+
+  test("a matcher that is not required and has no var joins every set with its one match", async () => {
+    const pages = new PathMatcher("page:", ["slug"], [new Mem("page:a", "A"), new Mem("page:b", "B")])
+    const sites = new PathMatcher("site", [])
+    const made: string[] = []
+    const build = new Build()
+    build.each({
+      matchersByName: { page: pages, site: sites },
+      required: ["page"],
+      *tasks(vars, matched) {
+        made.push(`${vars.slug}: ${matched.site?.data.id ?? "no site"}`)
+        yield new Task({ id: `page:${vars.slug}`, run: async () => {} })
+      },
+    })
+    await build.run()
+    expect(made.sort()).toEqual(["a: no site", "b: no site"])
+
+    made.length = 0
+    sites.foundArtifact(new Mem("site", "S"))
+    expect(made.sort()).toEqual(["a: site", "b: site"])
+  })
+
+  test("required left out makes every matcher required", async () => {
+    const pages = new PathMatcher("page:", ["lang", "slug"], [new Mem("page:en/a", "A"), new Mem("page:en/b", "B")])
+    const reviews = new PathMatcher("review:", ["lang", "slug"], [new Mem("review:en/a", "5")])
+    const build = new Build()
+    build.each({
+      matchersByName: { page: pages, review: reviews },
+      *tasks(vars, matched) {
+        // Every matcher is required, so the types have no undefined: not in matched, and not in vars.
+        const slug: string = vars.slug
+        yield new Task({ id: `page:${slug}`, inputs: [matched.page.data, matched.review.data], run: async () => {} })
+      },
+    })
+
+    const result = await build.run()
+
+    expect(sortedIds(result.executed)).toEqual(["page:a"])
+  })
+
+  test("tsc requires a check before the data of a matcher that is not required", () => {
+    const build = new Build()
+    build.each({
+      matchersByName: { page: new PathMatcher("page:", ["lang", "slug"]), review: new PathMatcher("review:", ["lang", "slug"]) },
+      required: ["page"],
+      *tasks(vars, matched) {
+        // @ts-expect-error with a matcher that is not required, any var can be undefined
+        const lang: string = vars.lang
+        void lang
+        void matched.page.data.id
+        // @ts-expect-error matched.review is possibly undefined
+        void matched.review.data.id
+        if (matched.review !== undefined) {
+          void matched.review.data.id
+        }
+      },
+    })
+    expect(() =>
+      build.each({
+        matchersByName: { page: new PathMatcher("page:", ["slug"]) },
+        // @ts-expect-error 'pages' is not a name in matchersByName
+        required: ["pages"],
+        *tasks() {},
+      }),
+    ).toThrow("build.each 2: required names 'pages', which is not a name in matchersByName")
+  })
+
+  test("an empty required makes build.each throw", () => {
+    const build = new Build()
+    expect(() =>
+      build.each({ matchersByName: { page: new PathMatcher("page:", ["slug"]) }, required: [], *tasks() {} }),
+    ).toThrow("build.each 1: required is empty; name at least one matcher, or leave required out to require every matcher")
+  })
+
+  test("the required matchers must connect among themselves; a matcher that is not required does not connect them", () => {
+    const build = new Build()
+    expect(() =>
+      build.each({
+        matchersByName: {
+          page: new PathMatcher("page:", ["slug"]),
+          template: new PathMatcher("template:", ["lang"]),
+          review: new PathMatcher("review:", ["lang", "slug"]),
+        },
+        required: ["page", "template"],
+        *tasks() {},
+      }),
+    ).toThrow(
+      "build.each 1: the required matchers ['template'] share no var name with required matcher 'page' or its required partners; " +
+        "each required matcher must share a var name with another required matcher, and a matcher that is not required does not connect them",
+    )
+  })
+})
+
+describe("build.each with required: indexes, shared matchers, re-entrant events", () => {
+  test("after a found and gone cycle, the tables and the set indexes are empty", () => {
+    const taskIdsByGroup = new Map<TaskGroup, string[]>()
+    const pages = new PathMatcher("page:", ["lang", "slug"])
+    const templates = new PathMatcher("template:", ["lang"])
+    const reviews = new PathMatcher("review:", ["lang", "slug"])
+    const branches = new PathMatcher("branch:", ["lang"])
+    const taskMaterializer = new TaskMaterializer(
+      1,
+      {
+        matchersByName: { page: pages, template: templates, review: reviews, branch: branches },
+        required: ["page", "template"],
+        *tasks(vars, matched) {
+          yield new Task({ id: `page:${vars.lang}/${vars.slug}:${matched.review?.data.id}:${matched.branch?.data.id}`, run: async () => {} })
+        },
+      },
+      (group, tasks) => {
+        const ids: string[] = []
+        for (const task of tasks) {
+          ids.push(task.id)
+        }
+        taskIdsByGroup.set(group, ids)
+      },
+    )
+    function found(name: string, vars: Record<string, string>, id: string): void {
+      taskMaterializer.hear(name, { kind: "found", matched: { vars, data: new Mem(id) } })
+    }
+    function gone(name: string, vars: Record<string, string>): void {
+      taskMaterializer.hear(name, { kind: "gone", vars })
+    }
+    function currentTaskIds(): string[] {
+      const ids: string[] = []
+      for (const groupIds of taskIdsByGroup.values()) {
+        ids.push(...groupIds)
+      }
+      return ids.sort()
+    }
+
+    // Optional matches before, between and after the required ones; one review has no set.
+    found("review", { lang: "en", slug: "a" }, "review:en/a")
+    found("template", { lang: "en" }, "template:en")
+    found("page", { lang: "en", slug: "a" }, "page:en/a")
+    found("branch", { lang: "en" }, "branch:en")
+    found("page", { lang: "en", slug: "b" }, "page:en/b")
+    found("review", { lang: "en", slug: "c" }, "review:en/c")
+    found("review", { lang: "en", slug: "a" }, "review:en/a#2")
+    expect(currentTaskIds()).toEqual(["page:en/a:review:en/a#2:branch:en", "page:en/b:undefined:branch:en"])
+
+    // A required match goes first, while the optional matches stay.
+    gone("template", { lang: "en" })
+    expect(currentTaskIds()).toEqual([])
+    found("template", { lang: "en" }, "template:en#2")
+    expect(currentTaskIds()).toEqual(["page:en/a:review:en/a#2:branch:en", "page:en/b:undefined:branch:en"])
+
+    gone("review", { lang: "en", slug: "a" })
+    gone("branch", { lang: "en" })
+    expect(currentTaskIds()).toEqual(["page:en/a:undefined:undefined", "page:en/b:undefined:undefined"])
+    gone("page", { lang: "en", slug: "a" })
+    gone("page", { lang: "en", slug: "b" })
+    gone("review", { lang: "en", slug: "c" })
+    gone("template", { lang: "en" })
+
+    expect(currentTaskIds()).toEqual([])
+    expect(taskMaterializer.joinKeyCount).toBe(0)
+  })
+
+  test("one matcher can be required in one build.each and not required in another", async () => {
+    const pages = new PathMatcher("page:", ["lang", "slug"], [new Mem("page:en/a", "A"), new Mem("page:en/b", "B")])
+    const reviews = new PathMatcher("review:", ["lang", "slug"], [new Mem("review:en/a", "5")])
+    const build = new Build()
+    const currentTaskIds = watchTaskIds(build)
+    build.each({
+      matchersByName: { page: pages, review: reviews },
+      *tasks(vars, matched) {
+        yield new Task({ id: `reviewed:${vars.slug}:${matched.review.data.id}`, outputs: [new Mem(`reviewed:${vars.slug}`)], run: async () => {} })
+      },
+    })
+    build.each({
+      matchersByName: { page: pages, review: reviews },
+      required: ["page"],
+      *tasks(vars, matched) {
+        yield new Task({ id: `page:${vars.slug}:${matched.review?.data.id}`, outputs: [new Mem(`html:${vars.slug}`)], run: async () => {} })
+      },
+    })
+
+    const result = await build.run()
+
+    expect(result.success).toBe(true)
+    expect(currentTaskIds()).toEqual(["page:a:review:en/a", "page:b:undefined", "reviewed:a:review:en/a"])
+
+    reviews.foundArtifact(new Mem("review:en/b", "4"))
+    expect(currentTaskIds()).toEqual(["page:a:review:en/a", "page:b:review:en/b", "reviewed:a:review:en/a", "reviewed:b:review:en/b"])
+
+    reviews.goneArtifact("review:en/a")
+    expect(currentTaskIds()).toEqual(["page:a:undefined", "page:b:review:en/b", "reviewed:b:review:en/b"])
+  })
+
+  test("a found of a matcher that is not required, sent from a subscriber of promised, ends in the tasks of the set", async () => {
+    const pages = new PathMatcher("page:", ["lang", "slug"], [new Mem("page:en/a", "A")])
+    const templates = new PathMatcher("template:", ["lang"], [new Mem("template:en", "E")])
+    const reviews = new PathMatcher("review:", ["lang", "slug"])
+    const build = new Build()
+    const currentTaskIds = watchTaskIds(build)
+    const ran: string[] = []
+    // The first promised html makes a review for its page, while build.each still hears the page.
+    build.subscribe((event) => {
+      if (event.kind !== "promised") return
+      if (event.output.id !== "html:en/a") return
+      reviews.foundArtifact(new Mem("review:en/a", "5"))
+    })
+    build.each({
+      matchersByName: { page: pages, template: templates, review: reviews },
+      required: ["page", "template"],
+      *tasks(vars, matched) {
+        const reviewId = matched.review?.data.id ?? "no review"
+        const html = new Mem(`html:${vars.lang}/${vars.slug}`)
+        yield new Task({ id: `page:${vars.slug}`, outputs: [html], run: async () => void ran.push(reviewId) })
+      },
+    })
+
+    const result = await build.run()
+
+    expect(result.success).toBe(true)
+    expect(currentTaskIds()).toEqual(["page:a"])
+    expect(ran).toEqual(["review:en/a"])
+  })
+})
+
+describe("build.each with required: a matcher that is not required can have var names of its own", () => {
+  /** The ids of the current tasks, each with the label of its task group, from a TaskMaterializer. */
+  function materialize<M extends Record<string, AnyMatcher>, R extends keyof M & string>(config: TaskMaterializerConfig<M, R>) {
+    const taskIdsByGroup = new Map<TaskGroup, string[]>()
+    const taskMaterializer = new TaskMaterializer(1, config, (group, tasks) => {
+      if (tasks.length === 0) {
+        taskIdsByGroup.delete(group)
+        return
+      }
+      const ids: string[] = []
+      for (const task of tasks) {
+        ids.push(task.id)
+      }
+      taskIdsByGroup.set(group, ids)
+    })
+    function found(name: string, vars: Record<string, string>, id: string): void {
+      taskMaterializer.hear(name, { kind: "found", matched: { vars, data: new Mem(id) } })
+    }
+    function gone(name: string, vars: Record<string, string>): void {
+      taskMaterializer.hear(name, { kind: "gone", vars })
+    }
+    function currentTasks(): string[] {
+      const lines: string[] = []
+      for (const [group, ids] of taskIdsByGroup) {
+        lines.push(`${group.label}: ${ids.join(" ")}`)
+      }
+      return lines.sort()
+    }
+    return { taskMaterializer, found, gone, currentTasks }
+  }
+
+  test("each review of a page is one joined set; with no review, the page has one set with no review", () => {
+    const { taskMaterializer, found, gone, currentTasks } = materialize({
+      matchersByName: { page: new PathMatcher("page:", ["lang", "slug"]), review: new PathMatcher("review:", ["lang", "slug", "reviewer"]) },
+      required: ["page"],
+      *tasks(vars, matched) {
+        // vars has the reviewer of the matched review, or no reviewer.
+        expect(vars.reviewer).toBe(matched.review?.vars.reviewer)
+        const reviewer = vars.reviewer ?? "nobody"
+        yield new Task({ id: `page:${vars.lang}/${vars.slug}:${reviewer}`, run: async () => {} })
+      },
+    })
+
+    found("page", { lang: "en", slug: "about" }, "page:en/about")
+    expect(currentTasks()).toEqual(["build.each 1 lang=en slug=about: page:en/about:nobody"])
+
+    // The first review replaces the set with no review.
+    found("review", { lang: "en", slug: "about", reviewer: "ann" }, "review:en/about/ann")
+    expect(currentTasks()).toEqual(["build.each 1 lang=en slug=about reviewer=ann: page:en/about:ann"])
+
+    // A second review adds a set.
+    found("review", { lang: "en", slug: "about", reviewer: "bob" }, "review:en/about/bob")
+    expect(currentTasks()).toEqual([
+      "build.each 1 lang=en slug=about reviewer=ann: page:en/about:ann",
+      "build.each 1 lang=en slug=about reviewer=bob: page:en/about:bob",
+    ])
+
+    // A review of another page joins no set.
+    found("review", { lang: "en", slug: "contact", reviewer: "ann" }, "review:en/contact/ann")
+    expect(currentTasks()).toHaveLength(2)
+
+    gone("review", { lang: "en", slug: "about", reviewer: "bob" })
+    expect(currentTasks()).toEqual(["build.each 1 lang=en slug=about reviewer=ann: page:en/about:ann"])
+
+    // When the last review is gone, the set with no review comes back.
+    gone("review", { lang: "en", slug: "about", reviewer: "ann" })
+    expect(currentTasks()).toEqual(["build.each 1 lang=en slug=about: page:en/about:nobody"])
+
+    // The page that comes later gets the review that waited.
+    found("page", { lang: "en", slug: "contact" }, "page:en/contact")
+    expect(currentTasks()).toEqual([
+      "build.each 1 lang=en slug=about: page:en/about:nobody",
+      "build.each 1 lang=en slug=contact reviewer=ann: page:en/contact:ann",
+    ])
+
+    gone("page", { lang: "en", slug: "about" })
+    gone("page", { lang: "en", slug: "contact" })
+    gone("review", { lang: "en", slug: "contact", reviewer: "ann" })
+    expect(currentTasks()).toEqual([])
+    expect(taskMaterializer.joinKeyCount).toBe(0)
+  })
+
+  test("the first review replaces the set with no review before it adds its own, so both can give one task id", async () => {
+    const pages = new PathMatcher("page:", ["slug"], [new Mem("page:a", "A")])
+    const reviews = new PathMatcher("review:", ["slug", "reviewer"])
+    const build = new Build()
+    const currentTaskIds = watchTaskIds(build)
+    const ran: string[] = []
+    build.each({
+      matchersByName: { page: pages, review: reviews },
+      required: ["page"],
+      *tasks(vars, matched) {
+        const reviewer = matched.review?.vars.reviewer ?? "nobody"
+        yield new Task({ id: `page:${vars.slug}`, outputs: [new Mem(`html:${vars.slug}`)], run: async () => void ran.push(reviewer) })
+      },
+    })
+    await build.run()
+
+    reviews.foundArtifact(new Mem("review:a/ann", "5"))
+    expect(currentTaskIds()).toEqual(["page:a"])
+    const later = await build.run()
+
+    expect(later.success).toBe(true)
+    expect(ran).toEqual(["nobody", "ann"])
+  })
+
+  test("two matchers with var names of their own make the product of their matches", () => {
+    const { taskMaterializer, found, gone, currentTasks } = materialize({
+      matchersByName: {
+        page: new PathMatcher("page:", ["slug"]),
+        review: new PathMatcher("review:", ["slug", "reviewer"]),
+        comment: new PathMatcher("comment:", ["slug", "commenter"]),
+      },
+      required: ["page"],
+      *tasks(vars, matched) {
+        const reviewer = matched.review?.vars.reviewer ?? "-"
+        const commenter = matched.comment?.vars.commenter ?? "-"
+        yield new Task({ id: `page:${vars.slug}:${reviewer}:${commenter}`, run: async () => {} })
+      },
+    })
+
+    found("page", { slug: "a" }, "page:a")
+    found("review", { slug: "a", reviewer: "ann" }, "review:a/ann")
+    found("review", { slug: "a", reviewer: "bob" }, "review:a/bob")
+    // No comment yet: comment is undefined in each set.
+    expect(currentTasks()).toEqual([
+      "build.each 1 slug=a reviewer=ann: page:a:ann:-",
+      "build.each 1 slug=a reviewer=bob: page:a:bob:-",
+    ])
+
+    found("comment", { slug: "a", commenter: "cy" }, "comment:a/cy")
+    found("comment", { slug: "a", commenter: "di" }, "comment:a/di")
+    expect(currentTasks()).toEqual([
+      "build.each 1 slug=a reviewer=ann commenter=cy: page:a:ann:cy",
+      "build.each 1 slug=a reviewer=ann commenter=di: page:a:ann:di",
+      "build.each 1 slug=a reviewer=bob commenter=cy: page:a:bob:cy",
+      "build.each 1 slug=a reviewer=bob commenter=di: page:a:bob:di",
+    ])
+
+    gone("review", { slug: "a", reviewer: "ann" })
+    gone("review", { slug: "a", reviewer: "bob" })
+    expect(currentTasks()).toEqual([
+      "build.each 1 slug=a commenter=cy: page:a:-:cy",
+      "build.each 1 slug=a commenter=di: page:a:-:di",
+    ])
+
+    gone("comment", { slug: "a", commenter: "cy" })
+    gone("comment", { slug: "a", commenter: "di" })
+    gone("page", { slug: "a" })
+    expect(currentTasks()).toEqual([])
+    expect(taskMaterializer.joinKeyCount).toBe(0)
+  })
+
+  test("a new match of a matcher with no var of its own changes the tasks of each set, and keeps their groups", () => {
+    const groups: TaskGroup[] = []
+    const taskMaterializer = new TaskMaterializer(
+      1,
+      {
+        matchersByName: {
+          page: new PathMatcher("page:", ["slug"]),
+          review: new PathMatcher("review:", ["slug", "reviewer"]),
+          template: new PathMatcher("template:", []),
+        },
+        required: ["page"],
+        *tasks() {},
+      },
+      (group) => void groups.push(group),
+    )
+    taskMaterializer.hear("page", { kind: "found", matched: { vars: { slug: "a" }, data: new Mem("page:a") } })
+    taskMaterializer.hear("review", { kind: "found", matched: { vars: { slug: "a", reviewer: "ann" }, data: new Mem("review:a/ann") } })
+    groups.length = 0
+    taskMaterializer.hear("template", { kind: "found", matched: { vars: {}, data: new Mem("template") } })
+
+    // One call for the set reviewer=ann, in the same group as before.
+    expect(groups.map((group) => group.label)).toEqual(["build.each 1 slug=a reviewer=ann"])
+  })
+
+  test("the left joins chain in name order, so the order of the names can change the sets", () => {
+    const review = { lang: "en", slug: "about", reviewer: "ann" }
+    const rating = { lang: "en", slug: "about", reviewer: "bob" }
+    function setsInOrder(names: readonly ["review", "rating"] | readonly ["rating", "review"]): string[] {
+      const matchersByName: Record<string, PathMatcher> = { page: new PathMatcher("page:", ["lang", "slug"]) }
+      for (const name of names) {
+        matchersByName[name] = new PathMatcher(`${name}:`, ["lang", "slug", "reviewer"])
+      }
+      const { found, currentTasks } = materialize({
+        matchersByName,
+        required: ["page"],
+        *tasks(vars, matched) {
+          const review = matched.review?.data.id ?? "no review"
+          const rating = matched.rating?.data.id ?? "no rating"
+          yield new Task({ id: `page:${vars.slug}:${vars.reviewer}:${review}:${rating}`, run: async () => {} })
+        },
+      })
+      found("page", { lang: "en", slug: "about" }, "page:en/about")
+      found("review", review, "review:en/about/ann")
+      found("rating", rating, "rating:en/about/bob")
+      return currentTasks()
+    }
+
+    // review binds reviewer=ann first. The rating of bob does not agree, so rating is undefined.
+    expect(setsInOrder(["review", "rating"])).toEqual([
+      "build.each 1 lang=en slug=about reviewer=ann: page:about:ann:review:en/about/ann:no rating",
+    ])
+    // rating binds reviewer=bob first. The review of ann does not agree, so review is undefined.
+    expect(setsInOrder(["rating", "review"])).toEqual([
+      "build.each 1 lang=en slug=about reviewer=bob: page:about:bob:no review:rating:en/about/bob",
+    ])
+  })
+
+  test("a matcher whose ON var comes from an earlier matcher that is undefined is undefined too, as NULL in SQL", () => {
+    const { taskMaterializer, found, gone, currentTasks } = materialize({
+      matchersByName: {
+        page: new PathMatcher("page:", ["slug"]),
+        comment: new PathMatcher("comment:", ["slug", "author"]),
+        info: new PathMatcher("info:", ["author"]),
+      },
+      required: ["page"],
+      *tasks(vars, matched) {
+        yield new Task({ id: `page:${vars.slug}:${vars.author}:${matched.info?.data.id ?? "-"}`, run: async () => {} })
+      },
+    })
+    found("info", { author: "ann" }, "info:ann")
+    found("info", { author: "bob" }, "info:bob")
+    found("page", { slug: "a" }, "page:a")
+    found("page", { slug: "b" }, "page:b")
+    found("comment", { slug: "a", author: "ann" }, "comment:a/ann")
+
+    // Page b has no comment, so it has no author, and no info agrees with it.
+    expect(currentTasks()).toEqual([
+      "build.each 1 slug=a author=ann: page:a:ann:info:ann",
+      "build.each 1 slug=b: page:b:undefined:-",
+    ])
+
+    // A comment by an author with no info: info is undefined, and author stays.
+    found("comment", { slug: "b", author: "cy" }, "comment:b/cy")
+    expect(currentTasks()).toEqual([
+      "build.each 1 slug=a author=ann: page:a:ann:info:ann",
+      "build.each 1 slug=b author=cy: page:b:cy:-",
+    ])
+
+    // An info found later joins the sets of its author.
+    found("info", { author: "cy" }, "info:cy")
+    expect(currentTasks()).toEqual([
+      "build.each 1 slug=a author=ann: page:a:ann:info:ann",
+      "build.each 1 slug=b author=cy: page:b:cy:info:cy",
+    ])
+
+    gone("comment", { slug: "a", author: "ann" })
+    gone("comment", { slug: "b", author: "cy" })
+    expect(currentTasks()).toEqual(["build.each 1 slug=a: page:a:undefined:-", "build.each 1 slug=b: page:b:undefined:-"])
+    for (const author of ["ann", "bob", "cy"]) {
+      gone("info", { author })
+    }
+    gone("page", { slug: "a" })
+    gone("page", { slug: "b" })
+    expect(currentTasks()).toEqual([])
+    expect(taskMaterializer.joinKeyCount).toBe(0)
+  })
+
+  test("a matcher with no ON var joins each set with each of its matches, as LEFT JOIN ON TRUE", () => {
+    const { taskMaterializer, found, gone, currentTasks } = materialize({
+      matchersByName: { page: new PathMatcher("page:", ["slug"]), tag: new PathMatcher("tag:", ["tag"]) },
+      required: ["page"],
+      *tasks(vars) {
+        yield new Task({ id: `page:${vars.slug}:${vars.tag}`, run: async () => {} })
+      },
+    })
+    found("page", { slug: "a" }, "page:a")
+    found("page", { slug: "b" }, "page:b")
+    expect(currentTasks()).toEqual(["build.each 1 slug=a: page:a:undefined", "build.each 1 slug=b: page:b:undefined"])
+
+    found("tag", { tag: "x" }, "tag:x")
+    found("tag", { tag: "y" }, "tag:y")
+    expect(currentTasks()).toEqual([
+      "build.each 1 slug=a tag=x: page:a:x",
+      "build.each 1 slug=a tag=y: page:a:y",
+      "build.each 1 slug=b tag=x: page:b:x",
+      "build.each 1 slug=b tag=y: page:b:y",
+    ])
+
+    gone("tag", { tag: "x" })
+    gone("tag", { tag: "y" })
+    gone("page", { slug: "a" })
+    gone("page", { slug: "b" })
+    expect(currentTasks()).toEqual([])
+    expect(taskMaterializer.joinKeyCount).toBe(0)
+  })
+
+  test("new data of a match in one of two branches calls tasks one time, for its set only", () => {
+    const made: string[] = []
+    const { found } = materialize({
+      matchersByName: { page: new PathMatcher("page:", ["slug"]), review: new PathMatcher("review:", ["slug", "reviewer"]) },
+      required: ["page"],
+      *tasks(vars, matched) {
+        made.push(`${vars.reviewer}: ${matched.review?.data.id}`)
+        yield new Task({ id: `page:${vars.slug}:${vars.reviewer}`, run: async () => {} })
+      },
+    })
+    found("page", { slug: "a" }, "page:a")
+    found("review", { slug: "a", reviewer: "ann" }, "review:a/ann")
+    found("review", { slug: "a", reviewer: "bob" }, "review:a/bob")
+
+    made.length = 0
+    found("review", { slug: "a", reviewer: "bob" }, "review:a/bob#2")
+
+    expect(made).toEqual(["bob: review:a/bob#2"])
+  })
+
+  test("a later matcher that agrees with the var of an earlier one joins the same set", () => {
+    const { taskMaterializer, found, gone, currentTasks } = materialize({
+      matchersByName: {
+        page: new PathMatcher("page:", ["slug"]),
+        review: new PathMatcher("review:", ["slug", "reviewer"]),
+        rating: new PathMatcher("rating:", ["slug", "reviewer"]),
+      },
+      required: ["page"],
+      *tasks(vars, matched) {
+        yield new Task({ id: `page:${vars.slug}:${vars.reviewer}:${matched.rating?.data.id ?? "-"}`, run: async () => {} })
+      },
+    })
+    found("page", { slug: "a" }, "page:a")
+    found("review", { slug: "a", reviewer: "ann" }, "review:a/ann")
+    found("review", { slug: "a", reviewer: "bob" }, "review:a/bob")
+    found("rating", { slug: "a", reviewer: "bob" }, "rating:a/bob")
+    expect(currentTasks()).toEqual([
+      "build.each 1 slug=a reviewer=ann: page:a:ann:-",
+      "build.each 1 slug=a reviewer=bob: page:a:bob:rating:a/bob",
+    ])
+
+    // With no review, reviewer has no value, so no rating agrees: rating is undefined.
+    gone("review", { slug: "a", reviewer: "ann" })
+    gone("review", { slug: "a", reviewer: "bob" })
+    expect(currentTasks()).toEqual(["build.each 1 slug=a: page:a:undefined:-"])
+
+    gone("rating", { slug: "a", reviewer: "bob" })
+    gone("page", { slug: "a" })
+    expect(currentTasks()).toEqual([])
+    expect(taskMaterializer.joinKeyCount).toBe(0)
+  })
+})
+
+describe("build.each gives the changes of one matcher event to the build in one step", () => {
+  test("a page found before its review keeps its store record when the review replaces its set, so the next build skips", async () => {
+    const store = new MemoryStore()
+    const page = new Mem("page:a", "A")
+    const review = new Mem("review:a/ann", "5")
+    async function buildOnce() {
+      const build = new Build({ store })
+      // page comes first, so its scan sends the page before the review: the set with no review comes first.
+      build.each({
+        matchersByName: { page: new PathMatcher("page:", ["slug"], [page]), review: new PathMatcher("review:", ["slug", "reviewer"], [review]) },
+        required: ["page"],
+        *tasks(vars, matched) {
+          const inputs: Ref[] = [matched.page.data]
+          if (matched.review !== undefined) {
+            inputs.push(matched.review.data)
+          }
+          yield new Task({ id: `page:${vars.slug}`, inputs, run: async () => {} })
+        },
+      })
+      return build.run()
+    }
+
+    const first = await buildOnce()
+    expect(sortedIds(first.executed)).toEqual(["page:a"])
+
+    const second = await buildOnce()
+    expect(second.executed).toEqual([])
+    expect(sortedIds(second.skipped)).toEqual(["page:a"])
+  })
+
+  test("two sets that swap their task ids in one event do not clash", async () => {
+    const pages = new PathMatcher("page:", ["slug"], [new Mem("page:a", "A"), new Mem("page:b", "B")])
+    // order has no ON var, so its one match joins the set of each page.
+    const orders = new PathMatcher("order:", ["flip"])
+    const build = new Build()
+    const ran: string[] = []
+    build.each({
+      matchersByName: { page: pages, order: orders },
+      required: ["page"],
+      *tasks(vars) {
+        // With no order: a gives "first" and b gives "second". With flip=yes, they swap.
+        const slugOfFirst = vars.flip === "yes" ? "b" : "a"
+        const id = vars.slug === slugOfFirst ? "first" : "second"
+        yield new Task({ id, run: async () => void ran.push(`${id}:${vars.slug}`) })
+      },
+    })
+    await build.run()
+    expect(ran.sort()).toEqual(["first:a", "second:b"])
+
+    ran.length = 0
+    orders.foundArtifact(new Mem("order:yes", "Y"))
+    const later = await build.run()
+
+    expect(later.success).toBe(true)
+    expect(ran.sort()).toEqual(["first:b", "second:a"])
+  })
+})
+
+describe("build.each: one step of task changes for each drain of the event queue", () => {
+  test("a drafts rule fed by the promised outputs of another rule gives the same tasks as with the files there", async () => {
+    // Rule 1 copies each source to an output. Its promised outputs feed rule 2, the drafts rule.
+    const sources = new PathMatcher("src:", ["kind", "slug", "who"], [
+      new Mem("src:page/a/x", "A"),
+      new Mem("src:page/b/x", "B"),
+      new Mem("src:rev/a/ann", "R"),
+    ])
+    const build = new Build()
+    build.each({
+      matchersByName: { source: sources },
+      *tasks(vars) {
+        const out = vars.kind === "page" ? `out:page/${vars.slug}` : `out:rev/${vars.slug}/${vars.who}`
+        yield new Task({ id: `copy:${out}`, outputs: [new Mem(out)], run: async () => {} })
+      },
+    })
+    build.each({
+      matchersByName: { page: new PathMatcher("out:page/", ["slug"]), review: new PathMatcher("out:rev/", ["slug", "who"]) },
+      required: ["page"],
+      *tasks(vars, matched) {
+        // The page with no review is the one draft. Before a review is found, two pages have none.
+        yield new Task({ id: matched.review === undefined ? "draft" : `page:${vars.slug}`, run: async () => {} })
+      },
+    })
+
+    const result = await build.run()
+
+    expect(result.success).toBe(true)
+    expect(sortedIds(result.executed)).toEqual(["copy:out:page/a", "copy:out:page/b", "copy:out:rev/a/ann", "draft", "page:a"])
+  })
+
+  test("a chain of three rules with more events in one drain than sendLimit passes when each pass is under it", async () => {
+    const sources: Mem[] = []
+    for (let i = 0; i < 30; i++) {
+      sources.push(new Mem(`src:${i}`, "S"))
+    }
+    const build = new Build({ sendLimit: 50 })
+    // Each rule promises one output for each match: src -> mid -> out -> done. 90 promised events, 30 in each pass.
+    const stages: [string, string][] = [
+      ["src:", "mid:"],
+      ["mid:", "out:"],
+      ["out:", "done:"],
+    ]
+    for (const [from, to] of stages) {
+      const scanned = from === "src:" ? sources : []
+      build.each({
+        matchersByName: { item: new PathMatcher(from, ["i"], scanned) },
+        *tasks(vars) {
+          yield new Task({ id: `${to}${vars.i}`, outputs: [new Mem(`${to}${vars.i}`)], run: async () => {} })
+        },
+      })
+    }
+
+    const result = await build.run()
+
+    expect(result.success).toBe(true)
+    expect(result.executed.length).toBe(90)
+  })
+
+  test("a build.each that feeds itself through promised outputs stops at the limit of passes", async () => {
+    const turns = new PathMatcher("turn:", ["n"], [new Mem("turn:0", "0")])
+    const build = new Build({ sendLimit: 50 })
+    build.each({
+      matchersByName: { turn: turns },
+      *tasks(vars) {
+        const next = Number(vars.n) + 1
+        yield new Task({ id: `turn:${vars.n}`, outputs: [new Mem(`turn:${next}`)], run: async () => {} })
+      },
+    })
+
+    await expect(build.run()).rejects.toThrow("send limit: 50 passes in one drain, and more task changes wait")
+  })
+
+  test("build.add during the scans of an id that a set of the scans gives rejects run(), and names both groups", async () => {
+    let releaseScan!: () => void
+    const scanReleased = new Promise<void>((resolve) => {
+      releaseScan = resolve
+    })
+    class WaitingMatcher extends PathMatcher {
+      override async scan(signal: AbortSignal): Promise<void> {
+        await super.scan(signal)
+        await scanReleased
+      }
+    }
+    const pages = new WaitingMatcher("page:", ["slug"], [new Mem("page:a", "A")])
+    const build = new Build()
+    build.each({
+      matchersByName: { page: pages },
+      *tasks() {
+        yield new Task({ id: "x", run: async () => {} })
+      },
+    })
+    const running = build.run()
+    // The set of page a has its task x only in the open step of the scans, so add cannot see it.
+    build.add(new Task({ id: "x", run: async () => {} }))
+    releaseScan()
+
+    await expect(running).rejects.toThrow("task 'x' is in two groups: 'build.add x' and 'build.each 1 slug=a'")
   })
 })
 

@@ -571,11 +571,12 @@ describe("build.each errors", () => {
     build.subscribe((event) => {
       if (event.kind === "promised") throw new Error("index is full")
     })
+    // run() sends the promised event of this task before the scans start.
+    // The tasks of build.each come only when the scans return, so they cannot cause the error here.
+    build.add(new Task({ id: "plain", outputs: [new Mem("out:plain")], run: async () => {} }))
     build.each({
       matchersByName: { page: new HangingMatcher(new Mem("page:a", "A")) },
-      *tasks(vars) {
-        yield new Task({ id: `t:${vars.name}`, outputs: [new Mem(`out:${vars.name}`)], run: async () => {} })
-      },
+      *tasks() {},
     })
 
     await expect(build.run()).rejects.toThrow("index is full")
@@ -670,7 +671,7 @@ describe("build.each errors", () => {
         matchersByName: { a: new MemMatcher("a:"), b: new EventMatcher<Mem>(["slug"], []) },
         *tasks() {},
       }),
-    ).toThrow("build.each 1: the matchers ['b'] share no var name with matcher 'a' or its partners")
+    ).toThrow("build.each 1: the required matchers ['b'] share no var name with required matcher 'a' or its required partners")
   })
 
   test("build.each after run() throws", async () => {

@@ -309,7 +309,7 @@ The rules:
 - Each task id is in exactly one group, so `build.add` throws if `build.each` already made a task with that id.
 - `build.add(task)` makes one group for the task id. When you add the same id again, the replacement stays in the same group.
 - `build.each` makes one group for each joined set of matches ([section 10](#10-buildeach-tasks-for-each-matched-artifact)).
-- A subclass of `Build` can call `setTasks(group, tasks)`. It replaces the whole list of the group. It adds each new id, replaces each known id, and removes each id that it does not get again.
+- A subclass of `Build` can call `setTasksOfGroups([{ group, tasks }, ...])`. It replaces the whole list of each group. It adds each new id, replaces each known id, and removes each id that no group of the call gets again.
 - `build.remove(id)` removes the task from its group. The other tasks of the group stay, and the group can get the same id again later.
 - After `build.remove(id)`, a later `build.add` with that id makes a new group. A task that `build.each` made and that you remove comes back only when its match changes, or after `gone` and then `found`.
 - A group is an object, a `TaskGroup`. Its label is only for error messages. Two groups with the same label are two different groups. Thus two parts of your code cannot share a group only because they use the same label.
@@ -364,7 +364,7 @@ After `build.run()` starts, a new task looks for its producers when the current 
 To make sure that a consumer waits for its producer, use one of these ways:
 
 - Add the producer first.
-- Give the producer and the consumer in one `setTasks` call.
+- Give the producer and the consumer in one `setTasksOfGroups` call.
 - Add the producer from a subscriber, when it gets the `promised` event of the consumer.
 
 Adding both in the same synchronous code also works:
@@ -616,7 +616,7 @@ dapat sends a `withdrawn` event for each declared output when it removes the tas
 
 For one output of one task, a subscriber gets the events in this order: `promised`, then `produced` or `deleted` for each report of the task, then `withdrawn` if the task leaves the build. A subscriber gets no `produced` or `deleted` event before the `promised` event, and no event after the `withdrawn` event. A task that you remove before the first `build.run()` sends no events.
 
-Each `add`, `remove`, and `setTasks` compares the old and the new outputs of each task id that it changes. One call puts all its `withdrawn` events on the queue before any `promised` event. Thus an output that moves from one task to another in one call is withdrawn before it is promised again. Each output is promised one time, even if a task declares it two times. For the order across calls, see [The event queue](#the-event-queue).
+Each `add`, `remove`, and `setTasksOfGroups` step compares the old and the new outputs of each task id that it changes. One call puts all its `withdrawn` events on the queue before any `promised` event. Thus an output that moves from one task to another in one call is withdrawn before it is promised again. Each output is promised one time, even if a task declares it two times. For the order across calls, see [The event queue](#the-event-queue).
 
 Delivery is synchronous. dapat calls each subscriber in the order that it subscribed, and it waits for each call to return. Thus, when `ctx.produced` returns, each task that a subscriber added is already in the build. A subscriber must not return a promise. If it returns one, dapat does not wait for it: the send fails with `subscriber returned a promise; subscribers must be synchronous`, and `build.run()` rejects with that error ([Subscriber errors](#subscriber-errors)). If the promise then rejects, dapat drops that rejection, because it keeps only the first error.
 
@@ -688,9 +688,9 @@ try {
 
 ### The event queue
 
-dapat keeps one queue of events for the build. A call that changes the state first changes the state, and then puts its events at the end of the queue. These calls are `add`, `remove`, `setTasks`, `ctx.produced`, `ctx.deleted`, the end of a task, and the start of the first `build.run()`. If no drain is in progress, the call then drains the queue: it sends one event at a time to every subscriber, until the queue is empty. The call returns after the drain.
+dapat keeps one queue of events for the build. A call that changes the state first changes the state, and then puts its events at the end of the queue. These calls are `add`, `remove`, a `setTasksOfGroups` step, `ctx.produced`, `ctx.deleted`, the end of a task, and the start of the first `build.run()`. If no drain is in progress, the call then drains the queue: it sends one event at a time to every subscriber, until the queue is empty. The call returns after the drain.
 
-A subscriber that changes tasks during a send does not start a new drain. Its events go at the end of the queue. The current event first reaches every subscriber, and then the new events follow. Thus every subscriber gets every event in the same order, and that order is the order of the state changes.
+A subscriber that changes tasks during a send does not start a new drain. Its events go at the end of the queue. The task changes of `build.each` during a drain wait in an open step until the queue is empty. Then the build applies them as one change, and their events make one more pass over the queue ([`setTasksOfGroups`](#class-build)). The current event first reaches every subscriber, and then the new events follow. Thus every subscriber gets every event in the same order, and that order is the order of the state changes.
 
 An event can be stale when it arrives. Then its correction always comes later in the queue. For example, task `t` declares `x`. Subscriber 1 replaces `t` with a task that declares `y` when it gets `promised x by t`. Both subscribers get these events, in this order:
 
@@ -703,14 +703,19 @@ produced y by t
 
 Subscriber 2 gets `promised x by t` after `t` stopped declaring `x`, and then `withdrawn x by t`. A subscriber that applies every event in order ends with the true state. Do not act on one event in a way that a later event cannot undo.
 
-**The send limit.** During one drain, subscribers can cause at most 10,000 events (`SEND_LIMIT`). The limit counts only the events that subscribers cause during the drain. It does not count the events of the call that started the drain. Thus a `setTasks` call or a first `build.run()` with more than 10,000 outputs does not reach it. To change the limit, use `new Build({ sendLimit })`. The value must be a positive integer. You cannot turn the limit off.
+**The send limit.** A drain sends the queue in passes. The first pass sends the events of the call that started the drain. When `build.each` has task changes from a pass, the build applies them as one step at the end of the pass, and their events make the next pass ([`setTasksOfGroups`](#class-build)). A drain with no change of `build.each` has one pass. `sendLimit` (default 10,000, `SEND_LIMIT`) limits two things:
 
-The limit counts all events that subscribers cause in one drain, also correct ones. For example, a subscriber adds one task for each `promised` event. On a first `build.run()` with more than `sendLimit` outputs, the start of the run sends more than `sendLimit` `promised` events in one drain, and the subscriber causes one more `promised` event for each of them. That build reaches the limit. Set a higher `sendLimit` for such a build.
+- **The events that subscribers cause in one pass.** The limit does not count the events that started the pass: the events of the call that started the drain, or the events of the step that the build applied before the pass. Thus a `setTasksOfGroups` step, a first `build.run()`, or a pipeline of several `build.each` calls with more than 10,000 outputs does not reach it.
+- **The passes of one drain.** A `build.each` that feeds itself, for example a task that declares `turns/<n+1>.txt` for the match `turns/<n>.txt`, makes one pass for each round. At the limit, the drain stops with the error `send limit: 10000 passes in one drain, and more task changes wait; a build.each can feed itself`.
+
+To change the limit, use `new Build({ sendLimit })`. The value must be a positive integer. You cannot turn the limit off.
+
+The limit counts all events that subscribers cause in one pass, also correct ones. For example, a subscriber adds one task for each `promised` event. On a first `build.run()` with more than `sendLimit` outputs, the start of the run sends more than `sendLimit` `promised` events in one pass, and the subscriber causes one more `promised` event for each of them. That build reaches the limit. Set a higher `sendLimit` for such a build.
 
 The limit stops a subscriber that undoes each change that it sees. For example, a subscriber removes a task on `promised` and adds it again on `withdrawn`. Then the queue never becomes empty. At the limit, the drain stops with this error:
 
 ```text
-send limit: subscribers caused 10000 events in one drain, and more wait; the last sent was 'promised x by t'
+send limit: subscribers caused 10000 events in one pass of a drain, and more wait; the last sent was 'promised x by t'
 ```
 
 dapat handles this error as a subscriber error: `build.run()` rejects with it.
@@ -824,28 +829,144 @@ If `Templates` sends `gone` for `{ lang: "fr" }`, `build.each` removes `page:fr/
 `build.each` joins the matches of its matchers like a database join. These are the parts:
 
 - A **shared var name** is a var name that two matchers both have. In the example, `lang`.
-- A **joined set** has one matched artifact of each matcher. Each shared var name has the same value in all of them. Every matcher must have a match in the set. A page with no template of its `lang` is in no set.
-- `vars` of a joined set holds all the vars of all its matched artifacts. The order is the order of the names in `matchersByName`, and then the `varNames` order of each matcher. A var name comes one time, at its first place.
-- `matched.<name>` is the matched artifact of the matcher `<name>`, with the data type of that matcher.
+- A **joined set** has one matched artifact of each matcher. Each shared var name has the same value in all of them. Every matcher must have a match in the set, unless it is not in `required` ([`required`](#required-matchers-that-a-set-can-do-without)). A page with no template of its `lang` is in no set.
+- `vars` of a joined set holds all the vars of all its matched artifacts. The order is the order of the names in `matchersByName`, and then the `varNames` order of each matcher. A var name comes one time, at its first place. A var of a matcher that is not required is not in `vars` when the set has no match of it ([`required`](#required-matchers-that-a-set-can-do-without)).
+- `matched.<name>` is the matched artifact of the matcher `<name>`, with the data type of that matcher. It is `undefined` for a matcher that is not required and has no match in the set.
 - Each joined set has one task group. Its label is `build.each <number> <var name>=<var value> ...`, in the order of `vars`.
 
-With three matchers, each pair joins on the var names that the pair shares. For example, `page` has `lang` and `slug`, `template` has `lang`, and `review` has `lang` and `slug`. Then each page gets the template of its `lang` and the review of its `lang` and `slug`. A page with no review is in no set.
+With three matchers, each pair joins on the var names that the pair shares. For example, `page` has `lang` and `slug`, `template` has `lang`, and `review` has `lang` and `slug`. Then each page gets the template of its `lang` and the review of its `lang` and `slug`. A page with no review is in no set, unless `review` is not in `required`.
 
 A matcher does not need to share a var name with every other matcher. It needs to share one with at least one other matcher, so that all the matchers form one connected group. `template` with `lang`, `page` with `lang` and `slug`, and `author` with `slug` form one group: `page` connects the other two.
 
 If the matchers do not form one connected group, `build.each` throws. Without a shared var name, each match of one group would join with each match of the other group, and the number of tasks would be the product of the two. Example: `page` has only `slug`, and `template` has only `lang`:
 
 ```
-build.each 1: the matchers ['template'] share no var name with matcher 'page' or its partners; each matcher must share a var name with another matcher
+build.each 1: the required matchers ['template'] share no var name with required matcher 'page' or its required partners; each required matcher must share a var name with another required matcher, and a matcher that is not required does not connect them
 ```
 
-One matcher alone is always valid. Each of its matches is a joined set with one member. A matcher with no var names shares no var, so it fails this check when the `build.each` has another matcher.
+One matcher alone is always valid. Each of its matches is a joined set with one member. A required matcher with no var names shares no var, so it fails this check when the `build.each` has another required matcher.
 
 `build.each` keeps **indexes** for each matcher. An index maps the values of some var names to the matches that have them. A matcher has one index for each set of var names that the join looks it up by. In the example, `page` has an index by `lang`. When one match changes, `build.each` looks up its partners in these indexes. It does not scan all the matches again. So the join costs one index lookup for each other matcher, and the work for each partner that it finds.
 
-The build itself has a cost that grows with all its tasks. After each change of tasks, it checks every task to see which one can start. So one changed template among many pages can still take a long time in a large build. `build.add` has the same cost. `bun bench/join.ts` measures both.
+The build itself has a cost that grows with all its tasks. After each change of tasks, it checks every task to see which one can start. `build.each` gives all the changes of one step (the scans, or one pass of a drain) as one change ([Steps of task changes](#steps-of-task-changes)), so one changed template among many pages is one check. Each `build.add` is one change, so many `build.add` calls during a run cost more. `bun bench/join.ts` measures both.
 
 A matcher event that comes while `build.each` handles another one waits. It comes from `tasks`, or from a subscriber of the events of the change. `build.each` handles the waiting events in order, after the current one. Each `build.each` call thus sees each event alone. The tasks still exist before the outermost `send` of the matcher returns.
+
+### Steps of task changes
+
+`build.each` does not change the tasks of the build at once. It gives its changes to an open step ([`setTasksOfGroups`](#class-build)), and the build applies the step later, as one change:
+
+- During the scans of the first `build.run()`, all the changes until the last scan returns are one step.
+- After that, all the changes of one pass over the event queue are one step. The events that the step makes, for example the `promised` events of its new tasks, then make the next pass and the next step. So when the outputs of one `build.each` feed another `build.each`, the second one gets all of them before its changes are applied.
+- A matcher event that your code sends outside a drain, for example from a file watcher, is one step.
+
+So a task id can move from one set to another set in one step. For example, take the review example in [`required`](#required-matchers-that-a-set-can-do-without), but with a task id that does not hold `vars.reviewer`, such as `page:${vars.lang}/${vars.slug}`. Then the task `page:en/hello` of the set with no review moves to the set `reviewer=ann` when the review is found. The build treats this as a replacement: the task keeps its store record, and the next build can skip it. Two sets can also swap their task ids in one step. The rule that two sets cannot give one task id applies after the step. Thus the order in which the scans find the pages and the reviews does not change the result of the first run: a set that exists only for a while during the scans never gets its tasks. Matches that come in separate steps after the scans can still pass through such a set ([Limits](#13-limits)).
+
+### `required`: matchers that a set can do without
+
+By default, a joined set needs a match of each matcher. Sometimes a task can use a thing when it exists, and work without it when it does not. For example, a page uses its reviews when they exist. Put the names of the matchers that each set must have in `required`:
+
+```ts
+build.each({
+  matchersByName: { page: new Pages(), review: new Reviews() },
+  required: ["page"],
+  *tasks(vars, matched) {
+    const name = `${vars.lang}/${vars.slug}.${vars.reviewer ?? "nobody"}`
+    const inputs: Ref[] = [matched.page.data]
+    if (matched.review !== undefined) {
+      inputs.push(matched.review.data)
+    }
+    yield new Task({ id: `page:${name}`, inputs, outputs: [new FileArtifact(`site/${name}.html`)], run: async () => {} })
+  },
+})
+```
+
+`Pages` is the matcher of [the first example](#example-pages-joined-to-a-template), with the `varNames` `lang` and `slug`. `Reviews` is a matcher like `Templates`, with the `varNames` `lang`, `slug`, and `reviewer`, that finds `reviews/<lang>/<slug>/<reviewer>.json`. `review` is not required. It joins each page like a LEFT JOIN in SQL:
+
+- A page with reviews has one joined set for each of its reviews.
+- A page with no review has one joined set. In it, `matched.review` is `undefined`, and `vars.reviewer` is `undefined`.
+
+With these files:
+
+```
+content/en/about.md
+content/en/hello.md
+reviews/en/about/ann.json
+reviews/en/about/bob.json
+```
+
+`build.each` makes three joined sets:
+
+| Joined set | `vars` | `matched.page` | `matched.review` |
+| --- | --- | --- | --- |
+| `build.each 1 lang=en slug=about reviewer=ann` | `{ lang: "en", slug: "about", reviewer: "ann" }` | `content/en/about.md` | `reviews/en/about/ann.json` |
+| `build.each 1 lang=en slug=about reviewer=bob` | `{ lang: "en", slug: "about", reviewer: "bob" }` | `content/en/about.md` | `reviews/en/about/bob.json` |
+| `build.each 1 lang=en slug=hello` | `{ lang: "en", slug: "hello" }` | `content/en/hello.md` | `undefined` |
+
+Each set has its own task group, and the label has each var that has a value. Two sets cannot give one task id, so put `vars.reviewer` in the task id, as the example does.
+
+Without `required`, `hello` has no review, so it has no set and no task.
+
+The sets change when the reviews change. Start with `content/en/hello.md` and no review:
+
+1. The set `lang=en slug=hello` has `matched.review === undefined`.
+2. `Reviews` sends `found` for `{ lang: "en", slug: "hello", reviewer: "ann" }`. `build.each` removes the set with no review, and its tasks. Then it adds the set `reviewer=ann`.
+3. `Reviews` sends `found` for `reviewer: "bob"`. `build.each` adds the set `reviewer=bob`. The set `reviewer=ann` does not change.
+4. `Reviews` sends `gone` for `reviewer: "bob"`. `build.each` removes the set `reviewer=bob`.
+5. `Reviews` sends `gone` for `reviewer: "ann"`. `build.each` removes the set `reviewer=ann`, and adds the set with no review again.
+
+A review of a page that does not exist makes no set. It waits, and joins the page when the page is found.
+
+A matcher that is not required and has only var names that the required matchers have is simpler. Each set has one match of it, or none. Its found and gone keep the set, and replace its tasks in the same task group. For example, a `branch` matcher with only `lang` gives each page the branch of its `lang`, or `undefined`. A matcher with no var names is in every set.
+
+On the first run, `tasks` can run more than one time for one set, for example when the scan finds the page before its review. Each set ends with one task list, and no task starts before the scans finish.
+
+`build.each` gives its task changes to the build in steps ([Steps of task changes](#steps-of-task-changes)). If a task id does not hold `vars.reviewer`, for example `page:${vars.lang}/${vars.slug}`, the task can move from the set with no review to the set `reviewer=ann` in one step, and keep its store record.
+
+#### Several matchers that are not required: the order of the names
+
+The matchers that are not required join one after the other, in the order of their names in `matchersByName`, as SQL does with several LEFT JOINs.
+
+The **ON vars** of a matcher that is not required are its var names that a required matcher or an earlier matcher that is not required has. `build.each` finds them one time, when you call it. A match joins a set only when the set has a value for each ON var, and the values are equal. Each match that joins makes one set, and adds its other vars to it. If no match joins, the matcher is `undefined` in the set, and it adds no var.
+
+A set that has no value for an ON var joins no match, as NULL equals nothing in SQL. Example: `page` has `slug` and is required. `comment` has `slug` and `author`. `info` has `author`. Both are not required, in the order `{ page, comment, info }`. The ON vars of `info` are `author`, from `comment`. There is one info, for ann. If two earlier matchers both have an ON var, a set has only one value for it, because the later matcher joined on it.
+
+| Page | Its comments | Its joined sets |
+| --- | --- | --- |
+| `a` | one, by ann | one set: `author=ann`, `matched.info` is the info of ann |
+| `b` | none | one set: `author` is `undefined`, and `matched.info` is `undefined`. No info joins, because the set has no author. |
+
+When two of them have different var names of their own, the sets are each pair of their matches. A page with 2 reviews (`reviewer`) and 2 comments (`commenter`) has 4 sets. A page with 2 reviews and no comment has 2 sets, with `matched.comment === undefined`.
+
+When two of them share a var name that no required matcher has, the order of the names changes the sets. Example: `review` and `rating` both have `lang`, `slug`, and `reviewer`, and both are not required. The ON vars of the second one include `reviewer`.
+
+| Page | Its reviews and ratings | `{ page, review, rating }` | `{ page, rating, review }` |
+| --- | --- | --- | --- |
+| `en/about` | a review by ann, a rating by bob | one set: `reviewer=ann`, `matched.review` is the review of ann, `matched.rating` is `undefined` | one set: `reviewer=bob`, `matched.rating` is the rating of bob, `matched.review` is `undefined` |
+| `en/hello` | a rating by bob, no review | one set: `reviewer` is `undefined`, both are `undefined`. The rating does not join, because the set has no reviewer. | one set: `reviewer=bob`, `matched.rating` is the rating of bob, `matched.review` is `undefined` |
+
+In the first order, `review` joins first. It sets `reviewer` to `ann` for `en/about`, and the rating of bob does not agree. For `en/hello`, it sets no `reviewer`, so no rating joins. In the second order, `rating` joins first and sets `reviewer` to `bob`. **So if you change the order of the names, the tasks can change.** Put the matcher that sets the var first.
+
+A matcher that is not required and has no ON vars joins each set with each of its matches, as `LEFT JOIN ... ON TRUE` does in SQL. For example, a `tag` matcher with only `tag`, after `page` with `slug`: 2 pages and 2 tags make 4 sets. With no tag, each page has one set with `matched.tag === undefined`. This is valid, but each found and gone of a tag changes the sets of every page.
+
+#### The rules
+
+- **If you leave `required` out, every matcher is required.** This is the behavior of a `build.each` with no `required`.
+- **The required matchers must form one connected group by shared var names.** A matcher that is not required does not connect them.
+- **`required` must name at least one matcher, and each name must be a name in `matchersByName`.** A set needs a required match, so `required: []` is an error.
+
+#### Types
+
+The `vars` argument of `tasks` has the type `JoinedVars<M, R>`:
+
+- If every matcher is required, for example when you leave `required` out, it is `Vars`. Each var is a `string`.
+- Else it is `Readonly<Record<string, string | undefined>>`. A var of a matcher that is not required is `undefined` in a set with no match of it. TypeScript does not know the var names, so **when you give `required`, a var of a required matcher also needs a check or `!`**, for example `vars.lang!`. In a template string, as in `` `page:${vars.slug}` ``, you need no check.
+
+TypeScript knows which matched artifacts can be `undefined`, when `required` is one literal list. `matched.page` is a `MatchedArtifact`. `matched.review` is a `MatchedArtifact` or `undefined`, so you must check it before you read `matched.review.data`. If `required` has a wider type, for example `cond ? ["page", "review"] : ["page"]` or a variable of type `("page" | "review")[]`, TypeScript treats every name in that type as required. Then check `matched` and `vars` for `undefined` yourself. TypeScript does not check an empty list. `build.each` checks it when you call it.
+
+#### Cost
+
+`build.each` keeps an index of the required joins for each matcher that is not required, by the var names that it shares with the required matchers. A found or gone of such a match looks up its required joins in that index. For each one, it runs the left joins again over the matches of that join only, and changes only the sets that are different. A matcher that is not required and shares no var name with the required matchers, for example `info` or `tag` above, is in the index entry of every required join. So each of its found and gone events runs the left joins of every required join again.
 
 ### Example with one matcher
 
@@ -912,8 +1033,8 @@ const result = await build.run()
 With `posts/hello.md` and `posts/bye.md`, the first run does these steps:
 
 1. `Posts.scan` reads the folder and sends `found` for `{ slug: "hello" }` and `{ slug: "bye" }`.
-2. For each matched artifact, `build.each` calls `tasks`, and the build adds `page:hello` and `page:bye`.
-3. The scan returns. The build starts both tasks.
+2. For each matched artifact, `build.each` calls `tasks`.
+3. The scan returns. The build adds `page:hello` and `page:bye` in one step, and starts both tasks.
 
 The next time the program runs with no change, both tasks skip. If you add a task with `build.add` that declares the output `posts/news.md`, `Posts` gets its `promised` event and sends `found` for `{ slug: "news" }`. `build.each` adds `page:news`, and `page:news` waits for the task that writes the post.
 
@@ -990,6 +1111,7 @@ build.each({
 ```
 
 - `matchersByName` names the matchers. The names are yours. `tasks` gets each matched artifact under the name of its matcher, as `matched.post`. With two or more matchers, they join on their shared var names ([Joins on shared var names](#joins-on-shared-var-names)).
+- `required` (optional) names the matchers that each joined set must have a match of. If you leave it out, every matcher is required ([`required`](#required-matchers-that-a-set-can-do-without)).
 - `tasks` gets the vars and the matched artifacts by name of one joined set. It returns the tasks for that set. Write it as a generator (`*tasks`), so it can yield no task, one task, or many tasks.
 
 `tasks` can yield more than one task for a match:
@@ -1012,9 +1134,10 @@ The first `build.run()` does these steps:
 
 1. It sends a `promised` event for each output of each task that you added with `build.add`. Matchers get them, so `build.each` can make tasks for them.
 2. It starts the scan of each matcher, all at the same time, and waits until every scan has returned.
-3. It starts the tasks.
+3. It gives the build all the task changes of `build.each` since step 1, as one step ([`setTasksOfGroups`](#class-build)). A clash of two task ids is an error only if it is still there at this point. The build sends the `promised` events of the step, so the matchers get them now. The task changes that these events cause are one step for each pass over the event queue, until no change is left.
+4. It starts the tasks.
 
-No task starts during a scan. A scan that is still running could find a thing whose task writes the input of another task.
+No task starts during a scan. A scan that is still running could find a thing whose task writes the input of another task. A scan that never returns thus also makes no task of `build.each` exist.
 
 A later `build.run()` on the same build does not scan again. A `build.run()` that you call while the scans of the first one still run waits for the same scans, and then starts the tasks.
 
@@ -1070,7 +1193,9 @@ An error in `build.each` is fatal for the build, as a subscriber error is. The `
 | Where | Example | What you see |
 | --- | --- | --- |
 | `build.each` | `matchersByName` has no matcher | `build.each` throws |
-| `build.each` | the matchers do not form one connected group by shared var names | `build.each` throws, and names the matchers that do not connect |
+| `build.each` | the required matchers do not form one connected group by shared var names | `build.each` throws, and names the matchers that do not connect |
+| `build.each` | `required` is `[]` | `build.each` throws |
+| `build.each` | `required` has a name that is not in `matchersByName` | `build.each` throws, and names it |
 | `build.each` | one matcher object is under two names | `build.each` throws |
 | `build.each` | you call it after `build.run()` | `build.each` throws |
 | `build.each` | one of its matchers is used by another `Build` | `build.each` throws, and names the matcher |
@@ -1082,7 +1207,7 @@ An error in `build.each` is fatal for the build, as a subscriber error is. The `
 Two limits remain:
 
 - **A scan that never returns makes `build.run()` wait forever.** `build.run()` takes no signal, and the scan signal aborts only when the build fails.
-- **A `build.each` that feeds itself is not bounded yet.** For example, a task reads `turns/<n>.txt` and writes `turns/<n+1>.txt`. Each produced file makes a new task, and the run does not end. A task limit comes in a later version.
+- **A `build.each` that feeds itself while its tasks run is not bounded yet.** For example, a task reads `turns/<n>.txt` and writes `turns/<n+1>.txt`, and a matcher finds the file when the task calls `ctx.produced`. Each produced file makes a new task, and the run does not end. A task limit comes in a later version. A task that declares `turns/<n+1>.txt` as an output feeds the rule in one drain, and the limit of passes stops it ([The event queue](#the-event-queue)).
 
 ## 11. Built-in artifacts
 
@@ -1255,6 +1380,7 @@ A new checkout changes the modification time of each file. With the default `sta
 - **The skip rule ignores the order and the repeats of the inputs.** The record keeps the stamps by id. So a task that ran with the inputs `[a, b]` skips with `[b, a]`, and a task that ran with `[a]` skips with `[a, a]`. If the result of a task depends on the order of its inputs, put the order in the task id, or force the task to run ([section 12.1](#121-force-tasks-to-run-again)).
 - **A key pattern needs text between two vars.** `KeyPattern` (in `src/pattern.ts`, not exported yet) throws when two vars have nothing between them, for example `v/<lang><slug>.md`. A key such as `v/enintro.md` has more than one split. The error names the pattern and the two vars. Put text between the vars, for example `v/<lang>-<slug>.md`. A `*` between two vars is allowed, for example `v/<lang>*<slug>.md`. Then the first var takes the most text that it can.
 - **A var that comes twice in one segment can be slow on long names.** For example, `<a>-<b>-<c>-<a>` tries each split of the segment. A 255-character file name that almost matches takes about 10 ms. A 1000-character key can take seconds. Each segment without such a repeated var keeps its first split, so it stays fast.
+- **Matches that come in separate steps after the scans can pass through a state in between.** For example, a file watcher sends one file at a time, or two tasks that write a page and its review end at different times. Then `build.each` can make a set with `matched.review === undefined` for a while, and later replace it. This is correct if each set gives its own task ids and outputs. It is not safe when the id or an output depends on a matcher that is not required being `undefined`, and other sets can give the same id. For example, the drafts rule gives `draft:${vars.lang}` for the page of a lang with no review. In the state in between, two pages of one lang have no review, so two sets give `draft:en`, and `build.run()` rejects. Or the id moves between sets in two steps, and its store record is deleted, so the task runs again on the next build. Two passes of one drain are separate steps too. For example, rule 1 promises the pages, and rule 1b promises the reviews only when it gets those page events. Then the drafts rule gets the pages in pass 1 and the reviews in pass 2, and it passes through the same state in between. The safe pattern: put every var of the required matchers in each task id and each output, for example `draft:${vars.lang}/${vars.slug}`.
 - **No timeout and no concurrency limit.** All ready tasks start at the same time. Add limits and timeouts in your task code ([section 12.2](#122-limit-parallel-work)), and use `ctx.signal` to stop work.
 - **Bun only.** The adapters use Bun APIs.
 
@@ -1276,11 +1402,11 @@ new Build(opts?: { store?: Store; sendLimit?: number })
 
 | Member | Description |
 | --- | --- |
-| `add(task: Task): void` | Adds a task. If a task with the same id exists, replaces it (see [section 8](#replacement)). If `run()` has started, sends a `promised` event for each declared output, and the task starts at once. Does not throw when a subscriber throws ([section 9](#subscriber-errors)). Throws if another task already declares one of its exact outputs, if the task declares one output twice, or if another task group has that id ([Task groups](#task-groups)). Throws before it changes anything. |
+| `add(task: Task): void` | Adds a task. If a task with the same id exists, replaces it (see [section 8](#replacement)). If `run()` has started, sends a `promised` event for each declared output, and the task starts at once. Does not throw when a subscriber throws ([section 9](#subscriber-errors)). Throws if another task already declares one of its exact outputs, if the task declares one output twice, or if another task group has that id ([Task groups](#task-groups)). Throws before it changes anything. It is one step of its own, also while the build keeps a step open for `build.each` ([`setTasksOfGroups`](#class-build)). So during the scans of the first `run()`, `add` cannot see the sets of `build.each`, which wait in the open step. If it gives an id of such a set, the clash shows when the scans return, and `run()` rejects and names both groups. |
 | `remove(id: string): void` | Removes a task. Aborts it if it is running and sends a `withdrawn` event for each declared output. Does not throw when a subscriber throws. Starts to delete its store record. Does not wait for the delete, but `run()` does. A delete error goes into `result.errors`. Does nothing if the id is not known. The other tasks of the same task group stay. |
 | `subscribe(listener: (event: ArtifactEvent) => void): void` | From `Emitter`. Calls `listener` synchronously for each artifact event, in the order of the event queue. Does not replay earlier events. See [section 9](#9-subscribe-to-artifact-events). |
-| `protected setTasks(group: TaskGroup, tasks: readonly Task[]): void` | Makes `tasks` the tasks of `group` ([Task groups](#task-groups)). Adds each new id, replaces each known id, and removes each id that `group` had before and does not get now. Changes all state first, then puts the events on the queue: all `withdrawn` events of the call first, then the `promised` events, by id in list order. A dropped task ends as `cancelled` with the reason `"removed"` if it had not finished. Throws and changes nothing if another group has one of the ids, if `tasks` has one id two times, or if two tasks declare one exact output. `add(task)` calls it with one group for each task id. `build.each` calls it with one group for each match. A subclass of `Build` can call it with its own `new TaskGroup(label)`. |
-| `each<M extends Record<string, AnyMatcher>>(config: TaskMaterializerConfig<M>): void` | Makes tasks for each joined set of matched artifacts ([section 10](#10-buildeach-tasks-for-each-matched-artifact)). Subscribes to each matcher in `matchersByName`, joins their matches on shared var names, and gives the tasks of each joined set through `setTasks`, with one task group for each set, labeled `build.each <number> <var name>=<var value> ...`. The build sends each artifact event to `matcher.receiveArtifactEvent`, one time for each matcher. An error in `tasks` or in a matched artifact is fatal for the build, like a subscriber error. Throws if `matchersByName` has no matcher, if one matcher object is under two names, if its matchers do not form one connected group by shared var names, if `run()` has started, or if another `Build` uses a matcher. |
+| `protected setTasksOfGroups(changes: readonly GroupTasks[]): void` | Makes the tasks of each group in `changes` its new tasks, in one step ([Task groups](#task-groups)). `GroupTasks` is `{ group: TaskGroup; tasks: readonly Task[] }`. Adds each new id, replaces each known id, and removes each id that a group had before and that no group of the step gets now. A task id can move from one group of the step to another group of the step. That is a replacement, as a known id in one group is: the task ends as `cancelled` with the reason `"replaced"` if it had not finished, and its store record stays. A removed task ends as `cancelled` with the reason `"removed"` if it had not finished, and its store record is deleted. Changes all state first, then puts the events on the queue: all `withdrawn` events of the step first, then the `promised` events, by id in list order. Throws and changes nothing if two groups of the step or another group have one id, if a group gets one id two times, if two tasks declare one exact output, or if a group is in `changes` two times. The checks use the state after the whole step. **An open step:** while the first `run()` scans, during each pass of a drain over the event queue, and during each matcher event that comes from outside a drain, the build keeps a step open. Then a call does not throw: its changes join the open step, a later change of a group replaces its earlier one, and the build applies the step when the scans return, when the pass ends, or when the event ends. The events of the applied step make the next pass of the drain. An error then is fatal for the build. `build.each` gives its changes here. `add` never joins an open step. A subclass of `Build` can call it with its own `new TaskGroup(label)`. |
+| `each<M extends Record<string, AnyMatcher>, const R extends keyof M & string = keyof M & string>(config: TaskMaterializerConfig<M, R>): void` | Makes tasks for each joined set of matched artifacts ([section 10](#10-buildeach-tasks-for-each-matched-artifact)). TypeScript gets `R` from `required`. Subscribes to each matcher in `matchersByName`, joins their matches on shared var names, and gives the tasks of each joined set through `setTasksOfGroups`, with one task group for each set, labeled `build.each <number> <var name>=<var value> ...`. All the changes of one pass of a drain over the event queue are one step, and all the changes during the scans of the first `run()` are one step. The build sends each artifact event to `matcher.receiveArtifactEvent`, one time for each matcher. An error in `tasks` or in a matched artifact is fatal for the build, like a subscriber error. Throws if `matchersByName` has no matcher, if one matcher object is under two names, if `required` is empty or has a name that is not in `matchersByName`, if its required matchers do not form one connected group by shared var names, if `run()` has started, or if another `Build` uses a matcher. |
 | `run(): Promise<Result>` | The first time, sends a `promised` event for each output of each task that is in the build, and then runs the scan of each matcher and waits for all of them. A call during the scans waits for the same scans. Then starts every task and resolves when every started task has finished. Does not reject when a task fails. Rejects with the first subscriber error, `build.each` error, scan error, or send-limit error of the build, at once if that error happened before the call ([section 9](#subscriber-errors)). After a scan error, no task starts. |
 
 ### `class TaskGroup`
@@ -1289,7 +1415,7 @@ new Build(opts?: { store?: Store; sendLimit?: number })
 new TaskGroup(label: string)
 ```
 
-A group of tasks for `setTasks` ([Task groups](#task-groups)). The object is the identity. `label` is only for error messages.
+A group of tasks for `setTasksOfGroups` ([Task groups](#task-groups)). The object is the identity. `label` is only for error messages.
 
 ### `class Task`
 
@@ -1482,20 +1608,26 @@ type MatchedArtifactEvent<D extends MatchedData = MatchedData> =
 
 The vars of a matched artifact are its key. A `found` with known vars and new data replaces the match, a `found` with the same artifact ids in the same order does nothing, and a `gone` removes it. One artifact and a list of one artifact are different data. A `gone` with wrong var names makes `build.run()` reject. See [Matched artifacts](#matched-artifacts).
 
-### `type TaskMaterializerConfig<M>` and `type MatchedByName<M>`
+### `type TaskMaterializerConfig<M, R>`, `type MatchedByName<M, R>`, and `type JoinedVars<M, R>`
 
 ```ts
-type TaskMaterializerConfig<M extends Record<string, AnyMatcher>> = {
+type TaskMaterializerConfig<M extends Record<string, AnyMatcher>, R extends keyof M & string = keyof M & string> = {
   matchersByName: M
-  tasks: (vars: Vars, matched: MatchedByName<M>) => Iterable<Task>
+  required?: readonly R[]
+  tasks: (vars: JoinedVars<M, R>, matched: MatchedByName<M, R>) => Iterable<Task>
 }
 
-type MatchedByName<M extends Record<string, AnyMatcher>> = {
-  readonly [K in keyof M]: MatchedArtifact<DataOf<M[K]>>
+type JoinedVars<M extends Record<string, AnyMatcher>, R extends keyof M & string = keyof M & string> =
+  [Exclude<keyof M, R>] extends [never] ? Vars : Readonly<Record<string, string | undefined>>
+
+type MatchedByName<M extends Record<string, AnyMatcher>, R extends keyof M & string = keyof M & string> = {
+  readonly [K in keyof M]: K extends R ? MatchedArtifact<DataOf<M[K]>> : MatchedArtifact<DataOf<M[K]>> | undefined
 }
 ```
 
-`AnyMatcher` is `Matcher<any>`: a matcher of any data type. Each matched artifact has the data type of its own matcher: `DataOf` reads `D` from the matcher type. `matchersByName` must have at least one entry, and its matchers must form one connected group by shared var names. `tasks` gets the vars of one joined set, which hold the vars of all its matches, and each matched artifact under its matcher's name. See [The `build.each` config](#the-buildeach-config).
+`R` is the names in `required`. If you leave `required` out, `R` is every name, so no matched artifact is `undefined`. A matcher that is not in `R` can be `undefined` in `matched`. It left-joins onto the matchers in `R`, after the earlier matchers that are not in `R`, in name order, on its ON vars. Each of its matches that agrees makes its own joined set. `JoinedVars` is `Vars` when every name is in `R`, else `Readonly<Record<string, string | undefined>>`. `required` must name at least one matcher. See [`required`](#required-matchers-that-a-set-can-do-without).
+
+`AnyMatcher` is `Matcher<any>`: a matcher of any data type. Each matched artifact has the data type of its own matcher: `DataOf` reads `D` from the matcher type. `matchersByName` must have at least one entry, and its required matchers must form one connected group by shared var names. `tasks` gets the vars of one joined set, which hold the vars of all its matches (a var of a matcher with no match in the set is `undefined`), and each matched artifact under its matcher's name. See [The `build.each` config](#the-buildeach-config).
 
 ## Filesystem (`dapat/contrib`)
 
