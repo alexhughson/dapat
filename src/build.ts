@@ -5,7 +5,7 @@ import type { Prefix } from "./prefix"
 import { Task, isArtifact, isPrefix, type Context, type Ref } from "./task"
 import type { Store, TaskState } from "./store"
 import { Outcome, Result } from "./result"
-import { Rule, type RuleConfig } from "./rule"
+import { TasksForEachMatch, type TasksForEachMatchConfig } from "./tasks-for-each-match"
 
 export type ArtifactEvent =
   | { kind: "promised"; output: Ref; taskId: string }
@@ -20,7 +20,7 @@ type WaitResult = "ok" | "failed" | "cancelled" | "deadlock"
 /** The default number of events that subscribers can cause during one drain of the event queue. */
 export const SEND_LIMIT = 10_000
 
-// The build that each matcher belongs to. A matcher sends rows to the rules of one build only.
+// The build that each matcher belongs to. A matcher sends its matches to one build only.
 const matcherBuilds = new WeakMap<AnyMatcher, Build>()
 
 // The outputs of no task. Shared, and never changed.
@@ -59,9 +59,9 @@ export class Build extends Emitter<ArtifactEvent> {
   // The first subscriber error or send-limit error. Each later run() rejects with it.
   private fatal: Error | null = null
 
-  // The matchers of every rule, each one time, in the order that the rules named them.
+  // The matchers of every build.each, each one time, in the order of the build.each calls.
   private readonly matchers = new Set<AnyMatcher>()
-  private ruleCount = 0
+  private eachCount = 0
 
   private started = false
   // True while the first run() waits for the scans. No task starts then.
@@ -101,41 +101,41 @@ export class Build extends Emitter<ArtifactEvent> {
   }
 
   /**
-   * Adds a rule. The rule makes tasks from the rows of its matcher.
+   * Makes tasks for each artifact that the matcher finds.
    * Call it before the first run(): that run scans each matcher before any task starts.
    */
-  each<I extends Record<string, AnyMatcher>>(config: RuleConfig<I>): void {
+  each<M extends Record<string, AnyMatcher>>(config: TasksForEachMatchConfig<M>): void {
     if (this.started) {
       throw new Error("build.each must come before the first build.run()")
     }
-    const number = this.ruleCount + 1
-    const rule = new Rule(number, config, (owner, tasks) => this.setTasks(owner, tasks))
-    const matcher = rule.matcher
+    const number = this.eachCount + 1
+    const tasksForEachMatch = new TasksForEachMatch(number, config, (owner, tasks) => this.setTasks(owner, tasks))
+    const matcher = tasksForEachMatch.matcher
     const owner = matcherBuilds.get(matcher)
     if (owner !== undefined && owner !== this) {
-      throw new Error(`rule ${number}: its matcher belongs to another Build; make a new matcher for each Build`)
+      throw new Error(`build.each ${number}: its matcher belongs to another Build; make a new matcher for each Build`)
     }
-    this.ruleCount = number
+    this.eachCount = number
     matcher.subscribe((event) => {
-      // A rule error is fatal, like a subscriber error. The matcher's send never sees it.
+      // An error here is fatal, like a subscriber error. The matcher's send never sees it.
       try {
-        rule.hear(event)
+        tasksForEachMatch.hear(event)
       } catch (error) {
         this.fail(toError(error))
       }
     })
-    // Each matcher hears each artifact event one time, even if several rules use it.
+    // Each matcher gets each artifact event one time, even if several build.each calls use it.
     if (!this.matchers.has(matcher)) {
       matcherBuilds.set(matcher, this)
       this.matchers.add(matcher)
-      this.subscribe((event) => matcher.sendArtifact(event))
+      this.subscribe((event) => matcher.receiveArtifactEvent(event))
     }
   }
 
   /**
    * Makes `tasks` the tasks of `owner`. Adds each new id, replaces each known id,
    * and removes each id that the owner gave before and does not give now.
-   * Rules call it. Throws, with no change, if another owner has one of the ids.
+   * build.each calls it. Throws, with no change, if another owner has one of the ids.
    */
   protected setTasks(owner: string, tasks: readonly Task[]): void {
     this.assertSettable(owner, tasks)
@@ -255,7 +255,7 @@ export class Build extends Emitter<ArtifactEvent> {
       }
       this.push(events)
       this.drain()
-      // A build with no rules starts its tasks in this same call, as before rules existed.
+      // A build with no matchers starts its tasks in this same call, as before build.each existed.
       if (this.matchers.size > 0 && this.fatal === null) {
         this.scans = this.scanAll()
       }

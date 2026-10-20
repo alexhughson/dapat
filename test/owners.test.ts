@@ -3,7 +3,7 @@ import { Build, IdPrefix, MemoryStore, Task } from "../src/index"
 import type { ArtifactEvent } from "../src/index"
 import { Mem } from "./mem"
 
-/** A real build that stands for a rule: it gives tasks under an owner name that it picks. */
+/** A real build that stands for build.each: it gives tasks under an owner name that it picks. */
 class OwnerBuild extends Build {
   give(owner: string, tasks: Task[]): void {
     this.setTasks(owner, tasks)
@@ -276,7 +276,7 @@ describe("task owners", () => {
     const shotA = new Mem("mem:shot/a")
     const shotB = new Mem("mem:shot/b")
     const build = new OwnerBuild()
-    // This subscriber stands for a rule that makes tasks for each page.
+    // This subscriber stands for a build.each that makes tasks for each page.
     build.subscribe((event) => {
       if (event.kind !== "produced") return
       if (event.artifact.id !== "mem:p/1") return

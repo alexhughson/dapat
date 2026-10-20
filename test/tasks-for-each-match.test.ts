@@ -1,13 +1,13 @@
 import { describe, expect, test } from "bun:test"
 import { Build, IdPrefix, Matcher, Task } from "../src/index"
-import type { Artifact, ArtifactEvent, RowData, RowEvent } from "../src/index"
+import type { Artifact, ArtifactEvent, MatchedData, MatchedArtifactEvent } from "../src/index"
 import { Mem } from "./mem"
 
 /**
  * A real matcher over in-memory artifacts: it matches the ids `<prefix><name>`,
  * like a FileMatcher for `<prefix><name>`. Its scan finds the artifacts it was given.
  * It treats a promised or produced artifact as found, and a deleted or withdrawn one as gone.
- * Like the Posts matcher in DOCS.md, it puts a row again for each event of one artifact.
+ * Like the Posts matcher in DOCS.md, it sends `found` again for each event of one artifact.
  */
 class MemMatcher extends Matcher<Mem> {
   readonly varNames = ["name"]
@@ -27,7 +27,7 @@ class MemMatcher extends Matcher<Mem> {
     }
   }
 
-  override sendArtifact(event: ArtifactEvent): void {
+  override receiveArtifactEvent(event: ArtifactEvent): void {
     if (event.kind === "promised" || event.kind === "withdrawn") {
       this.heard.push(`${event.kind} ${event.output.id}`)
       if (!(event.output instanceof Mem)) return
@@ -50,13 +50,13 @@ class MemMatcher extends Matcher<Mem> {
   private foundArtifact(artifact: Mem): void {
     const name = this.nameOf(artifact)
     if (name === null) return
-    this.send({ kind: "put", row: { vars: { name }, data: artifact } })
+    this.send({ kind: "found", matched: { vars: { name }, data: artifact } })
   }
 
   private gone(artifact: Artifact): void {
     const name = this.nameOf(artifact)
     if (name === null) return
-    this.send({ kind: "drop", vars: { name } })
+    this.send({ kind: "gone", vars: { name } })
   }
 
   private nameOf(artifact: Artifact): string | null {
@@ -97,11 +97,11 @@ class DeferredMatcher extends MemMatcher {
   }
 }
 
-/** A matcher whose scan sends a fixed list of row events, in order. */
-class EventMatcher<D extends RowData> extends Matcher<D> {
+/** A matcher whose scan sends a fixed list of matched artifact events, in order. */
+class EventMatcher<D extends MatchedData> extends Matcher<D> {
   constructor(
     readonly varNames: readonly string[],
-    protected readonly events: readonly RowEvent<D>[],
+    protected readonly events: readonly MatchedArtifactEvent<D>[],
   ) {
     super()
   }
@@ -128,9 +128,9 @@ class CatchingMatcher extends EventMatcher<Mem> {
 
 /** A MemMatcher that catches every error of its sends while it hears the build. */
 class QuietMemMatcher extends MemMatcher {
-  override sendArtifact(event: ArtifactEvent): void {
+  override receiveArtifactEvent(event: ArtifactEvent): void {
     try {
-      super.sendArtifact(event)
+      super.receiveArtifactEvent(event)
     } catch {
       // ignores the artifact
     }
@@ -156,7 +156,7 @@ class HangingMatcher extends Matcher<Mem> {
 
   async scan(_signal: AbortSignal): Promise<void> {
     if (this.first !== null) {
-      this.send({ kind: "put", row: { vars: { name: "a" }, data: this.first } })
+      this.send({ kind: "found", matched: { vars: { name: "a" }, data: this.first } })
     }
     await new Promise<void>(() => {})
   }
@@ -185,16 +185,16 @@ function sortedIds(tasks: readonly Task[]): string[] {
   return ids
 }
 
-describe("build.each with one input", () => {
-  test("each scanned row becomes a task", async () => {
+describe("build.each with one matcher", () => {
+  test("each artifact that a scan finds becomes a task", async () => {
     const pageA = new Mem("page:a", "A")
     const pageB = new Mem("page:b", "B")
     const log: string[] = []
     const build = new Build()
     build.each({
-      inputs: { page: new MemMatcher("page:", [pageA, pageB]) },
-      *tasks(vars, input) {
-        yield copyTask(vars.name!, input.page.data, log)
+      matchersByName: { page: new MemMatcher("page:", [pageA, pageB]) },
+      *tasks(vars, matched) {
+        yield copyTask(vars.name!, matched.page.data, log)
       },
     })
 
@@ -204,18 +204,18 @@ describe("build.each with one input", () => {
     expect(sortedIds(result.executed)).toEqual(["copy:a", "copy:b"])
   })
 
-  test("a row can give several tasks", async () => {
+  test("one matched artifact can give several tasks", async () => {
     const page = new Mem("page:a", "A")
     const log: string[] = []
     const build = new Build()
     build.each({
-      inputs: { page: new MemMatcher("page:", [page]) },
-      *tasks(vars, input) {
+      matchersByName: { page: new MemMatcher("page:", [page]) },
+      *tasks(vars, matched) {
         // The data has the type of its matcher, Mem, and not any.
         // @ts-expect-error Mem has no field notAField
-        void input.page.data.notAField
-        yield copyTask(vars.name!, input.page.data, log)
-        yield new Task({ id: `count:${vars.name}`, inputs: [input.page.data], run: async () => {} })
+        void matched.page.data.notAField
+        yield copyTask(vars.name!, matched.page.data, log)
+        yield new Task({ id: `count:${vars.name}`, inputs: [matched.page.data], run: async () => {} })
       },
     })
 
@@ -224,23 +224,23 @@ describe("build.each with one input", () => {
     expect(sortedIds(result.executed)).toEqual(["copy:a", "count:a"])
   })
 
-  test("a put with known vars and new data replaces the tasks of that row, and a drop removes them", async () => {
+  test("found with known vars and new data replaces the tasks of that match, and gone removes them", async () => {
     const matcher = new EventMatcher<Mem>(
       ["name"],
       [
-        { kind: "put", row: { vars: { name: "a" }, data: new Mem("page:a-1", "1") } },
-        { kind: "put", row: { vars: { name: "a" }, data: new Mem("page:a-2", "2") } },
-        { kind: "put", row: { vars: { name: "b" }, data: new Mem("page:b-1", "1") } },
-        { kind: "drop", vars: { name: "b" } },
+        { kind: "found", matched: { vars: { name: "a" }, data: new Mem("page:a-1", "1") } },
+        { kind: "found", matched: { vars: { name: "a" }, data: new Mem("page:a-2", "2") } },
+        { kind: "found", matched: { vars: { name: "b" }, data: new Mem("page:b-1", "1") } },
+        { kind: "gone", vars: { name: "b" } },
       ],
     )
     const log: string[] = []
     const build = new Build()
     build.each({
-      inputs: { page: matcher },
-      *tasks(vars, input) {
-        const page = input.page.data
-        // The task id holds the value, so a replaced row gives a new task id.
+      matchersByName: { page: matcher },
+      *tasks(vars, matched) {
+        const page = matched.page.data
+        // The task id holds the value, so a replaced match gives a new task id.
         yield copyTask(`${vars.name}-${page.value}`, page, log)
       },
     })
@@ -250,19 +250,19 @@ describe("build.each with one input", () => {
     expect(sortedIds(result.executed)).toEqual(["copy:a-2"])
   })
 
-  test("a put with the same data as the current row does nothing", async () => {
+  test("found with the same artifact ids as the current match does nothing", async () => {
     let made = 0
     const matcher = new EventMatcher<Mem>(
       ["name"],
       [
-        { kind: "put", row: { vars: { name: "a" }, data: new Mem("page:a", "1") } },
+        { kind: "found", matched: { vars: { name: "a" }, data: new Mem("page:a", "1") } },
         // A new object with the same id is the same data.
-        { kind: "put", row: { vars: { name: "a" }, data: new Mem("page:a", "1") } },
+        { kind: "found", matched: { vars: { name: "a" }, data: new Mem("page:a", "1") } },
       ],
     )
     const build = new Build()
     build.each({
-      inputs: { page: matcher },
+      matchersByName: { page: matcher },
       *tasks(vars) {
         made += 1
         yield new Task({ id: `t:${vars.name}`, run: async () => {} })
@@ -275,30 +275,30 @@ describe("build.each with one input", () => {
     expect(result.cancelled).toEqual([])
   })
 
-  test("a list row is equal only with the same ids in the same order", async () => {
+  test("a list match is equal only with the same ids in the same order", async () => {
     const a = new Mem("html:a", "A")
     const b = new Mem("html:b", "B")
     const made: string[] = []
     const matcher = new EventMatcher<readonly Mem[]>(
       ["lang"],
       [
-        { kind: "put", row: { vars: { lang: "en" }, data: [a] } },
-        { kind: "put", row: { vars: { lang: "en" }, data: [a, b] } },
-        { kind: "put", row: { vars: { lang: "en" }, data: [a, b] } },
-        { kind: "put", row: { vars: { lang: "en" }, data: [b, a] } },
+        { kind: "found", matched: { vars: { lang: "en" }, data: [a] } },
+        { kind: "found", matched: { vars: { lang: "en" }, data: [a, b] } },
+        { kind: "found", matched: { vars: { lang: "en" }, data: [a, b] } },
+        { kind: "found", matched: { vars: { lang: "en" }, data: [b, a] } },
       ],
     )
     const build = new Build()
     build.each({
-      inputs: { html: matcher },
-      *tasks(vars, input) {
+      matchersByName: { html: matcher },
+      *tasks(vars, matched) {
         const ids: string[] = []
-        for (const page of input.html.data) {
+        for (const page of matched.html.data) {
           ids.push(page.id)
         }
         made.push(ids.join(","))
         // The data is typed, so it spreads into the inputs with no cast.
-        yield new Task({ id: `sitemap:${vars.lang}`, inputs: [...input.html.data], run: async () => {} })
+        yield new Task({ id: `sitemap:${vars.lang}`, inputs: [...matched.html.data], run: async () => {} })
       },
     })
 
@@ -313,16 +313,16 @@ describe("build.each with one input", () => {
     let runs = 0
     const build = new Build()
     build.each({
-      inputs: { post: new MemMatcher("post:", [post]) },
-      *tasks(vars, input) {
-        const file = input.post.data
+      matchersByName: { post: new MemMatcher("post:", [post]) },
+      *tasks(vars, matched) {
+        const file = matched.post.data
         yield new Task({
           id: `format:${vars.name}`,
           inputs: [file],
           outputs: [file],
           run: async () => {
             runs += 1
-            // Before equal puts did nothing, each produced event replaced and reran this task.
+            // Before an equal found did nothing, each produced event replaced and reran this task.
             if (runs > 3) throw new Error("the format task runs again and again")
             file.write(`${await file.read()}!`)
           },
@@ -343,13 +343,13 @@ describe("build.each with one input", () => {
     const slow = new SlowMatcher("slow:", [new Mem("slow:a", "x")], 20, log)
     const build = new Build()
     build.each({
-      inputs: { page: fast },
+      matchersByName: { page: fast },
       *tasks(vars) {
         yield new Task({ id: `fast:${vars.name}`, run: async () => void log.push(`fast:${vars.name}`) })
       },
     })
     build.each({
-      inputs: { page: slow },
+      matchersByName: { page: slow },
       *tasks(vars) {
         yield new Task({ id: `slow:${vars.name}`, run: async () => void log.push(`slow:${vars.name}`) })
       },
@@ -361,14 +361,14 @@ describe("build.each with one input", () => {
     expect([...log.slice(2)].sort()).toEqual(["fast:a", "slow:a"])
   })
 
-  test("a run() that starts during the scans waits for them and runs the rule tasks", async () => {
+  test("a run() that starts during the scans waits for them and runs their tasks", async () => {
     const matcher = new DeferredMatcher("page:", [new Mem("page:a", "A")])
     const log: string[] = []
     const build = new Build()
     build.each({
-      inputs: { page: matcher },
-      *tasks(vars, input) {
-        yield copyTask(vars.name!, input.page.data, log)
+      matchersByName: { page: matcher },
+      *tasks(vars, matched) {
+        yield copyTask(vars.name!, matched.page.data, log)
       },
     })
 
@@ -383,7 +383,7 @@ describe("build.each with one input", () => {
     expect(log).toEqual(["copy:a"])
   })
 
-  test("a promised output makes a rule task, and that task waits for the writer", async () => {
+  test("a promised output makes a task, and that task waits for the writer", async () => {
     const page = new Mem("page:a")
     const log: string[] = []
     const build = new Build()
@@ -398,9 +398,9 @@ describe("build.each with one input", () => {
       }),
     )
     build.each({
-      inputs: { page: new MemMatcher("page:") },
-      *tasks(vars, input) {
-        yield copyTask(vars.name!, input.page.data, log)
+      matchersByName: { page: new MemMatcher("page:") },
+      *tasks(vars, matched) {
+        yield copyTask(vars.name!, matched.page.data, log)
       },
     })
 
@@ -410,7 +410,7 @@ describe("build.each with one input", () => {
     expect(log).toEqual(["write", "copy:a"])
   })
 
-  test("a row sent during the run makes a task in that run", async () => {
+  test("an artifact found during the run makes a task in that run", async () => {
     const log: string[] = []
     const build = new Build()
     build.add(
@@ -427,12 +427,12 @@ describe("build.each with one input", () => {
       }),
     )
     build.each({
-      inputs: { chapter: new MemMatcher("chapter:") },
-      *tasks(vars, input) {
+      matchersByName: { chapter: new MemMatcher("chapter:") },
+      *tasks(vars, matched) {
         log.push(`made summary:${vars.name}`)
         yield new Task({
           id: `summary:${vars.name}`,
-          inputs: [input.chapter.data],
+          inputs: [matched.chapter.data],
           run: async () => void log.push(`summary:${vars.name}`),
         })
       },
@@ -441,18 +441,18 @@ describe("build.each with one input", () => {
     const result = await build.run()
 
     expect(result.success).toBe(true)
-    // The rule made each task inside ctx.produced, before the call returned.
+    // build.each made each task inside ctx.produced, before the call returned.
     expect(log.slice(0, 4)).toEqual(["made summary:0", "produced 0", "made summary:1", "produced 1"])
     expect(sortedIds(result.executed)).toEqual(["split", "summary:0", "summary:1"])
   })
 
-  test("a matcher that two rules use hears each artifact event one time", async () => {
+  test("a matcher that two build.each calls use gets each artifact event one time", async () => {
     const matcher = new MemMatcher("page:")
     const build = new Build()
     build.add(new Task({ id: "write", outputs: [new Mem("page:a", "A")], run: async () => {} }))
     for (const kind of ["one", "two"]) {
       build.each({
-        inputs: { page: matcher },
+        matchersByName: { page: matcher },
         *tasks(vars) {
           yield new Task({ id: `${kind}:${vars.name}`, run: async () => {} })
         },
@@ -472,7 +472,7 @@ describe("build.each errors", () => {
     const build = new Build()
     build.add(new Task({ id: "plain", run: async () => void log.push("plain") }))
     build.each({
-      inputs: { page: new FailingMatcher() },
+      matchersByName: { page: new FailingMatcher() },
       *tasks() {},
     })
 
@@ -482,8 +482,8 @@ describe("build.each errors", () => {
 
   test("a scan error rejects run() even when another scan never returns", async () => {
     const build = new Build()
-    build.each({ inputs: { page: new HangingMatcher() }, *tasks() {} })
-    build.each({ inputs: { page: new FailingMatcher() }, *tasks() {} })
+    build.each({ matchersByName: { page: new HangingMatcher() }, *tasks() {} })
+    build.each({ matchersByName: { page: new FailingMatcher() }, *tasks() {} })
 
     await expect(build.run()).rejects.toThrow("list failed")
   })
@@ -494,7 +494,7 @@ describe("build.each errors", () => {
       if (event.kind === "promised") throw new Error("index is full")
     })
     build.each({
-      inputs: { page: new HangingMatcher(new Mem("page:a", "A")) },
+      matchersByName: { page: new HangingMatcher(new Mem("page:a", "A")) },
       *tasks(vars) {
         yield new Task({ id: `t:${vars.name}`, outputs: [new Mem(`out:${vars.name}`)], run: async () => {} })
       },
@@ -503,11 +503,11 @@ describe("build.each errors", () => {
     await expect(build.run()).rejects.toThrow("index is full")
   })
 
-  test("two rows that give one task id reject run()", async () => {
+  test("two matches that give one task id reject run()", async () => {
     const matcher = new MemMatcher("page:", [new Mem("page:a", "A"), new Mem("page:b", "B")])
     const build = new Build()
     build.each({
-      inputs: { page: matcher },
+      matchersByName: { page: matcher },
       *tasks() {
         yield new Task({ id: "same", run: async () => {} })
       },
@@ -516,15 +516,15 @@ describe("build.each errors", () => {
     await expect(build.run()).rejects.toThrow("task 'same' has two owners: '1:a' and '1:b'")
   })
 
-  test("a matcher that catches the error of its send cannot hide a rule error", async () => {
+  test("a matcher that catches the error of its send cannot hide a build.each error", async () => {
     const build = new Build()
     build.each({
-      inputs: {
+      matchersByName: {
         page: new CatchingMatcher(
           ["name"],
           [
-            { kind: "put", row: { vars: { name: "a" }, data: new Mem("page:a", "A") } },
-            { kind: "put", row: { vars: { name: "b" }, data: new Mem("page:b", "B") } },
+            { kind: "found", matched: { vars: { name: "a" }, data: new Mem("page:a", "A") } },
+            { kind: "found", matched: { vars: { name: "b" }, data: new Mem("page:b", "B") } },
           ],
         ),
       },
@@ -536,54 +536,54 @@ describe("build.each errors", () => {
     await expect(build.run()).rejects.toThrow("task 'same' has two owners: '1:a' and '1:b'")
   })
 
-  test("a rule error outside run() makes the next run() reject, even if the matcher catches it", async () => {
+  test("a build.each error outside run() makes the next run() reject, even if the matcher catches it", async () => {
     const build = new Build()
     build.each({
-      inputs: { page: new QuietMemMatcher("page:") },
+      matchersByName: { page: new QuietMemMatcher("page:") },
       *tasks(vars) {
-        if (vars.name === "bad") throw new Error("bad row")
+        if (vars.name === "bad") throw new Error("bad match")
         yield new Task({ id: `t:${vars.name}`, run: async () => {} })
       },
     })
     const first = await build.run()
     expect(first.success).toBe(true)
 
-    // Its promised event reaches the matcher, and the rule throws.
+    // Its promised event reaches the matcher, and tasks() throws.
     build.add(new Task({ id: "write", outputs: [new Mem("page:bad")], run: async () => {} }))
 
-    await expect(build.run()).rejects.toThrow("bad row")
+    await expect(build.run()).rejects.toThrow("bad match")
   })
 
-  test("a row whose vars are not the matcher's varNames rejects run()", async () => {
-    const wrongVars: RowEvent<Mem> = { kind: "put", row: { vars: { slug: "a" }, data: new Mem("page:a", "A") } }
+  test("a match whose vars are not the matcher's varNames rejects run()", async () => {
+    const wrongVars: MatchedArtifactEvent<Mem> = { kind: "found", matched: { vars: { slug: "a" }, data: new Mem("page:a", "A") } }
     const build = new Build()
     build.each({
-      inputs: { page: new EventMatcher(["name"], [wrongVars]) },
+      matchersByName: { page: new EventMatcher(["name"], [wrongVars]) },
       *tasks() {},
     })
 
     await expect(build.run()).rejects.toThrow(
-      "input 'page' of rule 1 sent a row with vars [slug]; its matcher's varNames are [name]",
+      "matcher 'page' of build.each 1 matched an artifact with vars [slug]; its varNames are [name]",
     )
   })
 
-  test("a rule needs exactly one input", () => {
+  test("build.each needs exactly one matcher", () => {
     const build = new Build()
-    expect(() => build.each({ inputs: {}, *tasks() {} })).toThrow(
-      "rule 1 has 0 inputs; a rule needs exactly one input",
+    expect(() => build.each({ matchersByName: {}, *tasks() {} })).toThrow(
+      "build.each 1 has 0 matchers; build.each needs exactly one matcher",
     )
     expect(() =>
       build.each({
-        inputs: { a: new MemMatcher("a:"), b: new MemMatcher("b:") },
+        matchersByName: { a: new MemMatcher("a:"), b: new MemMatcher("b:") },
         *tasks() {},
       }),
-    ).toThrow("rule 1 has 2 inputs; a rule needs exactly one input")
+    ).toThrow("build.each 1 has 2 matchers; build.each needs exactly one matcher")
   })
 
   test("build.each after run() throws", async () => {
     const build = new Build()
     await build.run()
-    expect(() => build.each({ inputs: { page: new MemMatcher("page:") }, *tasks() {} })).toThrow(
+    expect(() => build.each({ matchersByName: { page: new MemMatcher("page:") }, *tasks() {} })).toThrow(
       "build.each must come before the first build.run()",
     )
   })
@@ -591,11 +591,11 @@ describe("build.each errors", () => {
   test("a matcher belongs to one Build", () => {
     const matcher = new MemMatcher("page:")
     const first = new Build()
-    first.each({ inputs: { page: matcher }, *tasks() {} })
+    first.each({ matchersByName: { page: matcher }, *tasks() {} })
     const second = new Build()
 
-    expect(() => second.each({ inputs: { page: matcher }, *tasks() {} })).toThrow(
-      "rule 1: its matcher belongs to another Build; make a new matcher for each Build",
+    expect(() => second.each({ matchersByName: { page: matcher }, *tasks() {} })).toThrow(
+      "build.each 1: its matcher belongs to another Build; make a new matcher for each Build",
     )
   })
 })

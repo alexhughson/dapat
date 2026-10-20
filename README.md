@@ -18,7 +18,7 @@ Use dapat for data pipelines, generated files, and agent loops, where a step is 
 
 ```
 Status: version 0.1.0. dapat is not published to a registry, and the API can change.
-Rules make one task for each thing that a matcher finds, with `build.each`. A rule has one input for now, and dapat has no built-in matchers yet.
+`build.each` makes tasks for each artifact that a matcher finds. It takes one matcher for now, and dapat has no built-in matchers yet.
 ```
 
 ```
@@ -122,7 +122,7 @@ if (!result.success) {
 - the rule for when a task skips, and how to find out why a task ran
 - failure, cancellation, and replacement of tasks
 - subscribers for the outputs that tasks declare and write during the build, and their errors
-- rules: `build.each` and matchers, which make one task for each thing found
+- `build.each` and matchers, which make tasks for each artifact that a matcher finds
 - recipes: force a rebuild, limit parallel work, run in CI
 - known limits
 - the full API reference
