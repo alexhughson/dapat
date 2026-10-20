@@ -8,7 +8,7 @@ export type MatchedByName<M extends Record<string, AnyMatcher>> = {
   readonly [K in keyof M]: MatchedArtifact<DataOf<M[K]>>
 }
 
-export type TasksForEachMatchConfig<M extends Record<string, AnyMatcher>> = {
+export type TaskMaterializerConfig<M extends Record<string, AnyMatcher>> = {
   /** The matchers to listen to, by name. For now there is exactly one. */
   matchersByName: M
   /** Gives the tasks for one matched artifact. It can give any number of tasks. */
@@ -18,11 +18,12 @@ export type TasksForEachMatchConfig<M extends Record<string, AnyMatcher>> = {
 type SetTasks = (owner: string, tasks: readonly Task[]) => void
 
 /**
- * Listens to its one matcher, and gives the build the tasks of each matched artifact.
+ * A materialized view of the matches: listens to the found and gone events of its one matcher,
+ * and keeps one task list in the build for each matched artifact.
  * Each match is one owner, `<number>:<vars key>`, so `setTasks` replaces the tasks
  * of a match that changes and removes the tasks of a match that is gone.
  */
-export class TasksForEachMatch<M extends Record<string, AnyMatcher>> {
+export class TaskMaterializer<M extends Record<string, AnyMatcher>> {
   readonly matcher: AnyMatcher
   private readonly matcherName: string
   // The artifact ids of the current match of each owner. A found event with the same ids does nothing.
@@ -30,7 +31,7 @@ export class TasksForEachMatch<M extends Record<string, AnyMatcher>> {
 
   constructor(
     readonly number: number,
-    private readonly config: TasksForEachMatchConfig<M>,
+    private readonly config: TaskMaterializerConfig<M>,
     private readonly setTasks: SetTasks,
   ) {
     const names = Object.keys(config.matchersByName)

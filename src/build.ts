@@ -5,7 +5,7 @@ import type { Prefix } from "./prefix"
 import { Task, isArtifact, isPrefix, type Context, type Ref } from "./task"
 import type { Store, TaskState } from "./store"
 import { Outcome, Result } from "./result"
-import { TasksForEachMatch, type TasksForEachMatchConfig } from "./tasks-for-each-match"
+import { TaskMaterializer, type TaskMaterializerConfig } from "./task-materializer"
 
 export type ArtifactEvent =
   | { kind: "promised"; output: Ref; taskId: string }
@@ -104,13 +104,13 @@ export class Build extends Emitter<ArtifactEvent> {
    * Makes tasks for each artifact that the matcher finds.
    * Call it before the first run(): that run scans each matcher before any task starts.
    */
-  each<M extends Record<string, AnyMatcher>>(config: TasksForEachMatchConfig<M>): void {
+  each<M extends Record<string, AnyMatcher>>(config: TaskMaterializerConfig<M>): void {
     if (this.started) {
       throw new Error("build.each must come before the first build.run()")
     }
     const number = this.eachCount + 1
-    const tasksForEachMatch = new TasksForEachMatch(number, config, (owner, tasks) => this.setTasks(owner, tasks))
-    const matcher = tasksForEachMatch.matcher
+    const taskMaterializer = new TaskMaterializer(number, config, (owner, tasks) => this.setTasks(owner, tasks))
+    const matcher = taskMaterializer.matcher
     const owner = matcherBuilds.get(matcher)
     if (owner !== undefined && owner !== this) {
       throw new Error(`build.each ${number}: its matcher belongs to another Build; make a new matcher for each Build`)
@@ -119,7 +119,7 @@ export class Build extends Emitter<ArtifactEvent> {
     matcher.subscribe((event) => {
       // An error here is fatal, like a subscriber error. The matcher's send never sees it.
       try {
-        tasksForEachMatch.hear(event)
+        taskMaterializer.hear(event)
       } catch (error) {
         this.fail(toError(error))
       }
