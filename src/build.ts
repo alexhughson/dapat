@@ -129,7 +129,9 @@ export class Build extends Emitter<ArtifactEvent> {
    * Makes tasks for each joined set of the matches of its matchers.
    * Call it before the first run(): that run scans each matcher before any task starts.
    */
-  each<M extends Record<string, AnyMatcher>>(config: TaskMaterializerConfig<M>): void {
+  each<M extends Record<string, AnyMatcher>, const R extends keyof M & string = keyof M & string>(
+    config: TaskMaterializerConfig<M, R>,
+  ): void {
     if (this.started) {
       throw new Error("build.each must come before the first build.run()")
     }
