@@ -1064,7 +1064,7 @@ When `split` returns, `summary:0`, `summary:1`, and `summary:2` exist. They run 
 
 The `tasks` function and a matcher are part of your program, like a subscriber. A mistake in them makes `build.run()` reject ([Subscriber errors](#subscriber-errors)).
 
-An error in `build.each` is fatal for the build, as a subscriber error is. The `send` of the matcher does not throw it, so a matcher that catches errors cannot hide it. An error outside `build.run()`, for example from the `promised` event of a `build.add` after the run, makes the next `build.run()` reject.
+An error in `build.each` is fatal for the build, as a subscriber error is. The `send` of the matcher does not throw it, so a matcher that catches errors cannot hide it. An error outside `build.run()`, for example from the `promised` event of a `build.add` after the run, makes the next `build.run()` reject. After a fatal error, the build ignores matcher events, so it does not call `tasks` again.
 
 | Where | Example | What you see |
 | --- | --- | --- |

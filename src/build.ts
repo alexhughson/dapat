@@ -145,6 +145,8 @@ export class Build extends Emitter<ArtifactEvent> {
     for (const name of matcherNames) {
       const matcher = config.matchersByName[name]!
       matcher.subscribe((event) => {
+        // A failed build makes no more tasks, so it does not call `tasks` again.
+        if (this.fatal) return
         this.matchEvents.push({ taskMaterializer, matcherName: name, event })
         this.hearMatchEvents()
       })
@@ -168,7 +170,7 @@ export class Build extends Emitter<ArtifactEvent> {
     if (this.hearing) return
     this.hearing = true
     try {
-      while (this.matchEvents.length > 0) {
+      while (this.matchEvents.length > 0 && this.fatal === null) {
         const next = this.matchEvents.shift()!
         next.taskMaterializer.hear(next.matcherName, next.event)
       }
@@ -177,6 +179,9 @@ export class Build extends Emitter<ArtifactEvent> {
       this.fail(toError(error))
     } finally {
       this.hearing = false
+      if (this.fatal) {
+        this.matchEvents = []
+      }
     }
   }
 

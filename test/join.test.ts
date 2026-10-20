@@ -342,6 +342,26 @@ describe("build.each joins matchers on shared var names", () => {
     await expect(build.run()).rejects.toThrow("bad template")
   })
 
+  test("after a fatal error, a later match does not call tasks() again", async () => {
+    const pages = new PathMatcher("page:", ["lang", "slug"], [new Mem("page:en/a", "A")])
+    const templates = new PathMatcher("template:", ["lang"], [new Mem("template:en", "E")])
+    const build = new Build()
+    let calls = 0
+    build.each({
+      matchersByName: { page: pages, template: templates },
+      *tasks() {
+        calls += 1
+        throw new Error("bad template")
+      },
+    })
+    await expect(build.run()).rejects.toThrow("bad template")
+    expect(calls).toBe(1)
+
+    pages.foundArtifact(new Mem("page:en/b", "B"))
+    expect(calls).toBe(1)
+    await expect(build.run()).rejects.toThrow("bad template")
+  })
+
   test("a matcher of another Build among several matchers makes build.each throw, and the error names it", () => {
     const templates = new PathMatcher("template:", ["lang"])
     new Build().each({ matchersByName: { template: templates }, *tasks() {} })
