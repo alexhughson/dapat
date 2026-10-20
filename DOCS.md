@@ -280,7 +280,7 @@ The task writes its outputs itself. dapat does not write, move, or delete files.
 
 Each task in a build is in one task group. A group holds a list of tasks. The build replaces the list of a group as one unit.
 
-For example, this build has two `build.add` tasks and one `build.each` over two posts ([section 10](#10-buildeach-tasks-for-each-matched-artifact)):
+For example, this build has two `build.add` tasks and one `build.each` over two posts. `lint` and `test` are any two tasks. `Posts` is the matcher from [section 10](#10-buildeach-tasks-for-each-matched-artifact).
 
 ```ts
 build.add(lint)
@@ -306,12 +306,12 @@ Now you delete `posts/b.md`. The matcher sends `gone` with the vars `{ slug: "b"
 
 The rules:
 
-- Each task is in exactly one group.
-- A task id can be in only one group. Thus `build.add` throws if `build.each` already made a task with the same id.
+- Each task id is in exactly one group, so `build.add` throws if `build.each` already made a task with that id.
 - `build.add(task)` makes one group for the task id. When you add the same id again, the replacement stays in the same group.
 - `build.each` makes one group for each match ([section 10](#10-buildeach-tasks-for-each-matched-artifact)).
-- `setTasks(group, tasks)` replaces the whole list of the group. It adds each new id, replaces each known id, and removes each id that it does not get again.
+- A subclass of `Build` can call `setTasks(group, tasks)`. It replaces the whole list of the group. It adds each new id, replaces each known id, and removes each id that it does not get again.
 - `build.remove(id)` removes the task from its group. The other tasks of the group stay, and the group can get the same id again later.
+- After `build.remove(id)`, a later `build.add` with that id makes a new group. A task that `build.each` made and that you remove comes back only when its match changes, or after `gone` and then `found`.
 - A group is an object, a `TaskGroup`. Its label is only for error messages. Two groups with the same label are two different groups. Thus two parts of your code cannot share a group only because they use the same label.
 
 ### What `build.run()` does

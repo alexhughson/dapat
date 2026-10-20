@@ -28,6 +28,12 @@ class MemPostsMatcher extends Matcher<Mem> {
     }
   }
 
+  addPost(post: Mem): void {
+    this.posts.push(post)
+    const slug = post.id.slice("posts/".length, -".md".length)
+    this.send({ kind: "found", matched: { vars: { slug }, data: post } })
+  }
+
   deletePost(slug: string): void {
     const kept: Mem[] = []
     for (const post of this.posts) {
@@ -147,6 +153,22 @@ describe("task groups", () => {
     expect(() => build.add(writer("t", []))).toThrow("task 't' is in two groups: 'same' and 'build.add t'")
     // One id in both groups: the error names both labels.
     expect(() => build.give(second, [writer("t", [])])).toThrow("task 't' is in two groups: 'same' and 'same'")
+  })
+
+  test("a subscriber can add the same id again while the first build.add sends its events", async () => {
+    const build = new Build()
+    await build.run()
+    let addedAgain = false
+    build.subscribe((event) => {
+      if (event.kind !== "promised") return
+      if (addedAgain) return
+      addedAgain = true
+      build.add(writer("t", [new Mem("mem:b")]))
+    })
+    build.add(writer("t", [new Mem("mem:a")]))
+    const result = await build.run()
+    expect(result.success).toBe(true)
+    expect(ids(result.executed)).toEqual(["t"])
   })
 
   test("one call that gives one id twice throws, and the build stays as it was", async () => {
@@ -401,5 +423,43 @@ describe("task groups", () => {
     expect(second.success).toBe(true)
     // A result holds the tasks of every run so far: the three new tasks ran, and page:a did not run again.
     expect(ids(second.executed).sort()).toEqual(["lint", "lint", "page:a", "page:b", "page:b", "test", "test"])
+  })
+
+  test("after gone, a found for the same vars makes the tasks again in a new group", async () => {
+    const posts = new MemPostsMatcher([new Mem("posts/b.md", "B")])
+    const log: string[] = []
+    const build = new Build()
+    build.subscribe((event) => {
+      if (event.kind === "produced") return
+      log.push(line(event))
+    })
+    build.each({
+      matchersByName: { post: posts },
+      *tasks(vars, matched) {
+        const page = new Mem(`site/${vars.slug}.html`)
+        yield new Task({
+          id: `page:${vars.slug}`,
+          inputs: [matched.post.data],
+          outputs: [page],
+          run: async () => {
+            page.write(await matched.post.data.read())
+          },
+        })
+      },
+    })
+    await build.run()
+    posts.deletePost("b")
+    log.length = 0
+
+    posts.addPost(new Mem("posts/b.md", "B2"))
+    expect(log).toEqual(["promised site/b.html by page:b"])
+    const result = await build.run()
+    expect(result.success).toBe(true)
+    // The first page:b ran in the first run, and the new page:b ran in this run.
+    expect(ids(result.executed)).toEqual(["page:b", "page:b"])
+    // page:b is in the build again, in the group of the new match.
+    expect(() => build.add(writer("page:b", []))).toThrow(
+      "task 'page:b' is in two groups: 'build.each 1 slug=b' and 'build.add page:b'",
+    )
   })
 })

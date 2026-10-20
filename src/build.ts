@@ -93,22 +93,31 @@ export class Build extends Emitter<ArtifactEvent> {
   }
 
   add(task: Task): void {
-    let group = this.addedTaskGroups.get(task.id)
+    const knownGroup = this.addedTaskGroups.get(task.id)
+    let group = knownGroup
     if (group === undefined) {
       group = new TaskGroup(`build.add ${task.id}`)
+      // Set before setTasks: a subscriber or an abort listener can add the same id during the call.
       this.addedTaskGroups.set(task.id, group)
     }
-    this.setTasks(group, [task])
+    try {
+      this.setTasks(group, [task])
+    } catch (error) {
+      // setTasks throws only before it changes anything, so the new group has no task.
+      if (knownGroup === undefined) {
+        this.addedTaskGroups.delete(task.id)
+      }
+      throw error
+    }
   }
 
   /** Removes the task from its group. The other tasks of the group stay. */
   remove(id: string): void {
     const slot = this.slots.get(id)
     if (!slot) return
-    // A group of build.add has one task, so it is now empty and a later add can make a new one.
-    if (this.addedTaskGroups.get(id) === slot.group) {
-      this.addedTaskGroups.delete(id)
-    }
+    // A group of build.add has one task, so it is now empty and a later add makes a new one.
+    // If build.each made the task, the map has no entry for the id.
+    this.addedTaskGroups.delete(id)
     this.change(slot.group, [], [slot])
   }
 
