@@ -37,7 +37,3 @@ export class FilesystemPrefix extends Prefix {
     return files
   }
 }
-
-export function folder(p: string, opts?: FileStampOptions): FilesystemPrefix {
-  return new FilesystemPrefix(p, opts)
-}

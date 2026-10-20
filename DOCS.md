@@ -43,7 +43,7 @@ The package has two entry points:
 | Import | Contents |
 | --- | --- |
 | `dapat` | `Build`, `Task`, `Artifact`, `Prefix`, `IdPrefix`, `MemoryStore`, `Result`, and their types |
-| `dapat/contrib` | `FileArtifact`, `FilesystemPrefix` (and the types `FileStampMode` and `FileStampOptions`), `S3ObjectArtifact`, `S3Prefix`, `MemoryS3` (and the types `S3Client`, `S3Head`, and `S3ListEntry`), `JsonStore`, `SqliteStore`, and a short factory function for each artifact and prefix (`file`, `folder`, `s3Object`, and `s3Prefix`) |
+| `dapat/contrib` | `FileArtifact`, `FilesystemPrefix` (and the types `FileStampMode` and `FileStampOptions`), `S3ObjectArtifact`, `S3Prefix`, `MemoryS3` (and the types `S3Client`, `S3Head`, and `S3ListEntry`), `JsonStore`, and `SqliteStore` |
 
 ## 3. First build
 
@@ -165,16 +165,16 @@ A prefix has a stamp, but no value of its own. The classes are `IdPrefix`, `File
 - **As an output**, when a task writes files, but you do not know their names before the task runs ([section 5](#outputs-with-unknown-names)).
 - **As an input**, when a task reads the files in a folder. The task waits for each task that writes into the folder.
 
-`folder(path)` makes a `FilesystemPrefix`. Its `list()` method returns the absolute path of each file under the folder, at any depth. A missing folder lists no files.
+`new FilesystemPrefix(path)` stands for a folder. Its `list()` method returns the absolute path of each file under the folder, at any depth. A missing folder lists no files.
 
 Example: a task joins every file under `out/` into `bundle.txt`.
 
 ```ts
 import { Task } from "dapat"
-import { file, folder } from "dapat/contrib"
+import { FileArtifact, FilesystemPrefix } from "dapat/contrib"
 
-const out = folder("out")
-const bundle = file("bundle.txt")
+const out = new FilesystemPrefix("out")
+const bundle = new FileArtifact("bundle.txt")
 
 new Task({
   id: "bundle",
@@ -196,9 +196,9 @@ new Task({
 
 ### Prefix stamps
 
-A prefix has a `stamp()` method, as an artifact has. The stamp changes when anything under the prefix changes. Each prefix class chooses how to make it. For example, `FilesystemPrefix` hashes the relative path and the stamp of each file under the folder. Each file stamp is the modification time and the size, or with `{ stamp: "hash" }` the hash of the bytes, as for `file()`.
+A prefix has a `stamp()` method, as an artifact has. The stamp changes when anything under the prefix changes. Each prefix class chooses how to make it. For example, `FilesystemPrefix` hashes the relative path and the stamp of each file under the folder. Each file stamp is the modification time and the size, or with `{ stamp: "hash" }` the hash of the bytes, as for `new FileArtifact()`.
 
-Example: a task writes `index.html` from every page under `pages/`. Its input is `folder("pages/")`. `index.html` is next to `pages/`, not in it. In `pages/`, it would change the stamp of its own input ([Prefix layouts](#prefix-layouts)).
+Example: a task writes `index.html` from every page under `pages/`. Its input is `new FilesystemPrefix("pages/")`. `index.html` is next to `pages/`, not in it. In `pages/`, it would change the stamp of its own input ([Prefix layouts](#prefix-layouts)).
 
 1. Build 1 sees `a.md`, `b.md`, and `c.md`. The task runs.
 2. You add `d.md`. The stamp of the prefix changes.
@@ -214,10 +214,10 @@ To write your own prefix with a stamp, extend `Prefix` and override `stamp()`. L
 
 ### Prefix layouts
 
-A **region** is a prefix: a ref that stands for many ids, for example `folder("out")`. Regions may overlap, and two tasks may declare the same region. dapat does not reject them. (Two tasks that declare the same artifact are still rejected as a duplicate output.) But two layouts make tasks run again with no edits, and dapat gives no warning:
+A **region** is a prefix: a ref that stands for many ids, for example `new FilesystemPrefix("out")`. Regions may overlap, and two tasks may declare the same region. dapat does not reject them. (Two tasks that declare the same artifact are still rejected as a duplicate output.) But two layouts make tasks run again with no edits, and dapat gives no warning:
 
-- **A task writes into a folder that it reads.** For example, a task reads `folder("pages/")` and writes `pages/index.html`. With the default `"time"` stamp, the task runs on every build. Put `index.html` next to `pages/`, not in it.
-- **Two tasks write into one folder.** For example, `split` writes `folder("out/")`, and `index` writes `out/index.html`. The writers, and a task that reads `out/`, run again on later builds. In some layouts they run on every build. Give each writer its own folder, for example `out/pages/` for `split`.
+- **A task writes into a folder that it reads.** For example, a task reads `new FilesystemPrefix("pages/")` and writes `pages/index.html`. With the default `"time"` stamp, the task runs on every build. Put `index.html` next to `pages/`, not in it.
+- **Two tasks write into one folder.** For example, `split` writes `new FilesystemPrefix("out/")`, and `index` writes `out/index.html`. The writers, and a task that reads `out/`, run again on later builds. In some layouts they run on every build. Give each writer its own folder, for example `out/pages/` for `split`.
 
 [Section 12](#12-limits) explains what runs again and why.
 
@@ -309,8 +309,8 @@ You do not declare edges. dapat finds them from the ids of your inputs and outpu
 
 - B has the artifact input `x`, and A has an artifact output with the same id `x`.
 - B has the artifact input `x`, and A has a prefix output that contains `x`.
-- B has a prefix input `p`, and A has an artifact output inside `p`. For example, a task that reads `folder("out")` waits for a task that writes `file("out/a.txt")`.
-- B has a prefix input `p`, and A has a prefix output inside `p`, or a prefix output that contains `p`. For example, a task that reads `folder("out")` waits for a task that writes `folder("out/sub")`.
+- B has a prefix input `p`, and A has an artifact output inside `p`. For example, a task that reads `new FilesystemPrefix("out")` waits for a task that writes `new FileArtifact("out/a.txt")`.
+- B has a prefix input `p`, and A has a prefix output inside `p`, or a prefix output that contains `p`. For example, a task that reads `new FilesystemPrefix("out")` waits for a task that writes `new FilesystemPrefix("out/sub")`.
 
 An input that no task writes is a **source**, for example `in.txt` in section 3. dapat does not wait for a source.
 
@@ -689,12 +689,12 @@ A relative path resolves against the current working directory when you create t
 
 | Class | Stamp | Value |
 | --- | --- | --- |
-| `FileArtifact(path, { stamp })`, `file()` | the modification time and size, or the SHA-256 of the bytes. `null` if the file is missing. | `read()` returns a `Uint8Array` |
-| `FilesystemPrefix(path, { stamp })`, `folder()` | SHA-256 of each relative path and the stamp of that file. A missing folder has the stamp of an empty list. | `list()` returns the absolute paths of all files, in all subfolders |
+| `new FileArtifact(path, { stamp })` | the modification time and size, or the SHA-256 of the bytes. `null` if the file is missing. | `read()` returns a `Uint8Array` |
+| `new FilesystemPrefix(path, { stamp })` | SHA-256 of each relative path and the stamp of that file. A missing folder has the stamp of an empty list. | `list()` returns the absolute paths of all files, in all subfolders |
 
 #### Time or hash
 
-Both classes take the option `stamp: "time" | "hash"`. The factory functions `file()` and `folder()` take it too. The default is `"time"`.
+Both classes take the option `stamp: "time" | "hash"`. The default is `"time"`.
 
 - `"time"`: the stamp of a file is its modification time in nanoseconds and its size. dapat reads no bytes.
 - `"hash"`: the stamp of a file is the SHA-256 of its bytes. dapat reads each file in full.
@@ -714,13 +714,13 @@ Both classes take the option `stamp: "time" | "hash"`. The factory functions `fi
 `"time"` has a cost. A `touch`, a `git checkout`, or a copy that changes the modification time and keeps the bytes changes the stamp. Then the task runs again. Set `stamp: "hash"` where a run is expensive, for example a task that calls a paid model.
 
 ```ts
-const prompt = file("prompts/summary.txt", { stamp: "hash" })
-const pages = folder("pages/", { stamp: "hash" })
+const prompt = new FileArtifact("prompts/summary.txt", { stamp: "hash" })
+const pages = new FilesystemPrefix("pages/", { stamp: "hash" })
 ```
 
 Older versions of dapat used the hash for every file. After an upgrade, every stamp of a file is different, so each task with a file runs one time.
 
-Older versions also had `directory()`, a folder artifact. Use `folder()` in its place, and call `list()` in place of `read()`. dapat stores a folder stamp under a different key, so each task that used `directory()` runs one time after the change.
+Older versions also had `directory()`, a folder artifact. Use `new FilesystemPrefix(path)` in its place, and call `list()` in place of `read()`. dapat stores a folder stamp under a different key, so each task that used `directory()` runs one time after the change.
 
 ### 10.2 S3: `S3ObjectArtifact`, `S3Prefix`, `S3Client`, `MemoryS3`
 
@@ -837,15 +837,15 @@ A new checkout changes the modification time of each file. With the default `sta
   `stamp: "hash"` sees all of these edits. Use it for files that such tools write, and for files that a program edits during the build.
 - **A link to a folder above the prefix pulls that folder into the stamp.** If that folder holds the store file or the outputs of the task, the task runs on every build.
 - **Many links to one folder are walked one time for each path.** The stamp then reads that folder many times. Only a link back to a folder above it is not walked again.
-- **A task that writes into a folder that it reads runs again with no edits.** For example, a task reads `folder("pages/")` and writes `pages/index.html`. Each run writes `index.html`, so the stamp of `pages/` changes, and on the next build the input stamp differs from the record. With the default `"time"` stamp, each write gives `index.html` a new modification time, so the task runs on every build. With `stamp: "hash"`, the task stops running once a run writes the same bytes as the run before. For example, if it writes the same bytes each time, it runs on builds 1 and 2 and skips from build 3. Each build finishes, and the task runs one time in each build. dapat gives no warning. To let the task skip from build 2, put `index.html` next to `pages/`, not in it.
-- **Two tasks that write into one folder run again with no edits.** For example, `split` writes `folder("out/")`, and `index` writes `out/index.html`. dapat records the stamp of `out/` when `split` ends. If `index` writes after that, the record of `split` is old on the next build. Each build finishes, and dapat gives no warning. With the default `"time"` stamp:
+- **A task that writes into a folder that it reads runs again with no edits.** For example, a task reads `new FilesystemPrefix("pages/")` and writes `pages/index.html`. Each run writes `index.html`, so the stamp of `pages/` changes, and on the next build the input stamp differs from the record. With the default `"time"` stamp, each write gives `index.html` a new modification time, so the task runs on every build. With `stamp: "hash"`, the task stops running once a run writes the same bytes as the run before. For example, if it writes the same bytes each time, it runs on builds 1 and 2 and skips from build 3. Each build finishes, and the task runs one time in each build. dapat gives no warning. To let the task skip from build 2, put `index.html` next to `pages/`, not in it.
+- **Two tasks that write into one folder run again with no edits.** For example, `split` writes `new FilesystemPrefix("out/")`, and `index` writes `out/index.html`. dapat records the stamp of `out/` when `split` ends. If `index` writes after that, the record of `split` is old on the next build. Each build finishes, and dapat gives no warning. With the default `"time"` stamp:
   - If `index` also reads a file that `split` writes, `index` waits for `split`. Then `split`, `index`, and a task that reads `out/` run on every build.
-  - If the two writers do not wait for each other, the writer that ended first, and a task that reads `out/`, run one extra time on the next build. Which writer that is depends on which one ends first. Then the tasks skip. If both writers declare the whole folder, for example both write `folder("out/")`, they can take turns and run again on every build.
+  - If the two writers do not wait for each other, the writer that ended first, and a task that reads `out/`, run one extra time on the next build. Which writer that is depends on which one ends first. Then the tasks skip. If both writers declare the whole folder, for example both write `new FilesystemPrefix("out/")`, they can take turns and run again on every build.
 
   With `stamp: "hash"`, the tasks skip from build 3 when each run writes the same bytes.
 
   To let all of these tasks skip from build 2, give each writer its own folder, for example `out/pages/` for `split` and `out/index.html` next to it, with no task that reads all of `out/`.
-- **A prefix input that covers the store file runs on every build.** For example, a task reads `folder(".")`, and the store is `.dapat/state.json`. Each build writes the store, so the stamp of the prefix changes. Put the store outside the folders that tasks read, or read a narrower prefix.
+- **A prefix input that covers the store file runs on every build.** For example, a task reads `new FilesystemPrefix(".")`, and the store is `.dapat/state.json`. Each build writes the store, so the stamp of the prefix changes. Put the store outside the folders that tasks read, or read a narrower prefix.
 - **Only a missing path counts as missing.** `FileArtifact` returns a `null` stamp, and `FilesystemPrefix` returns the stamp of an empty list and lists no files, only for `ENOENT`. Every other error makes `stamp()` throw, so the task fails with that error, for example a permission error, or a file where a folder must be. In `"time"` mode, dapat reads only the metadata of a file. A file that the task cannot read still gets a stamp, and `read()` fails later.
 - **No timeout and no concurrency limit.** All ready tasks start at the same time. Add limits and timeouts in your task code ([section 11.2](#112-limit-parallel-work)), and use `ctx.signal` to stop work.
 - **Bun only.** The adapters use Bun APIs.
@@ -1033,11 +1033,10 @@ type ArtifactEvent =
 
 Relative paths are resolved against `process.cwd()` when you construct the artifact.
 
-### `class FileArtifact extends Artifact<Uint8Array>` and `file(path)`
+### `class FileArtifact extends Artifact<Uint8Array>`
 
 ```ts
 new FileArtifact(path: string, opts?: { stamp?: "time" | "hash" })
-file(path: string, opts?: { stamp?: "time" | "hash" }): FileArtifact
 ```
 
 | Member | Value |
@@ -1048,11 +1047,10 @@ file(path: string, opts?: { stamp?: "time" | "hash" }): FileArtifact
 | `stamp()` | `"time"`: `<modification time in ns>:<size>`. `"hash"`: SHA-256 hex of the bytes. Follows a symlink. `null` if the file is missing. Throws if the path is not a file, and for every other error. |
 | `read()` | The bytes. Throws if the file is missing. |
 
-### `class FilesystemPrefix extends Prefix` and `folder(path)`
+### `class FilesystemPrefix extends Prefix`
 
 ```ts
 new FilesystemPrefix(path: string, opts?: { stamp?: "time" | "hash" })
-folder(path: string, opts?: { stamp?: "time" | "hash" }): FilesystemPrefix
 ```
 
 | Member | Value |
@@ -1069,11 +1067,10 @@ folder(path: string, opts?: { stamp?: "time" | "hash" }): FilesystemPrefix
 
 See [section 10.2](#102-s3-s3objectartifact-s3prefix-s3client-memorys3).
 
-### `class S3ObjectArtifact extends Artifact<Uint8Array>` and `s3Object(client, bucket, key)`
+### `class S3ObjectArtifact extends Artifact<Uint8Array>`
 
 ```ts
 new S3ObjectArtifact(client: S3Client, bucket: string, key: string)
-s3Object(client: S3Client, bucket: string, key: string): S3ObjectArtifact
 ```
 
 | Member | Value |
@@ -1083,11 +1080,10 @@ s3Object(client: S3Client, bucket: string, key: string): S3ObjectArtifact
 | `stamp()` | `head().etag`. `null` if `head` returns `null`. |
 | `read()` | `client.get(bucket, key)` |
 
-### `class S3Prefix extends Prefix` and `s3Prefix(client, bucket, keyPrefix)`
+### `class S3Prefix extends Prefix`
 
 ```ts
 new S3Prefix(client: S3Client, bucket: string, keyPrefix: string)
-s3Prefix(client: S3Client, bucket: string, keyPrefix: string): S3Prefix
 ```
 
 `id` is `s3://<bucket>/<keyPrefix>/`. The constructor adds the trailing `/` if `keyPrefix` is not empty and does not end with `/`.

@@ -27,7 +27,3 @@ export class FileArtifact extends Artifact<Uint8Array> {
     return new Uint8Array(await readFile(this.path))
   }
 }
-
-export function file(p: string, opts?: FileStampOptions): FileArtifact {
-  return new FileArtifact(p, opts)
-}

@@ -1,4 +1,4 @@
-export { FileArtifact, file } from "./file"
-export { FilesystemPrefix, folder } from "./folder"
+export { FileArtifact } from "./file"
+export { FilesystemPrefix } from "./folder"
 export { fileId, dirId } from "./id"
 export type { FileStampMode, FileStampOptions } from "./stamp"
