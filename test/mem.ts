@@ -27,50 +27,6 @@ export class Mem extends Artifact<string> {
   }
 }
 
-/** Listing whose `covers` includes every id under `region`. */
-export class MemDir extends Artifact<string[]> {
-  constructor(
-    readonly region: string,
-    public children: Mem[],
-  ) {
-    super()
-  }
-
-  get id(): string {
-    return this.region
-  }
-
-  get coversOthers(): boolean {
-    return true
-  }
-
-  covers(other: Artifact): boolean {
-    if (other.id === this.id) return true
-    return other.id.startsWith(this.region)
-  }
-
-  /** The sorted ids of the children that have a value. null when no child has one. */
-  async stamp(): Promise<string | null> {
-    const names: string[] = []
-    for (const child of this.children) {
-      if (child.value === null) continue
-      names.push(child.id)
-    }
-    names.sort()
-    if (names.length === 0) return null
-    return names.join(",")
-  }
-
-  async read(): Promise<string[]> {
-    const names: string[] = []
-    for (const child of this.children) {
-      if (child.value === null) continue
-      names.push(child.id)
-    }
-    return names
-  }
-}
-
 /** Prefix over a list of in-memory children. Its stamp lists each child that has a value. */
 export class MemPrefix extends Prefix {
   constructor(

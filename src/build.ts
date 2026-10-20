@@ -352,9 +352,7 @@ export class Build extends Emitter<ArtifactEvent> {
   /**
    * Tasks that must finish before `task` can run.
    *
-   * Artifact input: exact producer of that id, prefix outputs that
-   * cover it, and tasks whose outputs this artifact `covers`
-   * (a directory listing waits for writers under it).
+   * Artifact input: exact producer of that id, and prefix outputs that cover it.
    *
    * Prefix input: every current writer of a covered artifact or
    * overlapping prefix.
@@ -392,12 +390,6 @@ export class Build extends Emitter<ArtifactEvent> {
     }
     for (const entry of this.prefixOutputs) {
       if (entry.output.covers(input)) {
-        ids.add(entry.taskId)
-      }
-    }
-    if (!input.coversOthers) return
-    for (const entry of this.exactOutputs.values()) {
-      if (input.covers(entry.artifact)) {
         ids.add(entry.taskId)
       }
     }

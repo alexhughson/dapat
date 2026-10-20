@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import path from "node:path"
 import { Build, MemoryStore, Task } from "../../src/index"
-import { DirectoryArtifact, FileArtifact, PathPrefix } from "../../contrib/fs"
+import { FileArtifact, FilesystemPrefix } from "../../contrib/fs"
 
 const temps: string[] = []
 
@@ -85,7 +85,7 @@ describe("filesystem stress", () => {
   )
 
   test(
-    `one prefix writer emits ${PREFIX_FILES} files; a directory consumer waits`,
+    `one prefix writer emits ${PREFIX_FILES} files; a folder consumer waits`,
     async () => {
       const root = await tempDir()
       const outDir = path.join(root, "out")
@@ -99,14 +99,14 @@ describe("filesystem stress", () => {
       let manifests = 0
 
       const runOnce = async () => {
-        const listing = new DirectoryArtifact(outDir)
+        const listing = new FilesystemPrefix(outDir)
         const manifest = new FileArtifact(manifestPath)
         const build = new Build({ store })
         build.add(
           new Task({
             id: "write-all",
             inputs: [new FileArtifact(seedPath)],
-            outputs: [new PathPrefix(outDir), listing],
+            outputs: [listing],
             run: async (ctx) => {
               writes += 1
               await mkdir(outDir, { recursive: true })
@@ -125,7 +125,7 @@ describe("filesystem stress", () => {
             outputs: [manifest],
             run: async () => {
               manifests += 1
-              const files = await listing.read()
+              const files = await listing.list()
               await writeFile(manifestPath, String(files.length))
             },
           }),

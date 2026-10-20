@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test"
 import { Build, IdPrefix, MemoryStore, SEND_LIMIT, Task, isPrefix } from "../src/index"
 import type { Artifact, ArtifactEvent, Ref, TaskState } from "../src/index"
-import { Mem, MemDir, MemPrefix } from "./mem"
+import { Mem, MemPrefix } from "./mem"
 
 /** "<kind> <id>": the artifact id of a produced or deleted event, or the declared output id. */
 function describeEvent(event: ArtifactEvent): string {
@@ -79,9 +79,9 @@ describe("Build", () => {
     expect(executed).toEqual(["write-unknown", "use-foo"])
   })
 
-  test("directory artifact waits for writers it covers", async () => {
+  test("a folder input waits for the writers of the files in it", async () => {
     const foo = new Mem("mem:out/foo")
-    const dir = new MemDir("mem:out/", [foo])
+    const dir = new MemPrefix("mem:out/", [foo])
     const zip = new Mem("mem:zip")
     const executed: string[] = []
 
@@ -1416,6 +1416,33 @@ describe("the skip rule", () => {
     expect(third.executed).toEqual(["compile"])
   })
 
+  test("a prefix and an artifact with the same id keep separate stamps in the record", async () => {
+    const page = new Mem("mem:pages/a", "A")
+    const prefix = new MemPrefix("mem:pages/", [page])
+    const listing = new Mem("mem:pages/", "a")
+    const out = new Mem("mem:out")
+    const store = new MemoryStore()
+    const runs = { count: 0 }
+    const read = () =>
+      new Task({
+        id: "read",
+        inputs: [prefix, listing],
+        outputs: [out],
+        run: async () => {
+          runs.count += 1
+          out.write("x")
+        },
+      })
+
+    await runOnce(read(), store)
+    const record = await store.get("read")
+    const keys = Object.keys(record!.inputStamps)
+    keys.sort()
+    expect(keys).toEqual([`artifact ${listing.id}`, `prefix ${prefix.id}`])
+    const second = await runOnce(read(), store)
+    expect(second.skipped).toEqual(["read"])
+  })
+
   test("a record keyed by bare ids, as PR 7 wrote it, makes the task run once and then skip", async () => {
     const src = new Mem("mem:src", "a")
     const out = new Mem("mem:out", "obj")
@@ -2046,7 +2073,7 @@ describe("promised and withdrawn events", () => {
       log.push(`${event.kind} ${kind} ${event.output.id}`)
     })
     const running = build.run()
-    build.add(new Task({ id: "t", outputs: [new MemDir("mem:out/", [])], run: () => gate }))
+    build.add(new Task({ id: "t", outputs: [new Mem("mem:out/")], run: () => gate }))
     build.add(new Task({ id: "t", outputs: [new IdPrefix("mem:out/")], run: async () => {} }))
     release()
     await running
