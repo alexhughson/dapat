@@ -109,7 +109,7 @@ Put `hello` into `in.txt`, and then run the script more than one time:
 
 [Section 6](#6-when-a-task-skips) gives the full rules.
 
-The repo has this build in `examples/first-build.ts`. Run it with `bun run examples/first-build.ts` from a directory that contains `in.txt`.
+The repo has this build in `examples/first-build.ts`. Run it from a folder that contains `in.txt`, with `bun run <path to dapat>/examples/first-build.ts`.
 
 ### Read the result
 
@@ -1130,7 +1130,7 @@ Keeps every record in one JSON file with the shape `{ "tasks": { "<taskId>": { "
 new SqliteStore(db: Database | string)
 ```
 
-Creates the table `dapat_task_state (task_id TEXT PRIMARY KEY, payload TEXT)` if it does not exist. `payload` is the record as JSON. `close()` closes the database only if the store opened it from a path.
+Given a path, it creates the parent folder of the path. It creates the table `dapat_task_state (task_id TEXT PRIMARY KEY, payload TEXT)` if it does not exist. `payload` is the record as JSON. `close()` closes the database only if the store opened it from a path.
 
 ### `MemoryStore`
 

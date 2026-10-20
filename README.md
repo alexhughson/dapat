@@ -126,7 +126,7 @@ if (!result.success) {
 - known limits
 - the full API reference
 
-[examples/first-build.ts](examples/first-build.ts) is a runnable version of the example above. It keeps its state in `.dapat/state.json`, so a second run skips both tasks. Edit `in.txt` to see them run again. Run it with `bun run examples/first-build.ts` from a directory that contains `in.txt`.
+[examples/first-build.ts](examples/first-build.ts) is a runnable version of the example above. It keeps its state in `.dapat/state.json`, so a second run skips both tasks. Edit `in.txt` to see them run again. Run it from a folder that contains `in.txt`, with `bun run <path to dapat>/examples/first-build.ts`.
 
 
 
