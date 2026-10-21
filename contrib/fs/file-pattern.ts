@@ -28,7 +28,7 @@ export interface FilePatternSyntax {
 }
 
 /** The options of FileMatcher and FileGroupMatcher. */
-export interface FileMatcherOptions extends FileStampOptions {
+export interface FilePatternOptions extends FileStampOptions {
   syntax?: FilePatternSyntax
 }
 
@@ -72,13 +72,6 @@ export class FilePattern {
         )
       }
     }
-    const varToken = varTokenRegexOf(syntax)
-    const textOutsideVars = pattern.replace(varToken, "")
-    if (textOutsideVars.includes(syntax.varStart) || textOutsideVars.includes(syntax.varEnd)) {
-      throw new Error(
-        `${matcherName} pattern '${pattern}': each '${syntax.varStart}' and '${syntax.varEnd}' must enclose a var name of letters, digits, and '_' that does not start with a digit`,
-      )
-    }
     const normalized = path.posix.normalize(pattern)
     const segmentTexts = splitSegments(normalized)
     if (segmentTexts.length === 0) {
@@ -91,6 +84,16 @@ export class FilePattern {
       )
     }
     const keyPattern = new KeyPattern(normalized, syntax)
+    // KeyPattern decides which text is a var or a glob. A marker that is left in a literal part is stray.
+    for (const literalText of keyPattern.literalTexts) {
+      const holdsVarStart = literalText.includes(syntax.varStart)
+      const holdsVarEnd = literalText.includes(syntax.varEnd)
+      if (holdsVarStart || holdsVarEnd) {
+        throw new Error(
+          `${matcherName} pattern '${pattern}': each '${syntax.varStart}' and '${syntax.varEnd}' must enclose a var name of letters, digits, and '_' that does not start with a digit`,
+        )
+      }
+    }
     let root = process.cwd()
     if (path.posix.isAbsolute(normalized)) {
       root = "/"
@@ -197,17 +200,6 @@ function resolveSyntax(syntaxOption: FilePatternSyntax | undefined, matcherName:
     }
   }
   return syntax
-}
-
-/** A var token: `varStart`, a name of letters, digits, and `_` that does not start with a digit, and `varEnd`. */
-function varTokenRegexOf(syntax: PatternSyntax): RegExp {
-  const start = escapeRegex(syntax.varStart)
-  const end = escapeRegex(syntax.varEnd)
-  return new RegExp(`${start}[A-Za-z_][A-Za-z0-9_]*${end}`, "g")
-}
-
-function escapeRegex(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
 }
 
 function splitSegments(pattern: string): string[] {

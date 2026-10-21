@@ -3,7 +3,7 @@ import type { Vars } from "../../src/matched-artifact"
 import { Matcher } from "../../src/matcher"
 import type { FileArtifact } from "./file"
 import { FileMatchStates, type FileMatchChange } from "./file-match-states"
-import { FilePattern, type FileMatcherOptions } from "./file-pattern"
+import { FilePattern, type FilePatternOptions } from "./file-pattern"
 import { stampMode } from "./stamp"
 
 /** The files that have a match now and have the same vars. */
@@ -36,7 +36,7 @@ export class FileGroupMatcher extends Matcher<readonly FileArtifact[]> {
   // Each group with one or more files, by key.
   private readonly groupsByKey = new Map<string, FileGroup>()
 
-  constructor(pattern: string, opts?: FileMatcherOptions) {
+  constructor(pattern: string, opts?: FilePatternOptions) {
     super()
     const filePattern = new FilePattern(pattern, "FileGroupMatcher", opts?.syntax)
     const anyName = filePattern.syntax.anyName

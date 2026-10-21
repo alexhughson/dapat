@@ -365,6 +365,25 @@ describe("FileGroupMatcher syntax option", () => {
     expect(() => new FileGroupMatcher("site/<lang>/@@", { syntax })).toThrow("not '@@'; use '@@/%' for every file")
   })
 
+  test("a var marker that the anyName glob takes first is stray, and the pattern throws", () => {
+    const syntax = { anyName: "%a", anyFolders: "%a%a", varStart: "a{", varEnd: "}" }
+    expect(new FileGroupMatcher("/d/a{q}/%a.md", { syntax }).varNames).toEqual(["q"])
+    // '%a' starts before 'a{', so the part is the glob '%a' and the literal '{x}.md'. The '}' is stray.
+    expect(() => new FileGroupMatcher("/d/a{q}/%a{x}.md", { syntax })).toThrow("each 'a{' and '}' must enclose a var name")
+  })
+
+  test("with a change to anyFolders alone, a '**' part is two '*' globs in one folder name", async () => {
+    const root = await tempDir()
+    await writeText(path.join(root, "site", "en", "blog", "x.md"), "")
+    await writeText(path.join(root, "site", "en", "x.md"), "")
+    await writeText(path.join(root, "site", "en", "a", "b", "x.md"), "")
+    const syntax = { anyFolders: "%%" }
+    const matcher = new FileGroupMatcher(path.join(root, "site/<lang>/**/x.md"), { syntax })
+    const events = recordEvents(matcher, root)
+    await matcher.scan(new AbortController().signal)
+    expect(events).toEqual(["found lang=en [site/en/blog/x.md]"])
+  })
+
   test("the errors name the custom glob characters", () => {
     const syntax = { anyName: "%", anyFolders: "%%" }
     expect(() => new FileGroupMatcher("site/*.html", { syntax })).toThrow("has no '%' or '%%'; use FileMatcher")

@@ -572,6 +572,28 @@ describe("FileMatcher syntax option", () => {
     expect(() => new FileMatcher("content/{a}{b}.md", { syntax })).toThrow("the vars {a} and {b} have nothing between them")
   })
 
+  test("the parse of KeyPattern decides each var: '{{{x}}{.md' has the var x between two literal '{'", async () => {
+    const root = await tempDir()
+    await writeText(path.join(root, "{a{.md"), "")
+    await writeText(path.join(root, "b.md"), "")
+    const syntax = { varStart: "{{", varEnd: "}}" }
+    const matcher = new FileMatcher(path.join(root, "{{{x}}{.md"), { syntax })
+    expect(matcher.varNames).toEqual(["x"])
+    const events = recordEvents(matcher, root)
+    await matcher.scan(new AbortController().signal)
+    expect(events).toEqual(["found x=a {a{.md"])
+  })
+
+  test("the glob message names a var with the custom markers", () => {
+    const syntax = { varStart: "a{", varEnd: "}" }
+    expect(() => new FileMatcher("content/*.md", { syntax })).toThrow("use a var such as a{name} for each part that changes")
+  })
+
+  test("a change to anyFolders alone keeps '*' as the glob, so '**' still throws", () => {
+    const syntax = { anyFolders: "%%" }
+    expect(() => new FileMatcher("content/**/<slug>.md", { syntax })).toThrow("'*' and '%%' are not allowed")
+  })
+
   test("throws for a syntax that has no single parse", () => {
     expect(() => new FileMatcher("a/<x>.md", { syntax: { varStart: "" } })).toThrow("FileMatcher syntax: varStart is empty")
     expect(() => new FileMatcher("a/<x>.md", { syntax: { anyName: "" } })).toThrow("FileMatcher syntax: anyName is empty")

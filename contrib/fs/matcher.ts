@@ -2,7 +2,7 @@ import type { ArtifactEvent } from "../../src/build"
 import { Matcher } from "../../src/matcher"
 import type { FileArtifact } from "./file"
 import { FileMatchStates, type FileMatchChange } from "./file-match-states"
-import { FilePattern, type FileMatcherOptions } from "./file-pattern"
+import { FilePattern, type FilePatternOptions } from "./file-pattern"
 import { stampMode } from "./stamp"
 
 /**
@@ -23,14 +23,14 @@ export class FileMatcher extends Matcher<FileArtifact> {
   private readonly filePattern: FilePattern
   private readonly fileStates: FileMatchStates
 
-  constructor(pattern: string, opts?: FileMatcherOptions) {
+  constructor(pattern: string, opts?: FilePatternOptions) {
     super()
     const filePattern = new FilePattern(pattern, "FileMatcher", opts?.syntax)
     if (filePattern.hasGlob) {
       const syntax = filePattern.syntax
       const varExample = `${syntax.varStart}name${syntax.varEnd}`
       throw new Error(
-        `FileMatcher pattern '${pattern}': '${syntax.anyName}' and '${syntax.anyFolders}' are not allowed; use a ${varExample} var for each part that changes, or FileGroupMatcher for one match with a list of files`,
+        `FileMatcher pattern '${pattern}': '${syntax.anyName}' and '${syntax.anyFolders}' are not allowed; use a var such as ${varExample} for each part that changes, or FileGroupMatcher for one match with a list of files`,
       )
     }
     this.filePattern = filePattern

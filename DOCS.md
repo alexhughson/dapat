@@ -43,7 +43,7 @@ The package has two entry points:
 | Import | Contents |
 | --- | --- |
 | `dapat` | `Build`, `TaskGroup`, `Task`, `Artifact`, `Prefix`, `IdPrefix`, `Matcher`, `MemoryStore`, `Result`, and their types |
-| `dapat/contrib` | `FileArtifact`, `FilesystemPrefix`, `FileMatcher`, `FileGroupMatcher` (and the types `FileStampMode`, `FileStampOptions`, `FileMatcherOptions`, and `FilePatternSyntax`), `S3ObjectArtifact`, `S3Prefix`, `MemoryS3` (and the types `S3Client`, `S3Head`, and `S3ListEntry`), `JsonStore`, and `SqliteStore` |
+| `dapat/contrib` | `FileArtifact`, `FilesystemPrefix`, `FileMatcher`, `FileGroupMatcher` (and the types `FileStampMode`, `FileStampOptions`, `FilePatternOptions`, and `FilePatternSyntax`), `S3ObjectArtifact`, `S3Prefix`, `MemoryS3` (and the types `S3Client`, `S3Head`, and `S3ListEntry`), `JsonStore`, and `SqliteStore` |
 
 ## 3. First build
 
@@ -1027,7 +1027,7 @@ const templates = new FileMatcher("templates/<lang>.html")
 - An empty pattern throws.
 - A var never takes the value `..`. A file outside the root of the pattern never fits.
 
-The `<`, `>`, `*`, and `**` markers have their meaning in the whole pattern, also in the root folder. When a folder or file name holds one of them, use the `syntax` option to set other markers: `varStart` and `varEnd` for a var, `anyName` for `*`, and `anyFolders` for `**`. Each marker that you leave out keeps its default. A default marker that the syntax replaces is a literal character. The constructor throws for an empty marker, a marker with `/`, an `anyName` or `anyFolders` that is `.` or `..`, two equal markers, and a marker that holds another marker. Only `anyFolders` can hold `anyName`, as `**` holds `*`.
+The `<`, `>`, `*`, and `**` markers have their meaning in the whole pattern, also in the root folder. When a folder or file name holds one of them, use the `syntax` option to set other markers: `varStart` and `varEnd` for a var, `anyName` for `*`, and `anyFolders` for `**`. Each marker that you leave out keeps its default. A default marker that the syntax replaces is a literal character. The constructor throws for an empty marker, a marker with `/`, an `anyName` or `anyFolders` that is `.` or `..`, two equal markers, and a marker that holds another marker. Only `anyFolders` can hold `anyName`, as `**` holds `*`. Use markers that no folder or file name in the pattern holds.
 
 ```ts
 new FileMatcher("/data/a<b>/{lang}/{slug}.md", { syntax: { varStart: "{", varEnd: "}" } })
@@ -1855,7 +1855,7 @@ new FileMatcher(pattern: string, opts?: { stamp?: "hash" | "time"; syntax?: File
 | `scan(signal)` | Sends `found` for each file on disk that fits, in name order. Reads a folder only for a part with a var, and stats only symlinks and entries of unknown type. A link loop adds no file. A missing folder has no files. Follows symlinks. Throws for every other error. |
 | `receiveArtifactEvent(event)` | `promised` and `produced` of a `FileArtifact` that fits send `found`. `deleted` sends `gone` unless a task still declares the file. `withdrawn` sends `gone` unless the file is on disk. |
 
-The `stamp` option sets the stamp mode of each `FileArtifact` that the matcher sends. Default `"hash"`. The `syntax` option is `{ varStart?, varEnd?, anyName?, anyFolders? }`, with the defaults `<`, `>`, `*`, and `**`. It sets the markers of the pattern, and the error messages name these markers. With another `anyName` and `anyFolders`, a `*` is a literal and does not throw. See [The pattern](#the-pattern). The constructor throws for an invalid `syntax`, an empty pattern, a pattern with `*` or `**` (the message names `FileGroupMatcher`), a `..` part, a `<` or `>` that does not enclose a valid var name, and two vars with nothing between them. Each match is `{ vars, data: FileArtifact }`. See [`FileMatcher`](#filematcher-one-match-for-each-file).
+The `stamp` option sets the stamp mode of each `FileArtifact` that the matcher sends. Default `"hash"`. The `syntax` option is `{ varStart?, varEnd?, anyName?, anyFolders? }`, with the defaults `<`, `>`, `*`, and `**`. It sets the markers of the pattern, and the error messages name these markers. A `*` is a literal and does not throw only when `anyName` changes. With a change to `anyFolders` alone, `*` is still the glob, and a `**` part is two `*` globs in one name. See [The pattern](#the-pattern). The constructor throws for an invalid `syntax`, an empty pattern, a pattern with `*` or `**` (the message names `FileGroupMatcher`), a `..` part, a `<` or `>` that does not enclose a valid var name, and two vars with nothing between them. Each match is `{ vars, data: FileArtifact }`. See [`FileMatcher`](#filematcher-one-match-for-each-file).
 
 ### `class FileGroupMatcher extends Matcher<readonly FileArtifact[]>`
 
@@ -1871,7 +1871,7 @@ new FileGroupMatcher(pattern: string, opts?: { stamp?: "hash" | "time"; syntax?:
 | `scan(signal)` | Reads the files as `FileMatcher` does. At a `**`, takes every file under the folder, as `FilesystemPrefix.list()` does. After the whole scan, sends one `found` for each group, with its files sorted by path. Throws for every error other than a missing path. |
 | `receiveArtifactEvent(event)` | A file gets and loses its match as in `FileMatcher`. Each change sends `found` with the new list of the group of the file, or `gone` when the list becomes empty. |
 
-The `stamp` option sets the stamp mode of each `FileArtifact` that the matcher sends. Default `"hash"`. The `syntax` option sets the markers of the pattern, as for `FileMatcher`. The constructor throws for a pattern with no `*` or `**` (or no `anyName` or `anyFolders` of the syntax), a var in or after the first part with a glob, a `**` at the end, a `**` inside a name, and each other error of `FileMatcher`. Each match is `{ vars, data: readonly FileArtifact[] }`. See [`FileGroupMatcher`](#filegroupmatcher-one-match-with-a-list-of-files).
+The `stamp` option sets the stamp mode of each `FileArtifact` that the matcher sends. Default `"hash"`. The `syntax` option sets the markers of the pattern, as for `FileMatcher`. The constructor throws for a pattern with no `anyName` or `anyFolders` (by default `*` or `**`), a var in or after the first part with a glob, a `**` at the end, a `**` inside a name, and each other error of `FileMatcher`. Each match is `{ vars, data: readonly FileArtifact[] }`. See [`FileGroupMatcher`](#filegroupmatcher-one-match-with-a-list-of-files).
 
 ## S3 (`dapat/contrib`)
 

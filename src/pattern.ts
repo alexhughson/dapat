@@ -40,6 +40,11 @@ export class KeyPattern {
   readonly template: string
   readonly varNames: readonly string[]
   readonly hasGlob: boolean
+  /**
+   * The text of each literal part, in order: the text between the vars and the globs. A caller that must
+   * reject a stray `varStart` or `varEnd` checks these texts, so that one tokenizer decides the parse.
+   */
+  readonly literalTexts: readonly string[]
   readonly syntax: PatternSyntax
   private readonly segments: Segment[]
   private readonly keyRegex: RegExp
@@ -55,6 +60,7 @@ export class KeyPattern {
     const meta = collectMeta(this.segments)
     this.varNames = meta.varNames
     this.hasGlob = meta.hasGlob
+    this.literalTexts = literalTextsOf(this.segments)
     this.keyRegex = keyRegexOf(this.segments)
   }
 
@@ -169,6 +175,21 @@ function parseSegment(raw: string, template: string, syntax: PatternSyntax, toke
     parts.push({ kind: "lit", value: raw.slice(last) })
   }
   return { kind: "mix", parts }
+}
+
+function literalTextsOf(segments: Segment[]): string[] {
+  const texts: string[] = []
+  for (const segment of segments) {
+    if (segment.kind === "lit") {
+      texts.push(segment.value)
+      continue
+    }
+    if (segment.kind !== "mix") continue
+    for (const part of segment.parts) {
+      if (part.kind === "lit") texts.push(part.value)
+    }
+  }
+  return texts
 }
 
 function collectMeta(segments: Segment[]): {
