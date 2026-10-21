@@ -1288,6 +1288,7 @@ build.each({
 - `required` (optional) names the matchers that each joined set must have a match of. If you leave it out, every matcher is required ([`required`](#required-matchers-that-a-set-can-do-without)).
 - `outputsByName` (optional) names output templates. `tasks` gets each one filled in with the vars of the set ([`outputsByName`](#outputsbyname-output-templates)).
 - `tasks` gets the vars and the matched artifacts by name of one joined set. It returns the tasks for that set. Write it as a generator (`*tasks`), so it can yield no task, one task, or many tasks.
+- `name` and `run` take the place of `tasks` when each set needs exactly one task ([The one-task form](#the-one-task-form-name-and-run)). Give `tasks`, or `name` and `run`, not both.
 
 `tasks` can yield more than one task for a match:
 
@@ -1334,6 +1335,42 @@ build.each({
 - Each var of a template must be a var of some matcher. Else `build.each` throws.
 - A set with no value for a var of a template gets no tasks: the build does not call `tasks` for it. This happens when the var comes only from a matcher that is not in `required` and has no match in the set.
 - A var value that is empty, holds `/`, or is `.` or `..` makes the build fail.
+
+### The one-task form: `name` and `run`
+
+When each joined set needs one task whose inputs are the matched artifacts, give `name` and `run` in place of `tasks`. The example above becomes:
+
+```ts
+build.each({
+  name: "page",
+  matchersByName: {
+    page: new FileMatcher("content/<lang>/<section>/<slug>.md"),
+    template: new FileMatcher("templates/<lang>.html"),
+  },
+  outputsByName: { html: new FileTemplate("site/<lang>/<section>/<slug>.html") },
+  async run({ matched, outputs }) {
+    const text = await Bun.file(matched.page.data.path).text()
+    const layout = await Bun.file(matched.template.data.path).text()
+    await Bun.write(outputs.html.path, layout.replace("{{body}}", () => text))
+  },
+})
+```
+
+The build makes one task for each joined set:
+
+```
+for each joined set:
+├── outputs = each template of outputsByName, filled in, in its order -> outputs.html = site/en/docs/install.html
+│   (a template that the set has no value for: no task)
+├── id      = name + ":" + the values of vars joined by "/"           -> "page:en/docs/install"
+├── inputs  = the data of each matched artifact, in matchersByName order
+│   (a group adds each of its files; a matcher with no match adds nothing)
+└── run     = (ctx) => run({ vars, matched, outputs, ctx })
+```
+
+The values are in the order of `vars` ([Joins on shared var names](#joins-on-shared-var-names)). A var with no value in the set, from a matcher that is not required, adds no part. A set with no vars gets the id `name`. The id follows the order of `matchersByName`. If you change that order, each id changes, so each task runs again. An optional match that comes or goes also changes the id of its set ([Limits](#13-limits)).
+
+Two sets can give one id when a var has no value in one set and another var has a value in the other set. For example, with `A: a/<a>/<lang>.txt` before the required `P: p/<lang>.txt`, and `B: b/<lang>/<b>.txt`, the sets `{ a: "en", lang: "x" }` and `{ lang: "en", b: "x" }` both give `page:en/x`. Then `build.run()` rejects with the duplicate-id error ([Errors in `build.each`](#errors-in-buildeach)). Use `tasks` for such a join. Use `tasks` also when a task needs an input that no matcher gives, an output that no template can name, or more than one task for each set.
 
 ### Scans finish before tasks start
 
@@ -1854,8 +1891,12 @@ type TaskMaterializerConfig<
   matchersByName: M
   required?: readonly R[]
   outputsByName?: O
-  tasks: (vars: JoinedVars<M, R>, matched: MatchedByName<M, R>, outputs: OutputsByName<O>) => Iterable<Task>
-}
+} & (
+  | { tasks: (vars: JoinedVars<M, R>, matched: MatchedByName<M, R>, outputs: OutputsByName<O>) => Iterable<Task>; name?: never; run?: never }
+  | { name: string; run: (args: RunArgs<M, R, O>) => Promise<void>; tasks?: never }
+)
+
+type RunArgs<M, R, O> = { vars: JoinedVars<M, R>; matched: MatchedByName<M, R>; outputs: OutputsByName<O>; ctx: Context }
 
 type JoinedVars<M extends Record<string, AnyMatcher>, R extends keyof M & string = keyof M & string> =
   [Exclude<keyof M, R>] extends [never] ? Vars : Readonly<Record<string, string | undefined>>
@@ -1868,6 +1909,8 @@ type MatchedByName<M extends Record<string, AnyMatcher>, R extends keyof M & str
 `R` is the names in `required`. If you leave `required` out, `R` is every name, so no matched artifact is `undefined`. A matcher that is not in `R` can be `undefined` in `matched`. It left-joins onto the matchers in `R`, after the earlier matchers that are not in `R`, in name order, on its ON vars. Each of its matches that agrees makes its own joined set. `JoinedVars` is `Vars` when every name is in `R`, else `Readonly<Record<string, string | undefined>>`. `required` must name at least one matcher. See [`required`](#required-matchers-that-a-set-can-do-without).
 
 `AnyMatcher` is `Matcher<any>`: a matcher of any data type. Each matched artifact has the data type of its own matcher: `DataOf` reads `D` from the matcher type. `matchersByName` must have at least one entry, and its required matchers must form one connected group by shared var names. `tasks` gets the vars of one joined set, which hold the vars of all its matches (a var of a matcher with no match in the set is `undefined`), and each matched artifact under its matcher's name. See [The `build.each` config](#the-buildeach-config).
+
+The config has `tasks`, or `name` and `run`. The exported types `TasksConfig<M, R, O>` and `RunConfig<M, R, O>` are the two forms. Each one sets the fields of the other to `never`, so a config with both is a type error, and `build.each` also throws for it at run time. `run` needs a `name`. See [The one-task form](#the-one-task-form-name-and-run).
 
 ### `interface ArtifactTemplate<R>` and `type OutputsByName<O>`
 
