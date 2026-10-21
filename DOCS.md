@@ -1286,6 +1286,7 @@ build.each({
 
 - `matchersByName` names the matchers. The names are yours. `tasks` gets each matched artifact under the name of its matcher, as `matched.post`. With two or more matchers, they join on their shared var names ([Joins on shared var names](#joins-on-shared-var-names)).
 - `required` (optional) names the matchers that each joined set must have a match of. If you leave it out, every matcher is required ([`required`](#required-matchers-that-a-set-can-do-without)).
+- `outputsByName` (optional) names output templates. `tasks` gets each one filled in with the vars of the set ([`outputsByName`](#outputsbyname-output-templates)).
 - `tasks` gets the vars and the matched artifacts by name of one joined set. It returns the tasks for that set. Write it as a generator (`*tasks`), so it can yield no task, one task, or many tasks.
 
 `tasks` can yield more than one task for a match:
@@ -1301,6 +1302,38 @@ build.each({
 Each joined set has one task group ([Task groups](#task-groups)). With one matcher, each match is a joined set. The label of the group is `build.each <number> <var name>=<var value> ...`, for example `build.each 1 slug=hello`. dapat counts the `build.each` calls from 1, in order. The vars are in the order of `vars` ([Joins on shared var names](#joins-on-shared-var-names)). A task id must be unique in the build. If two joined sets give one task id, or a match gives the id of a task that you added with `build.add`, `build.run()` rejects ([Errors in `build.each`](#errors-in-buildeach)). So put the vars in the task id, as `page:${vars.slug}` does.
 
 Call `build.each` before the first `build.run()`. After that, it throws.
+
+### `outputsByName`: output templates
+
+An output template names the output of a task with the same vars as the matchers. For each joined set, the build fills in each template and gives the results to `tasks` as its third argument:
+
+```ts
+build.each({
+  matchersByName: {
+    page: new FileMatcher("content/<lang>/<section>/<slug>.md"),
+    template: new FileMatcher("templates/<lang>.html"),
+  },
+  outputsByName: { html: new FileTemplate("site/<lang>/<section>/<slug>.html") },
+  *tasks(vars, matched, outputs) {
+    yield new Task({
+      id: `page:${vars.lang}/${vars.section}/${vars.slug}`,
+      inputs: [matched.page.data, matched.template.data],
+      outputs: [outputs.html],
+      run: async () => {
+        const text = await Bun.file(matched.page.data.path).text()
+        const layout = await Bun.file(matched.template.data.path).text()
+        await Bun.write(outputs.html.path, layout.replace("{{body}}", () => text))
+      },
+    })
+  },
+})
+```
+
+`outputs.html` is a `FileArtifact`, typed from the template. A template only names a path: the task must still list it in `outputs`. `FolderTemplate("out/<book>/pages/")` gives a `FilesystemPrefix`. Both take the options of `FileMatcher` (`stamp` and `syntax`). A `*` or `**` makes the constructor throw, because an output names one path.
+
+- Each var of a template must be a var of some matcher. Else `build.each` throws.
+- A set with no value for a var of a template gets no tasks: the build does not call `tasks` for it. This happens when the var comes only from a matcher that is not in `required` and has no match in the set.
+- A var value that is empty, holds `/`, or is `.` or `..` makes the build fail.
 
 ### Scans finish before tasks start
 
@@ -1383,7 +1416,7 @@ The [API reference](#api-reference) gives the full details of each class.
 
 A relative path resolves against the current working directory when you create the object.
 
-To make tasks for each file that fits a pattern, use `FileMatcher` ([`FileMatcher`](#filematcher-one-match-for-each-file)). To make tasks for each list of files, use `FileGroupMatcher` ([`FileGroupMatcher`](#filegroupmatcher-one-match-with-a-list-of-files)).
+To make tasks for each file that fits a pattern, use `FileMatcher` ([`FileMatcher`](#filematcher-one-match-for-each-file)). To make tasks for each list of files, use `FileGroupMatcher` ([`FileGroupMatcher`](#filegroupmatcher-one-match-with-a-list-of-files)). To name the output file or folder of each joined set, use `FileTemplate` or `FolderTemplate` in `outputsByName` ([`outputsByName`](#outputsbyname-output-templates)).
 
 | Class | Stamp | Value |
 | --- | --- | --- |
@@ -1810,13 +1843,18 @@ type MatchedArtifactEvent<D extends MatchedData = MatchedData> =
 
 The vars of a matched artifact are its key. A `found` with known vars and new data replaces the match, a `found` with the same artifact ids in the same order does nothing, and a `gone` removes it. One artifact and a list of one artifact are different data. A `gone` with wrong var names makes `build.run()` reject. See [Matched artifacts](#matched-artifacts).
 
-### `type TaskMaterializerConfig<M, R>`, `type MatchedByName<M, R>`, and `type JoinedVars<M, R>`
+### `type TaskMaterializerConfig<M, R, O>`, `type MatchedByName<M, R>`, and `type JoinedVars<M, R>`
 
 ```ts
-type TaskMaterializerConfig<M extends Record<string, AnyMatcher>, R extends keyof M & string = keyof M & string> = {
+type TaskMaterializerConfig<
+  M extends Record<string, AnyMatcher>,
+  R extends keyof M & string = keyof M & string,
+  O extends Record<string, ArtifactTemplate> = {},
+> = {
   matchersByName: M
   required?: readonly R[]
-  tasks: (vars: JoinedVars<M, R>, matched: MatchedByName<M, R>) => Iterable<Task>
+  outputsByName?: O
+  tasks: (vars: JoinedVars<M, R>, matched: MatchedByName<M, R>, outputs: OutputsByName<O>) => Iterable<Task>
 }
 
 type JoinedVars<M extends Record<string, AnyMatcher>, R extends keyof M & string = keyof M & string> =
@@ -1830,6 +1868,18 @@ type MatchedByName<M extends Record<string, AnyMatcher>, R extends keyof M & str
 `R` is the names in `required`. If you leave `required` out, `R` is every name, so no matched artifact is `undefined`. A matcher that is not in `R` can be `undefined` in `matched`. It left-joins onto the matchers in `R`, after the earlier matchers that are not in `R`, in name order, on its ON vars. Each of its matches that agrees makes its own joined set. `JoinedVars` is `Vars` when every name is in `R`, else `Readonly<Record<string, string | undefined>>`. `required` must name at least one matcher. See [`required`](#required-matchers-that-a-set-can-do-without).
 
 `AnyMatcher` is `Matcher<any>`: a matcher of any data type. Each matched artifact has the data type of its own matcher: `DataOf` reads `D` from the matcher type. `matchersByName` must have at least one entry, and its required matchers must form one connected group by shared var names. `tasks` gets the vars of one joined set, which hold the vars of all its matches (a var of a matcher with no match in the set is `undefined`), and each matched artifact under its matcher's name. See [The `build.each` config](#the-buildeach-config).
+
+### `interface ArtifactTemplate<R>` and `type OutputsByName<O>`
+
+```ts
+interface ArtifactTemplate<R extends Ref = Ref> {
+  readonly varNames: readonly string[]
+  expand(vars: Vars): R
+}
+type OutputsByName<O extends Record<string, ArtifactTemplate>> = { readonly [K in keyof O]: O[K] extends ArtifactTemplate<infer R> ? R : never }
+```
+
+A template makes one artifact or prefix from the vars of a joined set. `build.each` calls `expand` only with vars that hold each name of `varNames`. Each entry of `OutputsByName` has the ref type of its template, so `outputs.html` of a `FileTemplate` is a `FileArtifact`. `FileTemplate` and `FolderTemplate` are in `dapat/contrib`. See [`outputsByName`](#outputsbyname-output-templates).
 
 ## Filesystem (`dapat/contrib`)
 
@@ -1894,6 +1944,21 @@ new FileGroupMatcher(pattern: string, opts?: { stamp?: "hash" | "time"; syntax?:
 | `receiveArtifactEvent(event)` | A file gets and loses its match as in `FileMatcher`. Each change sends `found` with the new list of the group of the file, or `gone` when the list becomes empty. |
 
 The `stamp` option sets the stamp mode of each `FileArtifact` that the matcher sends. Default `"hash"`. The `syntax` option sets the markers of the pattern, as for `FileMatcher`. The constructor throws for a pattern with no `anyName` or `anyFolders` (by default `*` or `**`), a var in or after the first part with a glob, a `**` at the end, a `**` inside a name, and each other error of `FileMatcher`. Each match is `{ vars, data: readonly FileArtifact[] }`. See [`FileGroupMatcher`](#filegroupmatcher-one-match-with-a-list-of-files).
+
+### `class FileTemplate implements ArtifactTemplate<FileArtifact>` and `class FolderTemplate implements ArtifactTemplate<FilesystemPrefix>`
+
+```ts
+new FileTemplate(pattern: string, opts?: { stamp?: "hash" | "time"; syntax?: FilePatternSyntax })
+new FolderTemplate(pattern: string, opts?: { stamp?: "hash" | "time"; syntax?: FilePatternSyntax })
+```
+
+| Member | Value |
+| --- | --- |
+| `pattern` | The pattern without `./`, for example `site/<lang>/<slug>.html`. |
+| `varNames` | The vars of the pattern, in order. |
+| `expand(vars)` | `FileTemplate`: the `FileArtifact` of the path with each var filled in. `FolderTemplate`: the `FilesystemPrefix` of that path. A relative pattern resolves against the working directory when you create the template. Throws for a var value that is empty, holds `/`, or is `.` or `..`. |
+
+The pattern and the options are those of `FileMatcher`, also `syntax`. The constructor throws for a `*` or `**` (or the `anyName` and `anyFolders` of `syntax`), because an output names one path, and for each other error of `FileMatcher`. See [`outputsByName`](#outputsbyname-output-templates).
 
 ## S3 (`dapat/contrib`)
 

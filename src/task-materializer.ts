@@ -2,7 +2,8 @@ import type { Artifact } from "./artifact"
 import type { AnyMatcher, DataOf } from "./matcher"
 import type { MatchedArtifact, MatchedArtifactEvent, MatchedData, Vars } from "./matched-artifact"
 import { JoinIndex, MatchTable, joinFrom, planJoins, type ArtifactIds, type BaseSet, type JoinStep, type JoinedSet, type StoredMatch } from "./match-join"
-import type { Task } from "./task"
+import type { ArtifactTemplate, RefOf } from "./artifact-template"
+import type { Ref, Task } from "./task"
 import { TaskGroup } from "./task-group"
 
 /**
@@ -23,7 +24,17 @@ export type JoinedVars<M extends Record<string, AnyMatcher>, R extends keyof M &
   ? Vars
   : Readonly<Record<string, string | undefined>>
 
-export type TaskMaterializerConfig<M extends Record<string, AnyMatcher>, R extends keyof M & string = keyof M & string> = {
+/** The templates of `outputsByName`, by name. */
+export type OutputTemplates = Record<string, ArtifactTemplate>
+
+/** What `tasks` gets as its third argument: each template of `outputsByName` expanded with the vars of the set. */
+export type OutputsByName<O extends OutputTemplates> = { readonly [K in keyof O]: RefOf<O[K]> }
+
+export type TaskMaterializerConfig<
+  M extends Record<string, AnyMatcher>,
+  R extends keyof M & string = keyof M & string,
+  O extends OutputTemplates = {},
+> = {
   /** The matchers to listen to, by name. Their matches join on the var names that they share. */
   matchersByName: M
   /**
@@ -32,10 +43,18 @@ export type TaskMaterializerConfig<M extends Record<string, AnyMatcher>, R exten
    */
   required?: readonly R[]
   /**
+   * Output templates, by name. For each joined set, the build expands each template with the vars of the set
+   * and gives the results to `tasks`. Each var of a template must be a var of some matcher. A set that has
+   * no value for a var of a template, because the matcher that has the var is not required and has no match,
+   * gets no tasks: the build does not call `tasks` for it.
+   */
+  outputsByName?: O
+  /**
    * Gives the tasks for one joined set of matches. It can give any number of tasks.
    * A var of a matcher that is not required is undefined when the set has no match of it.
+   * `outputs` holds each template of `outputsByName`, expanded.
    */
-  tasks: (vars: JoinedVars<M, R>, matched: MatchedByName<M, R>) => Iterable<Task>
+  tasks: (vars: JoinedVars<M, R>, matched: MatchedByName<M, R>, outputs: OutputsByName<O>) => Iterable<Task>
 }
 
 /** Gives the new tasks of one group to the build. The build applies them in steps: see Build.setTasksOfGroups. */
@@ -68,7 +87,7 @@ type Branch = {
  * of a set that changes and removes the tasks of a set that is gone.
  * The build never calls `hear` while another `hear` runs (see build.each).
  */
-export class TaskMaterializer<M extends Record<string, AnyMatcher>, R extends keyof M & string> {
+export class TaskMaterializer<M extends Record<string, AnyMatcher>, R extends keyof M & string, O extends OutputTemplates> {
   private readonly tablesByName = new Map<string, MatchTable>()
   // For each required matcher: the join steps from one of its matches to the other required matchers.
   private readonly joinStepsByName: Map<string, JoinStep[]>
@@ -79,7 +98,7 @@ export class TaskMaterializer<M extends Record<string, AnyMatcher>, R extends ke
 
   constructor(
     readonly number: number,
-    private readonly config: TaskMaterializerConfig<M, R>,
+    private readonly config: TaskMaterializerConfig<M, R, O>,
     private readonly setGroupTasks: SetGroupTasks,
   ) {
     const names = Object.keys(config.matchersByName)
@@ -135,6 +154,16 @@ export class TaskMaterializer<M extends Record<string, AnyMatcher>, R extends ke
       this.optionalMatchersByName.set(table.name, { table, sharedVarNames, onVarNames, baseIndex: new JoinIndex(sharedVarNames) })
     }
     this.joinStepsByName = planJoins(requiredTables, number)
+    const outputTemplates: OutputTemplates = config.outputsByName ?? {}
+    for (const [outputName, template] of Object.entries(outputTemplates)) {
+      for (const varName of template.varNames) {
+        if (!this.unionVarNames.includes(varName)) {
+          throw new Error(
+            `build.each ${number}: the output template '${outputName}' uses the var '${varName}', which no matcher has`,
+          )
+        }
+      }
+    }
   }
 
   hear(matcherName: string, event: MatchedArtifactEvent): void {
@@ -327,8 +356,23 @@ export class TaskMaterializer<M extends Record<string, AnyMatcher>, R extends ke
     }
     // fromEntries makes each name an own property, also a matcher named __proto__.
     const matched = Object.fromEntries(matchedEntries)
+    const outputEntries: [string, Ref][] = []
+    const outputTemplates: OutputTemplates = this.config.outputsByName ?? {}
+    for (const [outputName, template] of Object.entries(outputTemplates)) {
+      for (const varName of template.varNames) {
+        // A var of a matcher that is not required and has no match in this set. The output has no path,
+        // so the set gets no tasks.
+        if (!Object.hasOwn(set.vars, varName)) {
+          this.setGroupTasks(set.group, [])
+          return
+        }
+      }
+      outputEntries.push([outputName, template.expand(set.vars)])
+    }
+    // fromEntries makes each name an own property, also an output named __proto__.
+    const outputs = Object.fromEntries(outputEntries)
     const tasks: Task[] = []
-    for (const task of this.config.tasks(set.vars as JoinedVars<M, R>, matched as MatchedByName<M, R>)) {
+    for (const task of this.config.tasks(set.vars as JoinedVars<M, R>, matched as MatchedByName<M, R>, outputs as OutputsByName<O>)) {
       tasks.push(task)
     }
     this.setGroupTasks(set.group, tasks)
