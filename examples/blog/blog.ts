@@ -32,7 +32,8 @@ export function blogBuild(root: string): Build {
         run: async () => {
           const text = await Bun.file(page.path).text()
           const layout = await Bun.file(template.path).text()
-          await Bun.write(html.path, layout.replace("{{body}}", text))
+          // A function as the replacement, so that "$&" or "$'" in the page text stays as it is.
+          await Bun.write(html.path, layout.replace("{{body}}", () => text))
         },
       })
     },
@@ -87,7 +88,9 @@ function pageUrl(lang: string, relativePath: string): string | null {
     return null
   }
   const slug = fileName.slice(0, -".md".length)
-  return `${SITE_URL}/${lang}/${section}/${slug}.html`
+  // Percent-encoding also escapes "&", "<" and ">", so the url is safe as XML text.
+  const urlPath = [lang, section, `${slug}.html`].map(encodeURIComponent).join("/")
+  return `${SITE_URL}/${urlPath}`
 }
 
 function sitemapXml(urls: readonly string[]): string {

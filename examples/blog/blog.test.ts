@@ -157,6 +157,19 @@ test("the blog builds, skips, and runs only the tasks that each edit affects", a
     "https://example.com/en/blog/second-post.html",
   ])
 
+  // A file name with "&" or a space gets a percent-encoded url, and "$&" in the page text stays as it is.
+  await writeText(path.join(root, "content/fr/blog/q&a 1.md"), "Prix : $& et $'.\n")
+  const oddName = await runBuild(root)
+  expect(oddName.executed).toEqual(["page:fr/blog/q&a 1", "sitemap:fr"])
+  expect(await readText(path.join(root, "site/fr/blog/q&a 1.html"))).toBe(
+    `<html lang="fr"><body>Prix : $& et $'.\n</body></html>\n`,
+  )
+  expect(await sitemapUrls(path.join(root, "site/fr/sitemap.xml"))).toEqual([
+    "https://example.com/fr/blog/hello.html",
+    "https://example.com/fr/blog/q%26a%201.html",
+    "https://example.com/fr/docs/install.html",
+  ])
+
   // A page with no template of its lang gets no task. The es content folder has no sitemap task either.
   await writeText(path.join(root, "content/es/blog/hola.md"), "Hola.\n")
   const pageWithoutTemplate = await runBuild(root)

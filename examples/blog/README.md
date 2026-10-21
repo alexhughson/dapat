@@ -66,6 +66,7 @@ The e2e test [blog.test.ts](blog.test.ts) copies the input files into a temp fol
 | delete `content/en/docs/install.md` | `sitemap:en` |
 | add `content/es/blog/hola.md`, with no `templates/es.html` | none |
 | add `content/en/blog/notes.txt` and `content/en/blog/sub/deep.md` | `sitemap:en`, and it lists neither file |
+| add `content/fr/blog/q&a 1.md` | `page:fr/blog/q&a 1`, `sitemap:fr`, with the url `.../fr/blog/q%26a%201.html` |
 | add `templates/de.html` | `sitemap:de` |
 
 The file stamp is `"hash"`, the default. Thus a write of the same bytes runs no task.
@@ -74,9 +75,11 @@ The file stamp is `"hash"`, the default. Thus a write of the same bytes runs no 
 
 dapat does not delete files. When you delete `content/en/docs/install.md`, the task `page:en/docs/install` is gone, but `site/en/docs/install.html` stays on disk. A sitemap that listed `site/en/` would still list that page. So the sitemap lists `content/en/` and changes each `<section>/<slug>.md` into the url of its page.
 
+The same rule applies to a deleted template. When you delete `templates/fr.html`, the tasks of all fr pages and `sitemap:fr` are gone. `site/fr/` and its old `sitemap.xml` stay on disk.
+
 The cost: `pageUrl` in `blog.ts` repeats the part of the page pattern under the lang folder, `<section>/<slug>.md`. If you change the page pattern, change `pageUrl` too.
 
-The sitemap also runs for each edit of a page text, because the stamp of `content/en/` changes. It then writes the same bytes. The stamp of a `FilesystemPrefix` includes the hash of each file under it, not only the names.
+The sitemap also runs for each edit of a page text, and for each new or changed file under `content/en/` that is not a page, because the stamp of `content/en/` changes. It then writes the same bytes. The stamp of a `FilesystemPrefix` includes the hash of each file under it, not only the names.
 
 ## One writer for each file
 
