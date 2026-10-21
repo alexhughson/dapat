@@ -1694,8 +1694,8 @@ The constructor copies `inputs` and `outputs`. Later changes to your arrays do n
 ```ts
 interface TaskInit {
   id: string
-  inputs?: Ref[]
-  outputs?: Ref[]
+  inputs?: readonly Ref[]
+  outputs?: readonly Ref[]
   run: (ctx: Context) => Promise<void>
 }
 ```

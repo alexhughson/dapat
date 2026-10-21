@@ -19,8 +19,8 @@ export interface Context {
 
 export interface TaskInit {
   id: string
-  inputs?: Ref[]
-  outputs?: Ref[]
+  inputs?: readonly Ref[]
+  outputs?: readonly Ref[]
   run: (ctx: Context) => Promise<void>
 }
 
