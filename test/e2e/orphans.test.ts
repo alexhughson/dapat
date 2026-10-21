@@ -158,6 +158,7 @@ describe("orphans across runs", () => {
 
     const cleanupStore = new JsonStore(statePath)
     for (const orphan of second.orphans) {
+      // This program knows that chapters/<book>/ holds only the files of that book.
       for (const prefixId of orphan.prefixIds) {
         await fsPromises.rm(prefixId.slice("file:".length), { recursive: true, force: true })
       }

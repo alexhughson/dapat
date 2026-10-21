@@ -2590,6 +2590,60 @@ describe("orphans", () => {
     )
   })
 
+  test("a renamed task keeps its output out of the orphan of its old id", async () => {
+    const store = new MemoryStore()
+    const shared = new Mem("mem:x.txt")
+    const oldOnly = new Mem("mem:x.log")
+    const first = new Build({ store })
+    first.add(
+      new Task({
+        id: "page:x",
+        outputs: [shared, oldOnly],
+        run: async () => {
+          shared.write("1")
+          oldOnly.write("1")
+        },
+      }),
+    )
+    await first.run()
+
+    // The task has a new id and the same output.
+    const second = new Build({ store })
+    second.add(new Task({ id: "html:x", outputs: [shared], run: async () => shared.write("2") }))
+    const result = await second.run()
+    expect(result.success).toBe(true)
+    // mem:x.txt belongs to html:x now, so a program that deletes the orphan outputs must not get it.
+    expect(result.orphans).toEqual([{ taskId: "page:x", outputIds: ["mem:x.log"], prefixIds: [] }])
+  })
+
+  test("a prefix that a task in the build declares as a prefix output now is not in the orphan", async () => {
+    const store = new MemoryStore()
+    const site = new MemPrefix("mem:site/", [])
+    const cache = new MemPrefix("mem:cache/", [])
+    const first = new Build({ store })
+    first.add(new Task({ id: "assets", outputs: [site, cache], run: async () => {} }))
+    await first.run()
+
+    const second = new Build({ store })
+    second.add(new Task({ id: "pages", outputs: [site], run: async () => {} }))
+    const result = await second.run()
+    expect(result.orphans).toEqual([{ taskId: "assets", outputIds: [], prefixIds: ["mem:cache/"] }])
+  })
+
+  test("a store whose entries() gives one id two times gives one orphan for it", async () => {
+    class RepeatingStore extends MemoryStore {
+      override async entries(): Promise<Iterable<readonly [string, TaskState]>> {
+        const records = [...(await super.entries())]
+        return [...records, ...records]
+      }
+    }
+    const store = new RepeatingStore()
+    await store.set("old", { inputStamps: {}, outputStamps: { "artifact mem:a": "1" } })
+    const build = new Build({ store })
+    const result = await build.run()
+    expect(result.orphans).toEqual([{ taskId: "old", outputIds: ["mem:a"], prefixIds: [] }])
+  })
+
   test("a run that rejects gives no result, and so no orphans", async () => {
     const store = new MemoryStore()
     await store.set("old", { inputStamps: {}, outputStamps: {} })

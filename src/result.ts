@@ -8,8 +8,9 @@ export type Outcome =
 
 /**
  * A record in the store that no task of the build owns at the end of the run.
- * `outputIds` are the ids of the artifact outputs in the record. `prefixIds` are the ids of
- * the prefix outputs that existed at the last run. dapat deletes nothing.
+ * `outputIds` are the ids of the artifact outputs in the record that no task in the build declares now.
+ * `prefixIds` are the ids of the prefix outputs in the record that no task in the build declares
+ * as a prefix output now. dapat deletes nothing.
  */
 export type Orphan = { taskId: string; outputIds: readonly string[]; prefixIds: readonly string[] }
 

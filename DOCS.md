@@ -537,23 +537,27 @@ At the end of each `build.run()`, the build reads all the records with one call 
 type Orphan = { taskId: string; outputIds: readonly string[]; prefixIds: readonly string[] }
 ```
 
-- `outputIds` are the ids of the artifact outputs in the record, in the order of the record. The id of a `FileArtifact` is `file:` and the absolute path, for example `file:/home/me/site/fr/hello.html`.
+- `outputIds` are the ids of the artifact outputs in the record that no task in the build declares now, in the order of the record. The id of a `FileArtifact` is `file:` and the absolute path, for example `file:/home/me/site/fr/hello.html`.
 - A record keeps an output that did not exist with a `null` stamp. Its id is in `outputIds` too.
-- `prefixIds` are the ids of the prefix outputs in the record, in the order of the record. The id of a `FilesystemPrefix` is `file:` and the absolute path of the folder, with a `/` at the end.
+- `prefixIds` are the ids of the prefix outputs in the record that no task in the build declares as a prefix output now, in the order of the record. The id of a `FilesystemPrefix` is `file:` and the absolute path of the folder, with a `/` at the end.
 - A prefix that had a `null` stamp at the last run has no key in the record, so its id is not in `prefixIds`. For a `FilesystemPrefix`, a `null` stamp is not possible, because a missing folder has the stamp of an empty list. An `IdPrefix` always has a `null` stamp.
 - A record in an older shape ([section 7](#7-stores)) gives an orphan with no `outputIds` and no `prefixIds`.
-- `result.orphans` is in task id order.
+- `result.orphans` is in task id order, with one orphan for each task id.
+
+An output that a task in the build declares now is not in the orphan. For example, run 1 has the task `page:x` with the output `x.txt`. In run 2, you rename the task to `html:x`, with the same output. Then `page:x` is an orphan, but `x.txt` is not in its `outputIds`, because `html:x` owns it now. Thus a program that deletes the `outputIds` does not delete the output of a live task.
 
 These records are not orphans:
 
 - The record of a task that ran, skipped, failed, or was cancelled, and is still in the build.
 - The record of a task that the build removed during the run. The build deletes that record ([Removal](#removal)). If that delete rejects, the error is in `result.errors`, and the record is an orphan, because no task owns it now.
 
+A `build.remove` that you call while `build.run()` reads the store at the end can make that task an orphan in that result.
+
 **dapat deletes nothing.** Your program decides what to delete. The orphan stays in each result until you delete its record with `store.delete(taskId)`. If you delete the record but not the outputs, dapat forgets the outputs.
 
 With no store, the build reads nothing, and `result.orphans` is empty. When `build.run()` rejects, you get no result, and so no orphans. If `store.entries()` rejects, the error goes to `result.errors`, so `result.success` is `false`, and `result.orphans` is empty. The tasks of the run are not changed by this error.
 
-This program deletes the outputs of each orphan, and then its record:
+This program deletes the output files of each orphan, and then its record. It does not delete the prefix folders. It prints them, and you decide. A folder can hold the files of other tasks, or your sources. For example, an old task declared `site/`, and the live tasks write `site/a.html` as artifacts. `site/` is in `prefixIds`, because no live task declares it as a prefix, but `rm -r site/` deletes the files of the live tasks.
 
 ```ts
 import { rm } from "node:fs/promises"
@@ -567,10 +571,8 @@ const result = await build.run()
 
 for (const orphan of result.orphans) {
   for (const prefixId of orphan.prefixIds) {
-    if (!prefixId.startsWith("file:")) continue
-    const folderPath = prefixId.slice("file:".length)
-    console.log(`delete ${folderPath}, the old folder of ${orphan.taskId}`)
-    await rm(folderPath, { recursive: true, force: true })
+    // A folder can hold files that other tasks own. Do not delete it here.
+    console.log(`check ${prefixId}, the old folder of ${orphan.taskId}`)
   }
   for (const outputId of orphan.outputIds) {
     // This program has only file outputs. Keep the outputs of other kinds.
@@ -1615,7 +1617,7 @@ A prefix whose region is the id string. Its stamp is `null`, because an id strin
 | `set(taskId, state): Promise<void>` | Writes a record. The build calls it after each successful run. |
 | `delete(taskId): Promise<void>` | Deletes a record. The build calls it from `remove`. |
 | `clear(): Promise<void>` | Deletes every record. The build does not call it. |
-| `entries(): Promise<Iterable<readonly [string, TaskState]>>` | Each record and its task id, in any order. The build calls it one time at the end of each `run()` to find the orphans ([Orphans](#orphans)). Read all the records in one step: the build can call it for a store with many thousands of records. |
+| `entries(): Promise<Iterable<readonly [string, TaskState]>>` | Each record and its task id, in any order. Give each task id one time. If an id comes again, the build uses its first record. The build calls it one time at the end of each `run()` to find the orphans ([Orphans](#orphans)). Read all the records in one step: the build can call it for a store with many thousands of records. |
 
 To write your own store, implement these five methods. A store from an older version has no `entries()`. Add it: TypeScript rejects a store without it, and the `Build` constructor throws for a store object without an `entries` method, for example a store in JavaScript. A record holds strings and `null` only, so `JSON.stringify` can encode it as it is. `get` can return a record in an older shape. The build then treats it as no record ([section 7](#7-stores)).
 
@@ -1658,7 +1660,7 @@ Keeps records in a `Map`. The records are lost when the process ends. `MemorySto
 type Orphan = { taskId: string; outputIds: readonly string[]; prefixIds: readonly string[] }
 ```
 
-A record in the store that no task of the build owns. `outputIds` are the ids of the artifact outputs in the record. `prefixIds` are the ids of the prefix outputs in the record. A prefix with a `null` stamp is not in the record. See [Orphans](#orphans).
+A record in the store that no task of the build owns. `outputIds` are the ids of the artifact outputs in the record that no task in the build declares now. `prefixIds` are the ids of the prefix outputs in the record that no task in the build declares as a prefix output now. A prefix with a `null` stamp is not in the record. See [Orphans](#orphans).
 
 ### `type Outcome`
 

@@ -418,16 +418,34 @@ export class Build extends Emitter<ArtifactEvent> {
    * The records in the store whose task id is not a task of the build now. A task that the
    * build dropped during the run had its record deleted, so it is not here, unless that delete
    * failed. The build reads the store one time. A read that rejects goes to `errors`.
+   * Each orphan keeps only the outputs that no task in the build declares now, so that a
+   * program that deletes them does not delete the output of a live task.
    */
   private async findOrphans(store: Store): Promise<Orphan[]> {
+    const declaredPrefixIds = new Set<string>()
+    for (const entry of this.prefixOutputs) {
+      declaredPrefixIds.add(entry.output.id)
+    }
     const orphans: Orphan[] = []
+    // A custom store can give one id two times. The first record wins.
+    const seenTaskIds = new Set<string>()
     // The loop is in the try too: the iterable of a custom store can throw.
     try {
       const records = await store.entries()
       for (const [taskId, record] of records) {
         if (this.slots.has(taskId)) continue
-        const outputIds = outputIdsOf(record, ARTIFACT_KEY_START)
-        const prefixIds = outputIdsOf(record, PREFIX_KEY_START)
+        if (seenTaskIds.has(taskId)) continue
+        seenTaskIds.add(taskId)
+        const outputIds: string[] = []
+        for (const outputId of outputIdsOf(record, ARTIFACT_KEY_START)) {
+          if (this.exactOutputs.has(outputId)) continue
+          outputIds.push(outputId)
+        }
+        const prefixIds: string[] = []
+        for (const prefixId of outputIdsOf(record, PREFIX_KEY_START)) {
+          if (declaredPrefixIds.has(prefixId)) continue
+          prefixIds.push(prefixId)
+        }
         orphans.push({ taskId, outputIds, prefixIds })
       }
     } catch (error) {
@@ -1057,7 +1075,7 @@ function outputIdsOf(record: TaskState, keyStart: string): string[] {
   return ids
 }
 
-/** Task id order. Two orphans never have the same task id. */
+/** Task id order. findOrphans keeps one orphan for each task id, so no two are equal. */
 function compareOrphans(first: Orphan, second: Orphan): number {
   if (first.taskId < second.taskId) return -1
   if (first.taskId > second.taskId) return 1
