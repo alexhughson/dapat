@@ -143,6 +143,24 @@ describe("agent loop example", () => {
     expect(ids(third.executed)).toEqual([])
   })
 
+  test("a turn whose prompt is gone gets no act or advance task", async () => {
+    const root = await tempRoot()
+    await writeText(path.join(root, "inbox/intro.txt"), "What is a stamp?\n")
+    await runLoop(root)
+
+    // turns/intro/0 and turns/intro/1 stay. Without the join on the prompt, act:intro/1 would exist
+    // at the scan, skip with the old step.json, and advance:intro/1 would read old results.
+    await fsPromises.rm(path.join(root, "prompts"), { recursive: true })
+    await writeText(path.join(root, "inbox/intro.txt"), INTRO_QUESTION)
+    const result = await runLoop(root)
+    expect(ids(result.executed)).toEqual(sessionTasks("intro", 2))
+
+    const answer = await Bun.file(path.join(root, "answers/intro.txt")).text()
+    expect(answer).toBe(`${DAPAT_NOTE}\n${STAMP_NOTE}\n${TASK_NOTE}\n`)
+    const rerun = await runLoop(root)
+    expect(ids(rerun.executed)).toEqual([])
+  })
+
   test("an exact next-prompt output makes the build add turns until the send limit", async () => {
     // This is a cut-down rule with only advance, not the example pipeline.
     // advance declares the file prompts/<sid>/<n+1>/prompt.txt, not its folder.

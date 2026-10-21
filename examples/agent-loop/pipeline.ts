@@ -65,10 +65,15 @@ export function addAgentLoop(build: Build, root: string, think: model.Model): vo
   })
 
   build.each({
-    matchersByName: { step: new FileMatcher(path.join(root, "turns/<sid>/<n>/step.json")) },
+    // The join on sid and n makes act and advance only for a turn that has both files. A step.json
+    // that is left from a turn whose prompt is gone gets no tasks.
+    matchersByName: {
+      prompt: new FileMatcher(path.join(root, "prompts/<sid>/<n>/prompt.txt")),
+      step: new FileMatcher(path.join(root, "turns/<sid>/<n>/step.json")),
+    },
     *tasks(vars, matched) {
+      const prompt = matched.prompt.data
       const step = matched.step.data
-      const prompt = new FileArtifact(path.join(root, "prompts", vars.sid, vars.n, "prompt.txt"))
       const results = new FilesystemPrefix(path.join(root, "turns", vars.sid, vars.n, "results"))
       const nextTurn = Number(vars.n) + 1
       const nextPromptFolder = new FilesystemPrefix(path.join(root, "prompts", vars.sid, String(nextTurn)))

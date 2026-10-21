@@ -47,7 +47,8 @@ build.each 1: inbox = FileMatcher("inbox/<sid>.txt")
 build.each 2: prompt = FileMatcher("prompts/<sid>/<n>/prompt.txt")
 └─ think:<sid>/<n>   prompt.txt → turns/<sid>/<n>/step.json            (the model call)
 
-build.each 3: step = FileMatcher("turns/<sid>/<n>/step.json")
+build.each 3: prompt = FileMatcher("prompts/<sid>/<n>/prompt.txt")
+              step   = FileMatcher("turns/<sid>/<n>/step.json")       (joined on sid and n)
 ├─ act:<sid>/<n>     step.json → folder turns/<sid>/<n>/results/        (the tool calls)
 └─ advance:<sid>/<n> prompt.txt, step.json, folder results/
                      → folder prompts/<sid>/<n+1>/                      (the next prompt, or nothing)
@@ -61,7 +62,7 @@ build.run()
 ├─ seed:intro writes prompts/intro/0/prompt.txt
 │  └─ produced event → the prompt matcher finds turn 0 → think:intro/0
 ├─ think:intro/0 writes turns/intro/0/step.json (tools: dapat, stamp)
-│  └─ produced event → the step matcher finds turn 0 → act:intro/0, advance:intro/0
+│  └─ produced event → build.each 3 has prompt and step of turn 0 → act:intro/0, advance:intro/0
 ├─ act:intro/0 writes results/1.txt and results/2.txt, each with ctx.produced
 ├─ advance:intro/0 writes prompts/intro/1/prompt.txt with ctx.produced
 │  └─ produced event → the prompt matcher finds turn 1 → think:intro/1
@@ -93,6 +94,8 @@ DOCS section 13 (Limits) describes this case.
 
 `act` deletes the old files in its results folder before it writes the new ones. A turn with fewer tool calls than the run before must not leave old results, because `advance` reads the whole folder. No matcher watches this folder, so these deletes do not remove any task during the run.
 
+`build.each 3` joins the prompt and the step of a turn. So `act` and `advance` exist only for a turn that has both files. Without the join, a `step.json` from an old run makes `act` at the scan, before the new prompt of that turn exists. Then `act` does not wait for `think`, skips with the old `step.json`, and `advance` reads old results. A test deletes `prompts/` and edits the question to show this case.
+
 ## When a question gets shorter
 
 dapat does not delete the old outputs of a task that is gone. Thus an edit can leave turns on disk from an older, longer loop.
@@ -102,6 +105,10 @@ For example, `inbox/intro.txt` took three turns. You change it to `What is a tas
 `answer:intro` follows the turns from turn 0 to the first answer, so it ignores turn 2. It does not take the highest turn number.
 
 `advance` does not clear its output folder before it writes, as `act` does. A test of that version cleared `prompts/<sid>/<n+1>/` at the start of each `advance` run and then wrote the prompt again. The delete sent a `deleted` event, so the prompt matcher removed `think` for that turn during the run. `act:intro/1` was waiting for that `think`, so it went on to its skip check and skipped with the old `step.json`. It ran only on the next build.
+
+## When a question is removed
+
+When you delete `inbox/<sid>.txt`, the build removes `seed:<sid>` and `answer:<sid>`. The old prompts and steps stay on disk, so `think`, `act` and `advance` of the old turns stay. Their inputs do not change, so they skip and call no model. `answers/<sid>.txt` stays.
 
 ## The test
 
@@ -113,6 +120,7 @@ For example, `inbox/intro.txt` took three turns. You change it to `What is a tas
 | a new question | only the tasks of the new session |
 | an edited question | every task of the session, plus the new turns |
 | a shorter question | the new turns run, the old turn 2 skips, the answer comes from the new chain, then nothing |
+| a turn whose prompt is gone | `prompts/` deleted and the question edited: every turn runs in the right order, then nothing |
 | an exact next-prompt output | `build.run()` rejects with `send limit` |
 
 ```sh
