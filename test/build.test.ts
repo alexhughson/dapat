@@ -185,7 +185,7 @@ describe("Build", () => {
           // The listener added "report" before ctx.produced returned,
           // so a second task with the same output is a duplicate.
           const duplicate = new Task({ id: "other", outputs: [report], run: async () => {} })
-          expect(() => ctx.add(duplicate)).toThrow(/duplicate output 'mem:report'/)
+          expect(() => build.add(duplicate)).toThrow(/duplicate output 'mem:report'/)
           second.write("2")
           ctx.produced(second)
           declared.write("d")
@@ -480,7 +480,7 @@ describe("Build", () => {
     }
   })
 
-  test("ctx.remove with a throwing withdrawn subscriber removes the task and drops the later events", async () => {
+  test("build.remove inside a task with a throwing withdrawn subscriber removes the task and drops the later events", async () => {
     const a = new Mem("mem:p/a")
     const b = new Mem("mem:p/b")
     const withdrawn: string[] = []
@@ -505,8 +505,8 @@ describe("Build", () => {
       new Task({
         id: "remover",
         inputs: [a, b],
-        run: async (ctx) => {
-          ctx.remove("write")
+        run: async () => {
+          build.remove("write")
           removeReturned = true
         },
       }),
@@ -523,7 +523,7 @@ describe("Build", () => {
     build.add(new Task({ id: "again", outputs: [a], run: async () => {} }))
   })
 
-  test("ctx.add that replaces a completed task with a throwing subscriber rejects run(), and the replacement does not run", async () => {
+  test("replacing a completed task from inside a task: a throwing subscriber rejects run(), and the replacement does not run", async () => {
     const old = new Mem("mem:old")
     const next = new Mem("mem:next")
     const executed: string[] = []
@@ -545,9 +545,9 @@ describe("Build", () => {
       new Task({
         id: "replacer",
         inputs: [old],
-        run: async (ctx) => {
+        run: async () => {
           executed.push("replacer")
-          ctx.add(
+          build.add(
             new Task({
               id: "t",
               outputs: [next],
@@ -565,7 +565,7 @@ describe("Build", () => {
     expect(executed).toEqual(["old t", "replacer"])
   })
 
-  test("build.add and build.remove inside a task reject run() on a subscriber error, as ctx.add and ctx.remove do", async () => {
+  test("build.add and build.remove inside a task reject run() on a subscriber error", async () => {
     const one = new Mem("mem:one")
     const two = new Mem("mem:two")
     const build = new Build()
@@ -576,7 +576,7 @@ describe("Build", () => {
     build.add(new Task({ id: "two", outputs: [two], run: async () => {} }))
     build.add(
       new Task({
-        id: "outside",
+        id: "editor",
         inputs: [one, two],
         run: async () => {
           build.remove("one")
@@ -989,8 +989,8 @@ describe("Build", () => {
     build.add(
       new Task({
         id: "remover",
-        run: async (ctx) => {
-          ctx.remove("victim")
+        run: async () => {
+          build.remove("victim")
         },
       }),
     )
@@ -1069,10 +1069,10 @@ describe("Build", () => {
       new Task({
         id: "parent",
         outputs: [done],
-        run: async (ctx) => {
+        run: async () => {
           executed.push("parent")
           done.write("p")
-          ctx.add(
+          build.add(
             new Task({
               id: "child",
               inputs: [done],
@@ -1524,15 +1524,15 @@ describe("promised and withdrawn events", () => {
     build.add(
       new Task({
         id: "parent",
-        run: async (ctx) => {
-          ctx.add(new Task({ id: "child", outputs: [c], run: async () => {} }))
-          log.push("ctx.add returned")
+        run: async () => {
+          build.add(new Task({ id: "child", outputs: [c], run: async () => {} }))
+          log.push("build.add returned")
         },
       }),
     )
 
     await build.run()
-    expect(log).toEqual(["promised mem:c by child", "ctx.add returned", "produced mem:c by child"])
+    expect(log).toEqual(["promised mem:c by child", "build.add returned", "produced mem:c by child"])
 
     build.add(new Task({ id: "later", outputs: [d], run: async () => {} }))
     expect(log.slice(3)).toEqual(["promised mem:d by later"])
@@ -1652,7 +1652,7 @@ describe("promised and withdrawn events", () => {
     expect(heard).toEqual([])
   })
 
-  test("a subscriber error on promised from ctx.add rejects run(), and the new task does not run", async () => {
+  test("adding a task from inside a task: a throwing promised subscriber rejects run(), and the new task does not run", async () => {
     const c = new Mem("mem:c")
     let addReturned = false
     let childRan = false
@@ -1663,7 +1663,7 @@ describe("promised and withdrawn events", () => {
     build.add(
       new Task({
         id: "parent",
-        run: async (ctx) => {
+        run: async () => {
           const child = new Task({
             id: "child",
             outputs: [c],
@@ -1671,7 +1671,7 @@ describe("promised and withdrawn events", () => {
               childRan = true
             },
           })
-          ctx.add(child)
+          build.add(child)
           addReturned = true
         },
       }),
@@ -1749,9 +1749,9 @@ describe("promised and withdrawn events", () => {
       new Task({
         id: "editor",
         inputs: [new IdPrefix("mem:p/")],
-        run: async (ctx) => {
-          ctx.remove("use:2")
-          ctx.add(
+        run: async () => {
+          build.remove("use:2")
+          build.add(
             new Task({
               id: "use:1",
               inputs: [one],
@@ -1987,7 +1987,7 @@ describe("promised and withdrawn events", () => {
           run: async (ctx) => {
             // Clean-up code that declares t again, with another output.
             ctx.signal.addEventListener("abort", () => {
-              ctx.add(new Task({ id: "t", outputs: [c], run: () => new Promise<void>(() => {}) }))
+              build.add(new Task({ id: "t", outputs: [c], run: () => new Promise<void>(() => {}) }))
             })
             started()
             await new Promise<void>((resolve) => ctx.signal.addEventListener("abort", () => resolve()))
