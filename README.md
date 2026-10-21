@@ -131,6 +131,8 @@ if (!result.success) {
 
 [examples/file-pipeline.ts](examples/file-pipeline.ts) uses `build.each` and `FileMatcher`. It makes one HTML page for each `content/<lang>/<slug>.md`, with the template `templates/<lang>.html`. It writes sample files when `content/` is missing. Run it two times from an empty folder: the second run skips each page.
 
+[examples/agent-loop/](examples/agent-loop/README.md) runs an agent loop: a question, model calls, tool calls, and the next prompt, until the model answers. The number of turns is known only at run time. A rerun with no edits calls the model zero times.
+
 
 
 ## Development
