@@ -9,7 +9,7 @@ Inputs and outputs can be files. They can also be S3 objects, database rows, or 
 When you run a build, dapat does these things:
 
 - **Order:** it starts a task only after the tasks that write its inputs have finished.
-- **Skip:** it skips a task when each input and output has the same stamp as in the last run, and each output still exists. A task with no input always runs. This needs a store. By default, the file artifacts use the modification time and the size as stamps, because that is fast. Pass `{ stamp: "hash" }` to use a hash of the bytes. Then an edit that restores the old bytes does not cause a rebuild. A folder (`new FilesystemPrefix("pages")`) also has a stamp, so a new file in a folder that a task reads makes the task run.
+- **Skip:** it skips a task when each input and output has the same stamp as in the last run, and each output still exists. A task with no input always runs. This needs a store. By default, the file artifacts use a hash of the bytes as stamps. So a file that a task writes again with the same bytes does not cause a rebuild. Pass `{ stamp: "time" }` to use the modification time and the size. That is faster, because dapat reads no bytes. But then a rewrite with the same bytes, a `touch`, or a git branch switch causes a rebuild. A folder (`new FilesystemPrefix("pages")`) also has a stamp, so a new file in a folder that a task reads makes the task run.
 - **Grow:** it adds tasks during the build. A subscriber (`build.subscribe`) gets a `promised` event for each output that a task declares, a `produced` event for each output that a task writes, a `deleted` event for each output that a task deletes, and a `withdrawn` event when the declaring task leaves the build. The subscriber can add the task that reads that output. dapat calls subscribers synchronously, so the new task exists before the writer continues. If a subscriber throws, `build.run()` rejects with that error.
 
 ```
@@ -98,7 +98,7 @@ if (!result.success) {
 1. **First run.** Both tasks execute. `out.txt` contains `[HELLO]`.
 2. **No change.** Both tasks skip.
 3. **Change** `in.txt` **to** `bye`**.** Both tasks execute. `out.txt` contains `[BYE]`.
-4. **Run** `touch in.txt`**.** The modification time changes, so the default stamp of `in.txt` changes. Both tasks run. With `new FileArtifact("in.txt", { stamp: "hash" })`, the bytes decide the stamp, and both tasks skip.
+4. **Run** `touch in.txt`**.** The modification time changes, but the bytes do not. The default stamp is a hash of the bytes, so both tasks skip. With `new FileArtifact("in.txt", { stamp: "time" })`, the modification time is part of the stamp, and both tasks run.
 
 `build.run()` does not throw when a task fails. Always check `result.success`.
 

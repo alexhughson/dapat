@@ -5,9 +5,10 @@ import { hashLines, sha256Hex } from "../hash"
 
 /**
  * How a file stamp sees a change.
+ * "hash" (the default): the SHA-256 of the bytes. It reads each file in full.
+ *   A rewrite with the same bytes keeps the stamp.
  * "time": the modified time in nanoseconds and the size. Fast: it reads no bytes.
- *   A touch or a git checkout that keeps the bytes still changes the stamp.
- * "hash": the SHA-256 of the bytes. It reads each file in full.
+ *   A touch, a rewrite with the same bytes, or a git checkout still changes the stamp.
  */
 export type FileStampMode = "time" | "hash"
 
@@ -23,9 +24,9 @@ const HASH_BATCH = 8
 // A file larger than this is streamed into the hash, not read whole.
 const STREAM_FROM = 1024 * 1024
 
-/** The stamp mode in `opts`. Default "time". Throws for an unknown mode. */
+/** The stamp mode in `opts`. Default "hash". Throws for an unknown mode. */
 export function stampMode(opts: FileStampOptions | undefined): FileStampMode {
-  const mode = opts?.stamp ?? "time"
+  const mode = opts?.stamp ?? "hash"
   if (mode !== "time" && mode !== "hash") {
     throw new Error(`stamp must be "time" or "hash", not ${JSON.stringify(mode)}`)
   }
@@ -41,7 +42,10 @@ export async function stampFile(filePath: string, mode: FileStampMode): Promise<
   try {
     info = await stat(filePath, { bigint: true })
   } catch (error) {
-    if (isMissing(error)) return null
+    if (isMissing(error)) {
+      hashCache.delete(filePath)
+      return null
+    }
     throw error
   }
   if (!info.isFile()) {
@@ -50,8 +54,51 @@ export async function stampFile(filePath: string, mode: FileStampMode): Promise<
   if (mode === "time") {
     return `${info.mtimeNs}:${info.size}`
   }
+  const identity = `${info.dev}:${info.ino}:${info.size}:${info.mtimeNs}:${info.ctimeNs}`
+  const cached = hashCache.get(filePath)
+  if (cached !== undefined && cached.identity === identity) {
+    const trustedBefore = cached.statTimeNs - RACY_WINDOW_NS
+    const mtimeIsOld = info.mtimeNs < trustedBefore
+    const ctimeIsOld = info.ctimeNs < trustedBefore
+    if (mtimeIsOld && ctimeIsOld) {
+      return cached.hash
+    }
+  }
+  const statTimeNs = BigInt(Date.now()) * 1_000_000n
+  const pending = hashOrNull(filePath, info.size)
+  hashCache.set(filePath, { identity, statTimeNs, hash: pending })
   try {
-    return await hashFile(filePath, info.size)
+    return await pending
+  } catch (error) {
+    // A failed read must not stay in the cache.
+    if (hashCache.get(filePath)?.hash === pending) {
+      hashCache.delete(filePath)
+    }
+    throw error
+  }
+}
+
+/**
+ * The hash of each file that this process read, by path, with the stat identity at that time.
+ * Many tasks can read one input, and each task stamps it. With this cache, the file is hashed
+ * one time while its stat stays the same. The entry holds the promise, so tasks that stamp
+ * the file at the same time share one read.
+ * The cache trusts the stat identity only inside one process, as "time" does in all cases.
+ * A new process hashes each file again, so the stamp is still the hash of the bytes.
+ * As in git, an entry is trusted only when the mtime and the ctime of the file are older than
+ * the stat of the entry by RACY_WINDOW_NS. Two writes of the same size inside one timestamp
+ * tick keep the stat the same, and this rule sees them.
+ * Edge case: a write that changes no stat value, for example a write through a shared mmap
+ * to a page that is already dirty, is not seen when the file is older than the window.
+ */
+const hashCache = new Map<string, { identity: string; statTimeNs: bigint; hash: Promise<string | null> }>()
+
+// Larger than the timestamp tick of coarse file systems: HFS+ and FAT keep 1 or 2 seconds.
+const RACY_WINDOW_NS = 2_000_000_000n
+
+async function hashOrNull(filePath: string, size: bigint): Promise<string | null> {
+  try {
+    return await hashFile(filePath, size)
   } catch (error) {
     // The file went away after the stat.
     if (isMissing(error)) return null
