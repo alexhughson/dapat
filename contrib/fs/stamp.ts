@@ -42,7 +42,10 @@ export async function stampFile(filePath: string, mode: FileStampMode): Promise<
   try {
     info = await stat(filePath, { bigint: true })
   } catch (error) {
-    if (isMissing(error)) return null
+    if (isMissing(error)) {
+      hashCache.delete(filePath)
+      return null
+    }
     throw error
   }
   if (!info.isFile()) {
@@ -54,10 +57,16 @@ export async function stampFile(filePath: string, mode: FileStampMode): Promise<
   const identity = `${info.dev}:${info.ino}:${info.size}:${info.mtimeNs}:${info.ctimeNs}`
   const cached = hashCache.get(filePath)
   if (cached !== undefined && cached.identity === identity) {
-    return cached.hash
+    const trustedBefore = cached.statTimeNs - RACY_WINDOW_NS
+    const mtimeIsOld = info.mtimeNs < trustedBefore
+    const ctimeIsOld = info.ctimeNs < trustedBefore
+    if (mtimeIsOld && ctimeIsOld) {
+      return cached.hash
+    }
   }
+  const statTimeNs = BigInt(Date.now()) * 1_000_000n
   const pending = hashOrNull(filePath, info.size)
-  hashCache.set(filePath, { identity, hash: pending })
+  hashCache.set(filePath, { identity, statTimeNs, hash: pending })
   try {
     return await pending
   } catch (error) {
@@ -76,9 +85,16 @@ export async function stampFile(filePath: string, mode: FileStampMode): Promise<
  * the file at the same time share one read.
  * The cache trusts the stat identity only inside one process, as "time" does in all cases.
  * A new process hashes each file again, so the stamp is still the hash of the bytes.
- * Edge case: a write that keeps the device, inode, size, mtime, and ctime is not seen.
+ * As in git, an entry is trusted only when the mtime and the ctime of the file are older than
+ * the stat of the entry by RACY_WINDOW_NS. Two writes of the same size inside one timestamp
+ * tick keep the stat the same, and this rule sees them.
+ * Edge case: a write that changes no stat value, for example a write through a shared mmap
+ * to a page that is already dirty, is not seen when the file is older than the window.
  */
-const hashCache = new Map<string, { identity: string; hash: Promise<string | null> }>()
+const hashCache = new Map<string, { identity: string; statTimeNs: bigint; hash: Promise<string | null> }>()
+
+// Larger than the timestamp tick of coarse file systems: HFS+ and FAT keep 1 or 2 seconds.
+const RACY_WINDOW_NS = 2_000_000_000n
 
 async function hashOrNull(filePath: string, size: bigint): Promise<string | null> {
   try {

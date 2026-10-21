@@ -1300,7 +1300,9 @@ Both classes take the option `stamp: "hash" | "time"`. The default is `"hash"`.
 
 `"time"` stats up to 256 files at the same time. `"hash"` reads up to 8 files at the same time, and streams a file of 1 MB or more into the hash, so a large file does not fill the memory.
 
-With `"hash"`, dapat reads a file at most one time in each process while the stat of the file does not change. The stat includes the device, the inode, the size, the modification time, and the change time. So many tasks that read one input, or one folder, pay for one hash. A new process reads each file again, so the stamp is always the hash of the bytes. In one process, a write that keeps all of the stat values is not seen. This is the same limit that `"time"` has.
+With `"hash"`, dapat reads a file at most one time in each process while the stat of the file does not change. The stat includes the device, the inode, the size, the modification time, and the change time. So many tasks that read one input, or one folder, pay for one hash. A new process reads each file again, so the stamp is always the hash of the bytes.
+
+dapat uses a saved hash only when the modification time and the change time of the file are more than 2 seconds older than the stat that saved it. This rule comes from git. On a file system with coarse timestamps, two quick writes of the same size can keep every stat value. The rule sees these writes, because such a file is new, so dapat reads it again. The rule does not see a write that changes no stat value in a file that is older than 2 seconds, for example a write through a shared `mmap` ([section 13](#13-limits)).
 
 `"hash"` is the default because a skip that depends on the bytes is correct more often. For example, a task that runs again and writes the same bytes to its output files does not make the tasks that read them run. `"time"` is much faster. These are measured times on Bun, with a cold cache and then a warm cache:
 
@@ -1318,6 +1320,8 @@ const frames = new FilesystemPrefix("raw/frames/", { stamp: "time" })
 ```
 
 Older versions of dapat used `"time"` as the default. After an upgrade, every stamp of a file with the default stamp is different, so each task with such a file runs one time.
+
+After the upgrade, a file that dapat cannot read makes the task fail, because the hash reads the bytes. For example, a file with no read permission in an input folder, an input file that the task only stats, or a key file that the task writes into its own output folder. With the old `"time"` default, these tasks did not fail. Use `stamp: "time"` for such files.
 
 Older versions also had `directory()`, a folder artifact. Use `new FilesystemPrefix(path)` in its place, and call `list()` in place of `read()`. dapat stores a folder stamp under a different key, so each task that used `directory()` runs one time after the change.
 
@@ -1443,6 +1447,7 @@ A new checkout changes the modification time of each file. The default `stamp: "
 
   To let all of these tasks skip from build 2, give each writer its own folder, for example `out/pages/` for `split` and `out/index.html` next to it, with no task that reads all of `out/`.
 - **A prefix input that covers the store file runs on every build.** For example, a task reads `new FilesystemPrefix(".")`, and the store is `.dapat/state.json`. Each build writes the store, so the stamp of the prefix changes. Put the store outside the folders that tasks read, or read a narrower prefix.
+- **In one process, a write that changes no stat value is not seen.** For example, a long-lived process writes to a file through a shared `mmap`, and the page is already dirty. The bytes change, but the size, the modification time, and the change time do not. `"time"` does not see this write. `"hash"` does not see it either when the file is older than 2 seconds, because dapat uses the saved hash. A new process always reads each file again, so the next process sees the write.
 - **Only a missing path counts as missing.** `FileArtifact` returns a `null` stamp, and `FilesystemPrefix` returns the stamp of an empty list and lists no files, only for `ENOENT`. Every other error makes `stamp()` throw, so the task fails with that error, for example a permission error, or a file where a folder must be. In `"time"` mode, dapat reads only the metadata of a file. A file that the task cannot read still gets a stamp, and `read()` fails later.
 - **The skip rule ignores the order and the repeats of the inputs.** The record keeps the stamps by id. So a task that ran with the inputs `[a, b]` skips with `[b, a]`, and a task that ran with `[a]` skips with `[a, a]`. If the result of a task depends on the order of its inputs, put the order in the task id, or force the task to run ([section 12.1](#121-force-tasks-to-run-again)).
 - **A `FileMatcher` pattern needs text between two vars.** `FileMatcher` throws when two vars have nothing between them, for example `v/<lang><slug>.md`. A key such as `v/enintro.md` has more than one split. The error names the pattern and the two vars. Put text between the vars, for example `v/<lang>-<slug>.md`.

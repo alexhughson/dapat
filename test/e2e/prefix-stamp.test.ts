@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test"
-import { mkdir, mkdtemp, readdir, readFile, rm, symlink, utimes, writeFile } from "node:fs/promises"
+import { mkdir, mkdtemp, readdir, readFile, rm, stat, symlink, utimes, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import path from "node:path"
 import { Build, IdPrefix, Task } from "../../src/index"
@@ -7,6 +7,7 @@ import type { Result } from "../../src/index"
 import { FileArtifact, FilesystemPrefix } from "../../contrib/fs"
 import type { FileStampMode, FileStampOptions } from "../../contrib/fs"
 import { JsonStore } from "../../contrib/store"
+import { sha256Hex } from "../../contrib/hash"
 
 const temps: string[] = []
 
@@ -826,6 +827,8 @@ describe("file stamp modes", () => {
     await mkdir(sharedDir)
     const bigPath = path.join(sharedDir, "big.bin")
     await writeFile(bigPath, new Uint8Array(16 * 1024 * 1024))
+    // The cache trusts only a file that is older than its window of 2 seconds.
+    await Bun.sleep(2100)
     const store = new JsonStore(path.join(root, "state.json"))
     const taskCount = 100
 
@@ -855,6 +858,50 @@ describe("file stamp modes", () => {
     expect(second.skipped.length).toBe(taskCount)
     // Without the cache, this build hashes 3.2 GB, which takes many seconds.
     expect(elapsed).toBeLessThan(2000)
+  }, 20_000)
+
+  test("default stamp: a same-size edit right after a stamp is seen, also with the old modified time", async () => {
+    const root = await tempDir()
+    const filePath = path.join(root, "page.txt")
+    await writeFile(filePath, "hello")
+    // utimes keeps only milliseconds, so the test sets the same whole-second time two times.
+    const fixedTime = new Date(Math.floor(Date.now() / 1000) * 1000)
+    await utimes(filePath, fixedTime, fixedTime)
+    const before = await stat(filePath, { bigint: true })
+    const firstStamp = await new FileArtifact(filePath).stamp()
+
+    await writeFile(filePath, "jello")
+    // utimes cannot set the change time, so only the modified time and the size are the same.
+    await utimes(filePath, fixedTime, fixedTime)
+    const after = await stat(filePath, { bigint: true })
+    expect(after.mtimeNs).toBe(before.mtimeNs)
+    expect(after.size).toBe(before.size)
+
+    const secondStamp = await new FileArtifact(filePath).stamp()
+    expect(secondStamp).not.toBe(firstStamp)
+    expect(secondStamp).toBe(sha256Hex(new TextEncoder().encode("jello")))
+  })
+
+  test("default stamp: a write that keeps every stat value is seen while the file is new", async () => {
+    const root = await tempDir()
+    const filePath = path.join(root, "page.bin")
+    await writeFile(filePath, new Uint8Array(4096))
+    const map = Bun.mmap(filePath, { shared: true })
+    // The first write through the map makes the page dirty and sets the times.
+    map[0] = 1
+    const before = await stat(filePath, { bigint: true })
+    const firstStamp = await new FileArtifact(filePath).stamp()
+
+    // A second write to the dirty page changes the bytes but no stat value.
+    map[0] = 2
+    const after = await stat(filePath, { bigint: true })
+    expect(after.mtimeNs).toBe(before.mtimeNs)
+    expect(after.ctimeNs).toBe(before.ctimeNs)
+    expect(after.size).toBe(before.size)
+
+    const secondStamp = await new FileArtifact(filePath).stamp()
+    expect(secondStamp).not.toBe(firstStamp)
+    expect(secondStamp).toBe(sha256Hex(await readFile(filePath)))
   })
 
   test("default stamp: a touch on an input lets the task skip", async () => {
