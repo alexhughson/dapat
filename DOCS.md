@@ -120,8 +120,8 @@ The repo has this build in `examples/first-build.ts`. Run it from a folder that 
 - `skipped` lists the tasks that dapat did not run, because every stamp equalled the record ([section 6](#6-when-a-task-skips)).
 - `failed` is a `Map<Task, Error>`.
 - `cancelled` lists the tasks that were replaced or removed before they finished ([section 8](#8-failure-cancellation-and-replacement)).
-- `errors` lists the errors that no task owns: a non-abort error that a task throws after it was replaced or removed ([section 8](#replacement)), a store delete that rejects ([section 8](#removal)), and a store read for the orphans that rejects.
-- `orphans` lists the records in the store that no task of the build owns at the end of the run. Each orphan has a `taskId` and the `outputIds` of its record ([Orphans](#orphans)).
+- `errors` lists the errors that no task owns: a non-abort error that a task throws after it was replaced or removed ([section 8](#replacement)), a store delete that rejects ([section 8](#removal)), and a store read for the orphans that rejects ([Orphans](#orphans)). Each of these errors makes `success` `false`.
+- `orphans` lists the records in the store that no task of the build owns at the end of the run. Each orphan has a `taskId`, and the `outputIds` and `prefixIds` of its record ([Orphans](#orphans)).
 
 A failed task does not stop the build. The other tasks continue. `build.run()` does not throw when a task fails, so always check `result.success`. `build.run()` rejects in three cases only: a subscriber throws, a subscriber returns a promise, or subscribers reach the send limit ([section 9](#subscriber-errors)).
 
@@ -531,16 +531,17 @@ Add the store file to `.gitignore`. To make tasks run again, see [section 12.1](
 
 An orphan is a record in the store that no task of this run owns. No `build.each` and no `build.add` made its task. For example, you delete `templates/fr.html` before the run. Then `build.each` does not make the task `page:fr/hello`. Its record from the last run is still in the store, and its output `site/fr/hello.html` is still on disk.
 
-At the end of each `build.run()`, the build reads `store.ids()`. Each id that is not the id of a task in the build is an orphan. The build reads the record of each orphan and puts it in `result.orphans`:
+At the end of each `build.run()`, the build reads all the records with one call of `store.entries()`. Each record whose task id is not the id of a task in the build is an orphan. The build puts each orphan in `result.orphans`:
 
 ```ts
-type Orphan = { taskId: string; outputIds: readonly string[] }
+type Orphan = { taskId: string; outputIds: readonly string[]; prefixIds: readonly string[] }
 ```
 
 - `outputIds` are the ids of the artifact outputs in the record, in the order of the record. The id of a `FileArtifact` is `file:` and the absolute path, for example `file:/home/me/site/fr/hello.html`.
 - A record keeps an output that did not exist with a `null` stamp. Its id is in `outputIds` too.
-- A prefix output is not in `outputIds`. The record has no key for a prefix with a `null` stamp, so the record cannot list each prefix output.
-- A record in an older shape ([section 7](#7-stores)) gives an orphan with no `outputIds`.
+- `prefixIds` are the ids of the prefix outputs in the record, in the order of the record. The id of a `FilesystemPrefix` is `file:` and the absolute path of the folder, with a `/` at the end.
+- A prefix that had a `null` stamp at the last run has no key in the record, so its id is not in `prefixIds`. For a `FilesystemPrefix`, a `null` stamp is not possible, because a missing folder has the stamp of an empty list. An `IdPrefix` always has a `null` stamp.
+- A record in an older shape ([section 7](#7-stores)) gives an orphan with no `outputIds` and no `prefixIds`.
 - `result.orphans` is in task id order.
 
 These records are not orphans:
@@ -550,7 +551,7 @@ These records are not orphans:
 
 **dapat deletes nothing.** Your program decides what to delete. The orphan stays in each result until you delete its record with `store.delete(taskId)`. If you delete the record but not the outputs, dapat forgets the outputs.
 
-With no store, the build reads nothing, and `result.orphans` is empty. When `build.run()` rejects, you get no result, and so no orphans. A store read that rejects goes to `result.errors`. If `ids()` rejects, `result.orphans` is empty. If `get` rejects for one orphan, the other orphans stay.
+With no store, the build reads nothing, and `result.orphans` is empty. When `build.run()` rejects, you get no result, and so no orphans. If `store.entries()` rejects, the error goes to `result.errors`, so `result.success` is `false`, and `result.orphans` is empty. The tasks of the run are not changed by this error.
 
 This program deletes the outputs of each orphan, and then its record:
 
@@ -565,6 +566,12 @@ const build = new Build({ store })
 const result = await build.run()
 
 for (const orphan of result.orphans) {
+  for (const prefixId of orphan.prefixIds) {
+    if (!prefixId.startsWith("file:")) continue
+    const folderPath = prefixId.slice("file:".length)
+    console.log(`delete ${folderPath}, the old folder of ${orphan.taskId}`)
+    await rm(folderPath, { recursive: true, force: true })
+  }
   for (const outputId of orphan.outputIds) {
     // This program has only file outputs. Keep the outputs of other kinds.
     if (!outputId.startsWith("file:")) continue
@@ -1508,7 +1515,7 @@ All paths in this section are relative to the repo root. `dapat` is `src/index.t
 new Build(opts?: { store?: Store; sendLimit?: number })
 ```
 
-`sendLimit` is the number of events that subscribers can cause during one drain of the event queue. The default is `SEND_LIMIT` (10,000), which `dapat` exports. The constructor throws if `sendLimit` is not a positive integer. The limit cannot be turned off. See [The event queue](#the-event-queue).
+`sendLimit` is the number of events that subscribers can cause during one drain of the event queue. The default is `SEND_LIMIT` (10,000), which `dapat` exports. The constructor throws if `sendLimit` is not a positive integer. The limit cannot be turned off. The constructor also throws if `store` has no `entries` method, for example a store from before `entries()` existed ([`interface Store`](#interface-store)). See [The event queue](#the-event-queue).
 
 | Member | Description |
 | --- | --- |
@@ -1517,7 +1524,7 @@ new Build(opts?: { store?: Store; sendLimit?: number })
 | `subscribe(listener: (event: ArtifactEvent) => void): void` | From `Emitter`. Calls `listener` synchronously for each artifact event, in the order of the event queue. Does not replay earlier events. See [section 9](#9-subscribe-to-artifact-events). |
 | `protected setTasksOfGroups(changes: readonly GroupTasks[]): void` | Makes the tasks of each group in `changes` its new tasks, in one step ([Task groups](#task-groups)). `GroupTasks` is `{ group: TaskGroup; tasks: readonly Task[] }`. Adds each new id, replaces each known id, and removes each id that a group had before and that no group of the step gets now. A task id can move from one group of the step to another group of the step. That is a replacement, as a known id in one group is: the task ends as `cancelled` with the reason `"replaced"` if it had not finished, and its store record stays. A removed task ends as `cancelled` with the reason `"removed"` if it had not finished, and its store record is deleted. Changes all state first, then puts the events on the queue: all `withdrawn` events of the step first, then the `promised` events, by id in list order. Throws and changes nothing if two groups of the step or another group have one id, if a group gets one id two times, if two tasks declare one exact output, or if a group is in `changes` two times. The checks use the state after the whole step. **An open step:** while the first `run()` scans, during each pass of a drain over the event queue, and during each matcher event that comes from outside a drain, the build keeps a step open. Then a call does not throw: its changes join the open step, a later change of a group replaces its earlier one, and the build applies the step when the scans return, when the pass ends, or when the event ends. The events of the applied step make the next pass of the drain. An error then is fatal for the build. `build.each` gives its changes here. `add` never joins an open step. A subclass of `Build` can call it with its own `new TaskGroup(label)`. |
 | `each<M extends Record<string, AnyMatcher>, const R extends keyof M & string = keyof M & string>(config: TaskMaterializerConfig<M, R>): void` | Makes tasks for each joined set of matched artifacts ([section 10](#10-buildeach-tasks-for-each-matched-artifact)). TypeScript gets `R` from `required`. Subscribes to each matcher in `matchersByName`, joins their matches on shared var names, and gives the tasks of each joined set through `setTasksOfGroups`, with one task group for each set, labeled `build.each <number> <var name>=<var value> ...`. All the changes of one pass of a drain over the event queue are one step, and all the changes during the scans of the first `run()` are one step. The build sends each artifact event to `matcher.receiveArtifactEvent`, one time for each matcher. An error in `tasks` or in a matched artifact is fatal for the build, like a subscriber error. Throws if `matchersByName` has no matcher, if one matcher object is under two names, if `required` is empty or has a name that is not in `matchersByName`, if its required matchers do not form one connected group by shared var names, if `run()` has started, or if another `Build` uses a matcher. |
-| `run(): Promise<Result>` | The first time, sends a `promised` event for each output of each task that is in the build, and then runs the scan of each matcher and waits for all of them. A call during the scans waits for the same scans. Then starts every task and waits until every started task has finished. With a store, it then reads `store.ids()` and the record of each orphan ([Orphans](#orphans)), and resolves. Does not reject when a task fails. Rejects with the first subscriber error, `build.each` error, scan error, or send-limit error of the build, at once if that error happened before the call ([section 9](#subscriber-errors)). After a scan error, no task starts. |
+| `run(): Promise<Result>` | The first time, sends a `promised` event for each output of each task that is in the build, and then runs the scan of each matcher and waits for all of them. A call during the scans waits for the same scans. Then starts every task and waits until every started task has finished. With a store, it then reads `store.entries()` one time to find the orphans ([Orphans](#orphans)), and resolves. Does not reject when a task fails. Rejects with the first subscriber error, `build.each` error, scan error, or send-limit error of the build, at once if that error happened before the call ([section 9](#subscriber-errors)). After a scan error, no task starts. |
 
 ### `class TaskGroup`
 
@@ -1608,9 +1615,9 @@ A prefix whose region is the id string. Its stamp is `null`, because an id strin
 | `set(taskId, state): Promise<void>` | Writes a record. The build calls it after each successful run. |
 | `delete(taskId): Promise<void>` | Deletes a record. The build calls it from `remove`. |
 | `clear(): Promise<void>` | Deletes every record. The build does not call it. |
-| `ids(): Promise<readonly string[]>` | The task id of each record, in any order. The build calls it at the end of each `run()` to find the orphans ([Orphans](#orphans)). |
+| `entries(): Promise<Iterable<readonly [string, TaskState]>>` | Each record and its task id, in any order. The build calls it one time at the end of each `run()` to find the orphans ([Orphans](#orphans)). Read all the records in one step: the build can call it for a store with many thousands of records. |
 
-To write your own store, implement these five methods. A store from an older version has no `ids()`. Add it: TypeScript rejects a store without it. A record holds strings and `null` only, so `JSON.stringify` can encode it as it is. `get` can return a record in an older shape. The build then treats it as no record ([section 7](#7-stores)).
+To write your own store, implement these five methods. A store from an older version has no `entries()`. Add it: TypeScript rejects a store without it, and the `Build` constructor throws for a store object without an `entries` method, for example a store in JavaScript. A record holds strings and `null` only, so `JSON.stringify` can encode it as it is. `get` can return a record in an older shape. The build then treats it as no record ([section 7](#7-stores)).
 
 ### `interface TaskState`
 
@@ -1640,7 +1647,7 @@ Keeps records in a `Map`. The records are lost when the process ends. `MemorySto
 | `skipped` | `readonly Task[]` | Tasks that the skip rule skipped. |
 | `failed` | `ReadonlyMap<Task, Error>` | Tasks that threw, whose producer failed, or that were in a deadlock. |
 | `cancelled` | `readonly Task[]` | Tasks that were replaced or removed before they completed. |
-| `errors` | `readonly Error[]` | Errors that no task owns: a non-abort error that a task throws after it was replaced or removed, a store delete that rejects, and a store read for the orphans that rejects. It keeps the errors of earlier runs of the same build. A subscriber error is not here: `run()` rejects with it. |
+| `errors` | `readonly Error[]` | Errors that no task owns: a non-abort error that a task throws after it was replaced or removed, a store delete that rejects, and a store `entries()` that rejects. Each makes `success` `false`. It keeps the errors of earlier runs of the same build. A subscriber error is not here: `run()` rejects with it. |
 | `orphans` | `readonly Orphan[]` | The records in the store that no task of the build owns at the end of this run, in task id order. Empty with no store. dapat deletes nothing. See [Orphans](#orphans). |
 
 `Result` does not say why a task ran. The build keeps an `Outcome` for each task, but no public member returns it. See [section 6.1](#61-why-did-a-task-run-or-skip).
@@ -1648,10 +1655,10 @@ Keeps records in a `Map`. The records are lost when the process ends. `MemorySto
 ### `type Orphan`
 
 ```ts
-type Orphan = { taskId: string; outputIds: readonly string[] }
+type Orphan = { taskId: string; outputIds: readonly string[]; prefixIds: readonly string[] }
 ```
 
-A record in the store that no task of the build owns. `outputIds` are the ids of the artifact outputs in the record. Prefix outputs are not in it. See [Orphans](#orphans).
+A record in the store that no task of the build owns. `outputIds` are the ids of the artifact outputs in the record. `prefixIds` are the ids of the prefix outputs in the record. A prefix with a `null` stamp is not in the record. See [Orphans](#orphans).
 
 ### `type Outcome`
 

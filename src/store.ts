@@ -13,8 +13,11 @@ export interface Store {
   set(taskId: string, state: TaskState): Promise<void>
   delete(taskId: string): Promise<void>
   clear(): Promise<void>
-  /** The task id of each record in the store. The build reads it at the end of each run to find orphans. */
-  ids(): Promise<readonly string[]>
+  /**
+   * Each record in the store and its task id, in any order. The build reads it one time
+   * at the end of each run to find the orphans.
+   */
+  entries(): Promise<Iterable<readonly [string, TaskState]>>
 }
 
 export class MemoryStore implements Store {
@@ -36,7 +39,8 @@ export class MemoryStore implements Store {
     this.tasks.clear()
   }
 
-  async ids(): Promise<readonly string[]> {
-    return [...this.tasks.keys()]
+  async entries(): Promise<Iterable<readonly [string, TaskState]>> {
+    // A copy, so that a later change of the store does not change what the caller reads.
+    return [...this.tasks.entries()]
   }
 }

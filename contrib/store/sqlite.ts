@@ -53,13 +53,17 @@ export class SqliteStore implements Store {
     this.db.run(`DELETE FROM dapat_task_state`)
   }
 
-  async ids(): Promise<readonly string[]> {
-    const rows = this.db.query(`SELECT task_id FROM dapat_task_state ORDER BY task_id`).all() as { task_id: string }[]
-    const taskIds: string[] = []
+  async entries(): Promise<Iterable<readonly [string, TaskState]>> {
+    const rows = this.db.query(`SELECT task_id, payload FROM dapat_task_state`).all() as {
+      task_id: string
+      payload: string
+    }[]
+    const records: [string, TaskState][] = []
     for (const row of rows) {
-      taskIds.push(row.task_id)
+      const state = JSON.parse(row.payload) as TaskState
+      records.push([row.task_id, state])
     }
-    return taskIds
+    return records
   }
 
   close(): void {

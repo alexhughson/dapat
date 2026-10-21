@@ -97,7 +97,12 @@ export class Build extends Emitter<ArtifactEvent> {
 
   constructor(opts?: { store?: Store; sendLimit?: number }) {
     super()
-    this.store = opts?.store
+    const store = opts?.store
+    // A store from before entries() existed, or a JavaScript store, fails here, not at the end of each run.
+    if (store !== undefined && typeof store.entries !== "function") {
+      throw new Error("the store has no entries() method; a Store must implement get, set, delete, clear, and entries")
+    }
+    this.store = store
     const sendLimit = opts?.sendLimit ?? SEND_LIMIT
     if (!Number.isInteger(sendLimit) || sendLimit < 1) {
       let shown = String(sendLimit)
@@ -412,36 +417,24 @@ export class Build extends Emitter<ArtifactEvent> {
   /**
    * The records in the store whose task id is not a task of the build now. A task that the
    * build dropped during the run had its record deleted, so it is not here, unless that delete
-   * failed. A store read that rejects goes to `errors`.
+   * failed. The build reads the store one time. A read that rejects goes to `errors`.
    */
   private async findOrphans(store: Store): Promise<Orphan[]> {
-    let storedIds: readonly string[]
+    const orphans: Orphan[] = []
+    // The loop is in the try too: the iterable of a custom store can throw.
     try {
-      storedIds = await store.ids()
+      const records = await store.entries()
+      for (const [taskId, record] of records) {
+        if (this.slots.has(taskId)) continue
+        const outputIds = outputIdsOf(record, ARTIFACT_KEY_START)
+        const prefixIds = outputIdsOf(record, PREFIX_KEY_START)
+        orphans.push({ taskId, outputIds, prefixIds })
+      }
     } catch (error) {
       this.errors.push(toError(error))
       return []
     }
-    const orphanIds: string[] = []
-    for (const taskId of storedIds) {
-      if (this.slots.has(taskId)) continue
-      orphanIds.push(taskId)
-    }
-    orphanIds.sort()
-    const orphans: Orphan[] = []
-    for (const taskId of orphanIds) {
-      let record: TaskState | null
-      try {
-        record = await store.get(taskId)
-      } catch (error) {
-        this.errors.push(toError(error))
-        continue
-      }
-      // Another program can delete the record after the ids() read.
-      if (record === null) continue
-      const outputIds = artifactIdsOf(record)
-      orphans.push({ taskId, outputIds })
-    }
+    orphans.sort(compareOrphans)
     return orphans
   }
 
@@ -1042,26 +1035,39 @@ function isStampMap(value: unknown): value is StampMap {
   return true
 }
 
+/** The start of the record key of an artifact: "artifact <id>". */
+const ARTIFACT_KEY_START = "artifact "
+/** The start of the record key of a prefix: "prefix <id>". */
+const PREFIX_KEY_START = "prefix "
+
 /**
- * The ids of the artifact outputs in a record, in record order. A prefix output is not here,
- * because the record has no key for a prefix with a null stamp. A record in an older shape gives no id.
+ * The ids of the outputs in a record whose key starts with `keyStart`, in record order.
+ * A record in an older shape gives no id.
  */
-function artifactIdsOf(record: TaskState): string[] {
-  const artifactIds: string[] = []
-  if (!isStampMap(record.outputStamps)) return artifactIds
-  const artifactKeyStart = "artifact "
+function outputIdsOf(record: TaskState, keyStart: string): string[] {
+  const ids: string[] = []
+  // A custom store can give a value that is not a record.
+  if (typeof record !== "object" || record === null) return ids
+  if (!isStampMap(record.outputStamps)) return ids
   for (const key of Object.keys(record.outputStamps)) {
-    if (!key.startsWith(artifactKeyStart)) continue
-    const artifactId = key.slice(artifactKeyStart.length)
-    artifactIds.push(artifactId)
+    if (!key.startsWith(keyStart)) continue
+    const id = key.slice(keyStart.length)
+    ids.push(id)
   }
-  return artifactIds
+  return ids
+}
+
+/** Task id order. Two orphans never have the same task id. */
+function compareOrphans(first: Orphan, second: Orphan): number {
+  if (first.taskId < second.taskId) return -1
+  if (first.taskId > second.taskId) return 1
+  return 0
 }
 
 /** An artifact and a prefix with the same id are different outputs. */
 function refKey(ref: Ref): string {
-  if (isPrefix(ref)) return `prefix ${ref.id}`
-  return `artifact ${ref.id}`
+  if (isPrefix(ref)) return `${PREFIX_KEY_START}${ref.id}`
+  return `${ARTIFACT_KEY_START}${ref.id}`
 }
 
 /** The outputs of `task` by refKey. An output that the task declares two times is here one time. */

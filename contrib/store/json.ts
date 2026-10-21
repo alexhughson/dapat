@@ -44,9 +44,10 @@ export class JsonStore implements Store {
     })
   }
 
-  async ids(): Promise<readonly string[]> {
+  /** Reads the file one time. */
+  async entries(): Promise<Iterable<readonly [string, TaskState]>> {
     const data = await this.load()
-    return Object.keys(data.tasks)
+    return Object.entries(data.tasks)
   }
 
   /**

@@ -303,61 +303,78 @@ describe("stores", () => {
     expect(await readdir(dir)).toEqual(["state.json"])
   })
 
-  describe("ids", () => {
-    /** Writes three records, deletes one, and checks the ids. Returns the sorted ids. */
-    async function idsAfterChanges(store: Store): Promise<string[]> {
-      expect(await store.ids()).toEqual([])
-      await store.set("page:en/hello", sample)
-      await store.set("page:fr/hello", sample)
-      await store.set("index", sample)
-      await store.delete("index")
-      const storedIds = [...(await store.ids())]
-      storedIds.sort()
-      return storedIds
+  describe("entries", () => {
+    const otherSample: TaskState = { inputStamps: {}, outputStamps: { "prefix file:/tmp/out/": "9" } }
+
+    /** The entries of the store, sorted by task id. */
+    async function sortedEntries(store: Store): Promise<[string, TaskState][]> {
+      const records: [string, TaskState][] = []
+      for (const [taskId, state] of await store.entries()) {
+        records.push([taskId, state])
+      }
+      records.sort((first, second) => (first[0] < second[0] ? -1 : 1))
+      return records
     }
 
-    test("MemoryStore lists the id of each record", async () => {
+    /** Writes three records, deletes one, and returns the sorted entries. */
+    async function entriesAfterChanges(store: Store): Promise<[string, TaskState][]> {
+      expect(await sortedEntries(store)).toEqual([])
+      await store.set("page:fr/hello", otherSample)
+      await store.set("page:en/hello", sample)
+      await store.set("index", sample)
+      await store.delete("index")
+      return sortedEntries(store)
+    }
+
+    const expected: [string, TaskState][] = [
+      ["page:en/hello", sample],
+      ["page:fr/hello", otherSample],
+    ]
+
+    test("MemoryStore gives each record with its task id", async () => {
       const store = new MemoryStore()
-      expect(await idsAfterChanges(store)).toEqual(["page:en/hello", "page:fr/hello"])
+      expect(await entriesAfterChanges(store)).toEqual(expected)
+      const before = await store.entries()
       await store.clear()
-      expect(await store.ids()).toEqual([])
+      // The entries that the store gave before do not change.
+      expect([...before].length).toBe(2)
+      expect(await sortedEntries(store)).toEqual([])
     })
 
-    test("JsonStore lists the id of each record, also from a new object on the same file", async () => {
+    test("JsonStore gives each record with its task id, also from a new object on the same file", async () => {
       const dir = await mkdtemp(path.join(tmpdir(), "dapat-json-"))
       temps.push(dir)
       const statePath = path.join(dir, "state.json")
       const store = new JsonStore(statePath)
-      expect(await idsAfterChanges(store)).toEqual(["page:en/hello", "page:fr/hello"])
+      expect(await entriesAfterChanges(store)).toEqual(expected)
       await store.set("__proto__", sample)
 
       const reopened = new JsonStore(statePath)
-      const reopenedIds = [...(await reopened.ids())]
-      reopenedIds.sort()
-      expect(reopenedIds).toEqual(["__proto__", "page:en/hello", "page:fr/hello"])
+      const reopenedEntries = await sortedEntries(reopened)
+      expect(reopenedEntries).toEqual([["__proto__", sample], ...expected])
       await reopened.clear()
-      expect(await reopened.ids()).toEqual([])
+      expect(await sortedEntries(reopened)).toEqual([])
     })
 
-    test("SqliteStore lists the id of each record, also after it opens the file again", async () => {
+    test("SqliteStore gives each record with its task id, also after it opens the file again", async () => {
       const dir = await mkdtemp(path.join(tmpdir(), "dapat-sqlstore-"))
       temps.push(dir)
       const dbPath = path.join(dir, "state.db")
       const store = new SqliteStore(dbPath)
-      expect(await idsAfterChanges(store)).toEqual(["page:en/hello", "page:fr/hello"])
+      expect(await entriesAfterChanges(store)).toEqual(expected)
       store.close()
 
       const reopened = new SqliteStore(dbPath)
-      expect(await reopened.ids()).toEqual(["page:en/hello", "page:fr/hello"])
+      expect(await sortedEntries(reopened)).toEqual(expected)
       await reopened.clear()
-      expect(await reopened.ids()).toEqual([])
+      expect(await sortedEntries(reopened)).toEqual([])
       reopened.close()
     })
 
-    test("SqliteStore with an open Database lists the ids of that database", async () => {
+    test("SqliteStore with an open Database gives the records of that database", async () => {
       const db = new Database(":memory:")
       const store = new SqliteStore(db)
-      expect(await idsAfterChanges(store)).toEqual(["page:en/hello", "page:fr/hello"])
+      expect(await entriesAfterChanges(store)).toEqual(expected)
       db.close()
     })
   })

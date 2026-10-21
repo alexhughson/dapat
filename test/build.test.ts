@@ -1019,7 +1019,7 @@ describe("Build", () => {
     const second = await build.run()
     expect(second.errors.map((error) => error.message)).toEqual(["delete broke at once"])
     // The record stays, and no task of the build owns it now.
-    expect(second.orphans).toEqual([{ taskId: "t", outputIds: ["mem:a"] }])
+    expect(second.orphans).toEqual([{ taskId: "t", outputIds: ["mem:a"], prefixIds: [] }])
   })
 
   test("a fatal error during the stamp reads of a task stops its store record", async () => {
@@ -2460,14 +2460,16 @@ describe("orphans", () => {
     const kept = new Mem("mem:kept")
     const gone = new Mem("mem:gone")
     const neverWritten = new Mem("mem:never-written")
+    // An empty MemPrefix has the stamp "", so the record keeps it. An IdPrefix has a null stamp, so the record does not.
     const folder = new MemPrefix("mem:folder/", [])
+    const unknownFolder = new IdPrefix("mem:unknown/")
 
     const first = new Build({ store })
     first.add(new Task({ id: "kept", outputs: [kept], run: async () => kept.write("k") }))
     first.add(
       new Task({
         id: "gone",
-        outputs: [gone, neverWritten, folder],
+        outputs: [gone, neverWritten, folder, unknownFolder],
         run: async () => gone.write("g"),
       }),
     )
@@ -2478,8 +2480,11 @@ describe("orphans", () => {
     second.add(new Task({ id: "kept", outputs: [kept], run: async () => kept.write("k") }))
     const secondResult = await second.run()
     expect(secondResult.success).toBe(true)
-    // A missing output is in the record with a null stamp, so its id is here too. A prefix is not.
-    expect(secondResult.orphans).toEqual([{ taskId: "gone", outputIds: ["mem:gone", "mem:never-written"] }])
+    // A missing artifact is in the record with a null stamp, so its id is here too.
+    // A prefix with a null stamp is not in the record, so it is not here.
+    expect(secondResult.orphans).toEqual([
+      { taskId: "gone", outputIds: ["mem:gone", "mem:never-written"], prefixIds: ["mem:folder/"] },
+    ])
     // dapat deletes nothing.
     expect(await store.get("gone")).not.toBeNull()
     expect(gone.value).toBe("g")
@@ -2495,8 +2500,8 @@ describe("orphans", () => {
     build.add(new Task({ id: "mid", run: async () => {} }))
     const result = await build.run()
     expect(result.orphans).toEqual([
-      { taskId: "alpha", outputIds: [] },
-      { taskId: "zeta", outputIds: [] },
+      { taskId: "alpha", outputIds: [], prefixIds: [] },
+      { taskId: "zeta", outputIds: [], prefixIds: [] },
     ])
   })
 
@@ -2506,7 +2511,7 @@ describe("orphans", () => {
     const first = new Build({ store })
     first.add(new Task({ id: "victim", outputs: [victimOutput], run: async () => victimOutput.write("v") }))
     await first.run()
-    expect(await store.ids()).toEqual(["victim"])
+    expect(await storedIds(store)).toEqual(["victim"])
 
     const second = new Build({ store })
     second.add(new Task({ id: "victim", inputs: [new Mem("mem:never")], outputs: [victimOutput], run: async () => {} }))
@@ -2521,7 +2526,7 @@ describe("orphans", () => {
     const result = await second.run()
     expect(result.success).toBe(true)
     expect(result.orphans).toEqual([])
-    expect(await store.ids()).toEqual(["remover"])
+    expect(await storedIds(store)).toEqual(["remover"])
   })
 
   test("a task that failed in the run keeps its old record, and it is not an orphan", async () => {
@@ -2553,39 +2558,36 @@ describe("orphans", () => {
     await store.set("old", olderShape as unknown as TaskState)
     const build = new Build({ store })
     const result = await build.run()
-    expect(result.orphans).toEqual([{ taskId: "old", outputIds: [] }])
+    expect(result.orphans).toEqual([{ taskId: "old", outputIds: [], prefixIds: [] }])
   })
 
-  test("a store ids() that rejects goes to result.errors, with no orphans", async () => {
-    class BrokenIdsStore extends MemoryStore {
-      override async ids(): Promise<readonly string[]> {
-        throw new Error("ids broke")
+  test("a store entries() that rejects goes to result.errors and makes success false, with no orphans", async () => {
+    class BrokenEntriesStore extends MemoryStore {
+      override async entries(): Promise<Iterable<readonly [string, TaskState]>> {
+        throw new Error("entries broke")
       }
     }
-    const store = new BrokenIdsStore()
+    const store = new BrokenEntriesStore()
     await store.set("old", { inputStamps: {}, outputStamps: {} })
     const build = new Build({ store })
     build.add(new Task({ id: "t", run: async () => {} }))
     const result = await build.run()
     expect(result.success).toBe(false)
-    expect(result.errors.map((error) => error.message)).toEqual(["ids broke"])
+    expect(result.errors.map((error) => error.message)).toEqual(["entries broke"])
     expect(result.orphans).toEqual([])
   })
 
-  test("a store get that rejects for an orphan goes to result.errors, and the other orphans stay", async () => {
-    class BrokenGetStore extends MemoryStore {
-      override async get(taskId: string): Promise<TaskState | null> {
-        if (taskId === "broken") throw new Error(`get broke on ${taskId}`)
-        return super.get(taskId)
-      }
+  test("the Build constructor throws for a store with no entries() method", () => {
+    // A store written before entries() existed, as JavaScript code can give it.
+    const olderStore = {
+      get: async () => null,
+      set: async () => {},
+      delete: async () => {},
+      clear: async () => {},
     }
-    const store = new BrokenGetStore()
-    await store.set("broken", { inputStamps: {}, outputStamps: {} })
-    await store.set("old", { inputStamps: {}, outputStamps: { "artifact mem:a": "1" } })
-    const build = new Build({ store })
-    const result = await build.run()
-    expect(result.errors.map((error) => error.message)).toEqual(["get broke on broken"])
-    expect(result.orphans).toEqual([{ taskId: "old", outputIds: ["mem:a"] }])
+    expect(() => new Build({ store: olderStore as unknown as MemoryStore })).toThrow(
+      "the store has no entries() method; a Store must implement get, set, delete, clear, and entries",
+    )
   })
 
   test("a run that rejects gives no result, and so no orphans", async () => {
@@ -2599,3 +2601,13 @@ describe("orphans", () => {
     await expect(build.run()).rejects.toThrow("subscriber broke")
   })
 })
+
+/** The sorted task ids of the records in the store. */
+async function storedIds(store: MemoryStore): Promise<string[]> {
+  const ids: string[] = []
+  for (const [taskId] of await store.entries()) {
+    ids.push(taskId)
+  }
+  ids.sort()
+  return ids
+}
