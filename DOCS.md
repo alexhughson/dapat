@@ -815,6 +815,23 @@ If the matchers do not form one connected group, `build.each` throws. Without a 
 build.each 1: the required matchers ['template'] share no var name with required matcher 'page' or its required partners; each required matcher must share a var name with another required matcher, and a matcher that is not required does not connect them
 ```
 
+Only shared var names join. To join two matchers on some of their vars and not on others, give the others different names in the patterns. Example: each page gets a card with each banner of its `lang`:
+
+```ts
+build.each({
+  matchersByName: {
+    page: new FileMatcher("content/<lang>/<page>.md"),
+    banner: new FileMatcher("banners/<lang>/<banner>.png"),
+  },
+  *tasks(vars) {
+    const name = `${vars.lang}/${vars.page}/${vars.banner}`
+    yield new Task({ id: `card:${name}`, outputs: [new FileArtifact(`cards/${name}.png`)], run: async () => {} })
+  },
+})
+```
+
+The pages `en/hello` and `en/install` and the banners `en/blue` and `en/red` make four sets, because only `lang` joins. If both patterns used `<name>`, `name` would join too, and a page would get only the banner with its own name. Put each var in the task id, or two sets give one task id and the build throws.
+
 One matcher alone is always valid. Each of its matches is a joined set with one member. A required matcher with no var names shares no var, so it fails this check when the `build.each` has another required matcher.
 
 `build.each` keeps **indexes** for each matcher. An index maps the values of some var names to the matches that have them. A matcher has one index for each set of var names that the join looks it up by. In the example, `page` has an index by `lang`. When one match changes, `build.each` looks up its partners in these indexes. It does not scan all the matches again. So the join costs one index lookup for each other matcher, and the work for each partner that it finds.
@@ -1046,7 +1063,7 @@ A `promised` event of a `FilesystemPrefix` gives no file name, so it makes no ma
 
 #### Between runs
 
-dapat does not delete old outputs. When you delete a source file, the next scan does not find it, so its task is not in the build. But the outputs of that task from the last run stay on disk. A `FileMatcher` whose pattern fits those outputs finds them in its scan. For example, a task makes `upper/<slug>.txt` from `content/<slug>.md`, and a second `build.each` uses `new FileMatcher("upper/<slug>.txt")`. When you delete `content/b.md`, the task `upper:b` goes away, but `upper/b.txt` stays, and the task of the second `build.each` for `b` stays too. Delete the old outputs yourself when this is a problem.
+dapat does not delete old outputs. When you delete a source file, the next scan does not find it, so its task is not in the build. But the outputs of that task from the last run stay on disk. A `FileMatcher` whose pattern fits those outputs finds them in its scan. For example, a task makes `upper/<slug>.txt` from `content/<slug>.md`, and a second `build.each` uses `new FileMatcher("upper/<slug>.txt")`. When you delete `content/b.md`, the task `upper:b` goes away, but `upper/b.txt` stays, and the task of the second `build.each` for `b` stays too. Delete the old outputs yourself when this is a problem. dapat cannot do it for you, because it is not the only owner of the files in a folder: other tools and people can put files next to the outputs.
 
 ### Matchers
 
@@ -1430,7 +1447,7 @@ A new checkout changes the modification time of each file. With the default `sta
 - **A `FileMatcher` pattern needs text between two vars.** `FileMatcher` throws when two vars have nothing between them, for example `v/<lang><slug>.md`. A key such as `v/enintro.md` has more than one split. The error names the pattern and the two vars. Put text between the vars, for example `v/<lang>-<slug>.md`.
 - **A `FileMatcher` pattern cannot have `*` or `**` yet.** Use one var for each part that changes.
 - **A `FileMatcher` pattern cannot hold a `<` or `>` as text, or a `..` part.** A file name with `<` or `>` cannot fit a pattern.
-- **A `FileMatcher` finds the old outputs of a task that is gone.** dapat does not delete old outputs, so the scan finds them on the next build ([Between runs](#between-runs)).
+- **A `FileMatcher` finds the old outputs of a task that is gone.** dapat does not delete old outputs, so the scan finds them on the next build ([Between runs](#between-runs)). Other tools and people can own files in the same folders, so dapat does not guess which files to delete.
 - **A `FileMatcher` does not see a change on disk during the run that no task reports.** It looks at the disk only in its scan. A file that another program writes during the run gets its match on the next build.
 - **A var that comes twice in one segment can be slow on long names.** For example, `<a>-<b>-<c>-<a>` tries each split of the segment. A 255-character file name that almost matches takes about 10 ms. A 1000-character key can take seconds. Each segment without such a repeated var keeps its first split, so it stays fast.
 - **Matches that come in separate steps after the scans can pass through a state in between.** For example, a file watcher sends one file at a time, or two tasks that write a page and its review end at different times. Then `build.each` can make a set with `matched.review === undefined` for a while, and later replace it. This is correct if each set gives its own task ids and outputs. It is not safe when the id or an output depends on a matcher that is not required being `undefined`, and other sets can give the same id. For example, the drafts rule gives `draft:${vars.lang}` for the page of a lang with no review. In the state in between, two pages of one lang have no review, so two sets give `draft:en`, and `build.run()` rejects. Or the id moves between sets in two steps, and its store record is deleted, so the task runs again on the next build. Two passes of one drain are separate steps too. For example, rule 1 promises the pages, and rule 1b promises the reviews only when it gets those page events. Then the drafts rule gets the pages in pass 1 and the reviews in pass 2, and it passes through the same state in between. The safe pattern: put every var of the required matchers in each task id and each output, for example `draft:${vars.lang}/${vars.slug}`.
