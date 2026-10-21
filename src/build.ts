@@ -104,6 +104,8 @@ export class Build extends Emitter<ArtifactEvent> {
   // The events that wait to go to the subscribers, oldest first.
   private queue: ArtifactEvent[] = []
   private draining = false
+  // The number of change() calls that did not reach their drain yet. See checkDeadlock().
+  private changeDepth = 0
   // The first subscriber error or send-limit error. Each later run() rejects with it.
   private fatal: Error | null = null
 
@@ -319,6 +321,20 @@ export class Build extends Emitter<ArtifactEvent> {
    * It drains the queue last.
    */
   private change(changes: readonly GroupTasks[], dropped: readonly Slot[]): void {
+    // No deadlock check until the subscribers got the events of this change: one of them can
+    // change the tasks again and so end the deadlock. checkDeadlock() runs after the drain.
+    this.changeDepth += 1
+    try {
+      this.applyChange(changes, dropped)
+    } finally {
+      this.changeDepth -= 1
+    }
+    this.drain()
+    this.checkDeadlock()
+  }
+
+  /** The part of change() before its drain. It runs with changeDepth above 0. */
+  private applyChange(changes: readonly GroupTasks[], dropped: readonly Slot[]): void {
     const replaced: Slot[] = []
     const created: Slot[] = []
     // All withdrawn events of the call go before any promised event. Thus an output
@@ -426,9 +442,7 @@ export class Build extends Emitter<ArtifactEvent> {
         this.kick(slot)
       }
     }
-    this.checkDeadlock()
     this.maybeIdle()
-    this.drain()
   }
 
   /** Starts to delete the record of a task. run() waits for it. A delete error goes to `errors`. */
@@ -548,6 +562,8 @@ export class Build extends Emitter<ArtifactEvent> {
     } finally {
       this.draining = false
     }
+    // A change during the drain did not check for a deadlock. See checkDeadlock().
+    this.checkDeadlock()
   }
 
   /** Sends the queue until it is empty: one pass of a drain. */
@@ -947,9 +963,15 @@ export class Build extends Emitter<ArtifactEvent> {
     producer.waiters.clear()
   }
 
-  /** When no task runs and every pending task waits for a producer, wakes each of them with "deadlock". */
+  /**
+   * When no task runs and every pending task waits for a producer, wakes each of them with "deadlock".
+   * It does nothing during a change() or a drain: the events that wait for the subscribers can make a
+   * subscriber change the tasks and so end the deadlock. The drain checks again when it ends.
+   */
   private checkDeadlock(): void {
     if (this.fatal !== null) return
+    if (this.changeDepth > 0) return
+    if (this.draining) return
     if (this.runningCount !== 0) return
     if (this.blocked.size === 0) return
     if (this.blocked.size !== this.pendingCount) return

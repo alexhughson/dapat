@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { Build, IdPrefix, Prefix, Task } from "../src/index"
+import { Build, IdPrefix, MemoryStore, Prefix, Task } from "../src/index"
 import type { Artifact } from "../src/index"
 import { IdTrie } from "../src/id-trie"
 import { Mem } from "./mem"
@@ -249,4 +249,203 @@ describe("Build scheduling", () => {
       "P: dependency of 'P' failed",
     ])
   })
+
+  test("a waiting task starts when its producer is removed", async () => {
+    const log: string[] = []
+    const slow = gate()
+    const raw = new Mem("mem:raw")
+    const data = new Mem("mem:data")
+    const build = new Build()
+    build.add(
+      new Task({
+        id: "slow",
+        outputs: [raw],
+        run: async () => {
+          await slow.opened
+          log.push("slow")
+        },
+      }),
+    )
+    build.add(
+      new Task({
+        id: "middle",
+        inputs: [raw],
+        outputs: [data],
+        run: async () => {
+          log.push("middle")
+        },
+      }),
+    )
+    build.add(
+      new Task({
+        id: "reader",
+        inputs: [data],
+        run: async () => {
+          log.push("reader")
+          slow.open()
+        },
+      }),
+    )
+    const running = build.run()
+    await new Promise<void>((resolve) => setTimeout(resolve, 5))
+    // "reader" waits for "middle", which waits for "slow".
+    build.remove("middle")
+    const result = await running
+    expect(result.success).toBe(true)
+    expect(log).toEqual(["reader", "slow"])
+    expect(result.cancelled.map((task) => task.id)).toEqual(["middle"])
+  })
+
+  test("a waiting task waits for the new producer when a running producer is replaced by one with new inputs", async () => {
+    const log: string[] = []
+    const oldRun = gate()
+    const source = gate()
+    const src = new Mem("mem:src")
+    const data = new Mem("mem:data")
+    const build = new Build()
+    build.add(
+      new Task({
+        id: "producer",
+        outputs: [data],
+        run: async () => {
+          await oldRun.opened
+        },
+      }),
+    )
+    build.add(
+      new Task({
+        id: "reader",
+        inputs: [data],
+        run: async () => {
+          log.push("reader")
+        },
+      }),
+    )
+    const running = build.run()
+    await new Promise<void>((resolve) => setTimeout(resolve, 5))
+    build.add(
+      new Task({
+        id: "source",
+        outputs: [src],
+        run: async () => {
+          await source.opened
+          log.push("source")
+        },
+      }),
+    )
+    build.add(
+      new Task({
+        id: "producer",
+        inputs: [src],
+        outputs: [data],
+        run: async () => {
+          log.push("producer")
+        },
+      }),
+    )
+    oldRun.open()
+    setTimeout(() => source.open(), 5)
+    const result = await running
+    expect(result.success).toBe(true)
+    expect(log).toEqual(["source", "producer", "reader"])
+  })
+
+  test("a fatal error ends the run while tasks wait", async () => {
+    const log: string[] = []
+    const slow = gate()
+    const first = new Mem("mem:first")
+    const data = new Mem("mem:data")
+    const build = new Build()
+    build.subscribe((event) => {
+      if (event.kind === "produced" && event.artifact.id === "mem:first") throw new Error("subscriber broke")
+    })
+    build.add(new Task({ id: "first", outputs: [first], run: async () => {} }))
+    build.add(
+      new Task({
+        id: "slow",
+        outputs: [data],
+        run: async () => {
+          await slow.opened
+        },
+      }),
+    )
+    build.add(
+      new Task({
+        id: "reader",
+        inputs: [data],
+        run: async () => {
+          log.push("reader")
+        },
+      }),
+    )
+    const running = build.run()
+    setTimeout(() => slow.open(), 10)
+    await expect(running).rejects.toThrow("subscriber broke")
+    expect(log).toEqual([])
+  })
+
+  test("a prefix input with its own overlaps() waits for a prefix output that it overlaps", async () => {
+    /** Overlaps each prefix whose id ends with "/data/". The id strings do not share a start. */
+    class DataPrefix extends Prefix {
+      readonly id = "mem:in/"
+      override overlaps(other: Prefix): boolean {
+        return other.id.endsWith("/data/")
+      }
+    }
+    const log: string[] = []
+    const build = new Build()
+    build.add(
+      new Task({
+        id: "reader",
+        inputs: [new DataPrefix()],
+        run: async () => {
+          log.push("reader")
+        },
+      }),
+    )
+    build.add(
+      new Task({
+        id: "writer",
+        outputs: [new IdPrefix("mem:x/data/")],
+        run: async () => {
+          await new Promise<void>((resolve) => setTimeout(resolve, 5))
+          log.push("writer")
+        },
+      }),
+    )
+    const result = await build.run()
+    expect(result.success).toBe(true)
+    expect(log).toEqual(["writer", "reader"])
+  })
+
+  test("no deadlock while subscribers can still change the tasks", async () => {
+    // X and Y read each other. Z waits in a slow stamp, so the build is not in a deadlock yet.
+    // build.remove("Z") sends Z's withdrawn event; the subscriber then replaces X with an X that reads nothing.
+    const x = new Mem("mem:x")
+    const y = new Mem("mem:y")
+    const slowSource = new SlowStamp("mem:src")
+    const build = new Build({ store: new MemoryStore() })
+    build.add(new Task({ id: "X", inputs: [y], outputs: [x], run: async () => {} }))
+    build.add(new Task({ id: "Y", inputs: [x], outputs: [y], run: async () => {} }))
+    build.add(new Task({ id: "Z", inputs: [slowSource], outputs: [new Mem("mem:z")], run: async () => {} }))
+    build.subscribe((event) => {
+      if (event.kind === "withdrawn" && event.taskId === "Z") {
+        build.add(new Task({ id: "X", outputs: [x], run: async () => {} }))
+      }
+    })
+    const running = build.run()
+    await new Promise<void>((resolve) => setTimeout(resolve, 20))
+    build.remove("Z")
+    const result = await running
+    expect(result.failed.size).toBe(0)
+    expect(result.executed.map((task) => task.id).sort()).toEqual(["X", "Y"])
+  })
 })
+
+/** An artifact whose stamp takes 200 ms, so a task stays pending in its stamp phase. */
+class SlowStamp extends Mem {
+  override async stamp(): Promise<string | null> {
+    await new Promise<void>((resolve) => setTimeout(resolve, 200))
+    return "s"
+  }
+}
