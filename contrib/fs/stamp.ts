@@ -51,8 +51,38 @@ export async function stampFile(filePath: string, mode: FileStampMode): Promise<
   if (mode === "time") {
     return `${info.mtimeNs}:${info.size}`
   }
+  const identity = `${info.dev}:${info.ino}:${info.size}:${info.mtimeNs}:${info.ctimeNs}`
+  const cached = hashCache.get(filePath)
+  if (cached !== undefined && cached.identity === identity) {
+    return cached.hash
+  }
+  const pending = hashOrNull(filePath, info.size)
+  hashCache.set(filePath, { identity, hash: pending })
   try {
-    return await hashFile(filePath, info.size)
+    return await pending
+  } catch (error) {
+    // A failed read must not stay in the cache.
+    if (hashCache.get(filePath)?.hash === pending) {
+      hashCache.delete(filePath)
+    }
+    throw error
+  }
+}
+
+/**
+ * The hash of each file that this process read, by path, with the stat identity at that time.
+ * Many tasks can read one input, and each task stamps it. With this cache, the file is hashed
+ * one time while its stat stays the same. The entry holds the promise, so tasks that stamp
+ * the file at the same time share one read.
+ * The cache trusts the stat identity only inside one process, as "time" does in all cases.
+ * A new process hashes each file again, so the stamp is still the hash of the bytes.
+ * Edge case: a write that keeps the device, inode, size, mtime, and ctime is not seen.
+ */
+const hashCache = new Map<string, { identity: string; hash: Promise<string | null> }>()
+
+async function hashOrNull(filePath: string, size: bigint): Promise<string | null> {
+  try {
+    return await hashFile(filePath, size)
   } catch (error) {
     // The file went away after the stat.
     if (isMissing(error)) return null

@@ -620,10 +620,14 @@ describe("file stamp modes", () => {
   async function runCopy(
     root: string,
     store: JsonStore,
-    mode: FileStampMode,
+    mode: FileStampMode | undefined,
   ): Promise<Result> {
-    const src = new FileArtifact(path.join(root, "src.txt"), { stamp: mode })
-    const out = new FileArtifact(path.join(root, "out.txt"), { stamp: mode })
+    let opts: FileStampOptions | undefined = undefined
+    if (mode !== undefined) {
+      opts = { stamp: mode }
+    }
+    const src = new FileArtifact(path.join(root, "src.txt"), opts)
+    const out = new FileArtifact(path.join(root, "out.txt"), opts)
     const build = new Build({ store })
     build.add(
       new Task({
@@ -814,6 +818,69 @@ describe("file stamp modes", () => {
     expect(ids(second.executed)).toEqual(["index"])
     const third = await runOnce()
     expect(ids(third.skipped)).toEqual(["index"])
+  })
+
+  test("default stamp: many tasks that read one large file and its folder hash it one time", async () => {
+    const root = await tempDir()
+    const sharedDir = path.join(root, "shared")
+    await mkdir(sharedDir)
+    const bigPath = path.join(sharedDir, "big.bin")
+    await writeFile(bigPath, new Uint8Array(16 * 1024 * 1024))
+    const store = new JsonStore(path.join(root, "state.json"))
+    const taskCount = 100
+
+    const runOnce = async () => {
+      const build = new Build({ store })
+      for (let i = 0; i < taskCount; i++) {
+        const out = new FileArtifact(path.join(root, `out-${i}.txt`))
+        build.add(
+          new Task({
+            id: `use-${i}`,
+            inputs: [new FileArtifact(bigPath), new FilesystemPrefix(sharedDir)],
+            outputs: [out],
+            run: async () => {
+              await writeFile(out.path, "done")
+            },
+          }),
+        )
+      }
+      return build.run()
+    }
+
+    const first = await runOnce()
+    expect(first.executed.length).toBe(taskCount)
+    const started = performance.now()
+    const second = await runOnce()
+    const elapsed = performance.now() - started
+    expect(second.skipped.length).toBe(taskCount)
+    // Without the cache, this build hashes 3.2 GB, which takes many seconds.
+    expect(elapsed).toBeLessThan(2000)
+  })
+
+  test("default stamp: a touch on an input lets the task skip", async () => {
+    const root = await tempDir()
+    await writeFile(path.join(root, "src.txt"), "hello")
+    const store = new JsonStore(path.join(root, "state.json"))
+
+    await runCopy(root, store, undefined)
+    await rewriteSameBytes(path.join(root, "src.txt"))
+    const second = await runCopy(root, store, undefined)
+    expect(ids(second.skipped)).toEqual(["copy"])
+  })
+
+  test("default stamp: an edit that keeps the size makes the task run", async () => {
+    const root = await tempDir()
+    const srcPath = path.join(root, "src.txt")
+    await writeFile(srcPath, "hello")
+    const store = new JsonStore(path.join(root, "state.json"))
+
+    await runCopy(root, store, undefined)
+    // Wait past one tick of the file system clock, so the edit gets a new modified time.
+    await Bun.sleep(20)
+    await writeFile(srcPath, "jello")
+    const second = await runCopy(root, store, undefined)
+    expect(ids(second.executed)).toEqual(["copy"])
+    expect(await readFile(path.join(root, "out.txt"), "utf8")).toBe("jello")
   })
 
   test("an unknown stamp mode throws", () => {
