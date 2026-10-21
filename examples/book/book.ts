@@ -1,10 +1,10 @@
-// Makes a picture book from each books/<book>/text.txt: one page for each sentence, one image for
-// each page, and out/<book>/book.html. drawImage calls the OpenRouter image API, and each call costs
-// money. Each image also gets the image before it as a reference, so the look stays the same from
-// page to page.
+// Makes a picture book from each books/<book>/text.txt: a page for each group of lines, one image
+// for each page, and out/<book>/book.html. drawImage calls the OpenRouter image API, and each call
+// costs money. Each image also gets every image before it as a reference, so the look stays the same
+// from page to page.
 //
 // Set OPENROUTER_API_KEY, and run it from an empty folder two times: the second run draws no image.
-// Then add a sentence at the end of a text: the next run draws 1 image.
+// The argument is the number of text lines on each page: `bun run book.ts 3`. The default is 2.
 import * as fs from "node:fs"
 import * as fsPromises from "node:fs/promises"
 import path from "node:path"
@@ -17,16 +17,21 @@ if (apiKey === undefined || apiKey.length === 0) {
   throw new Error("set OPENROUTER_API_KEY to an OpenRouter API key")
 }
 
+const linesPerPage = Number(process.argv[2] ?? "2")
+if (!Number.isInteger(linesPerPage) || linesPerPage < 1) {
+  throw new Error(`lines per page must be a whole number of 1 or more, not '${process.argv[2]}'`)
+}
+
 if (!fs.existsSync("books")) {
   await fsPromises.cp(path.join(import.meta.dir, "books"), "books", { recursive: true })
 }
 
 let imageCalls = 0
-async function drawImage(prompt: string, previous: Uint8Array | null): Promise<Uint8Array> {
+async function drawImage(prompt: string, earlierImages: Uint8Array[]): Promise<Uint8Array> {
   imageCalls += 1
   const inputReferences = []
-  if (previous !== null) {
-    const url = `data:image/png;base64,${Buffer.from(previous).toString("base64")}`
+  for (const earlier of earlierImages) {
+    const url = `data:image/png;base64,${Buffer.from(earlier).toString("base64")}`
     inputReferences.push({ type: "image_url", image_url: { url } })
   }
   const response = await fetch("https://openrouter.ai/api/v1/images", {
@@ -48,23 +53,25 @@ async function drawImage(prompt: string, previous: Uint8Array | null): Promise<U
 const pageName = (index: number) => String(index).padStart(3, "0")
 const build = new Build({ store: new JsonStore(".dapat/state.json") })
 
-// chunk:<book> writes one file for each sentence. It does not know the page count before it runs,
+// chunk:<book> writes one file for each page. It does not know the page count before it runs,
 // so it declares the folder and reports each page. Each report makes the image task of that page.
+// linesPerPage is in the task id, so a new value makes a new task, and that task runs.
 build.each({
   matchersByName: { text: new FileMatcher("books/<book>/text.txt") },
   *tasks(vars, matched) {
     const pagesFolder = new FilesystemPrefix(`out/${vars.book}/pages/`)
     yield new Task({
-      id: `chunk:${vars.book}`,
+      id: `chunk:${vars.book}/lines=${linesPerPage}`,
       inputs: [matched.text.data],
       outputs: [pagesFolder],
       run: async (ctx) => {
         const text = await Bun.file(matched.text.data.path).text()
-        const sentences = text.split(/(?<=[.!?])\s+/).filter((sentence) => sentence.length > 0)
+        const lines = text.split("\n").filter((line) => line.trim().length > 0)
         const pages = new Set<string>()
-        for (let index = 0; index < sentences.length; index++) {
+        for (let index = 0; index * linesPerPage < lines.length; index++) {
+          const pageLines = lines.slice(index * linesPerPage, (index + 1) * linesPerPage)
           const page = new FileArtifact(`out/${vars.book}/pages/${pageName(index)}.txt`)
-          await Bun.write(page.path, sentences[index]!.trim())
+          await Bun.write(page.path, pageLines.join("\n"))
           pages.add(page.path)
           ctx.produced(page)
         }
@@ -80,7 +87,7 @@ build.each({
   },
 })
 
-// image:<book>/<page> joins each page to the style of its book, and reads the image before it.
+// image:<book>/<page> joins each page to the style of its book, and reads every image before it.
 build.each({
   matchersByName: {
     page: new FileMatcher("out/<book>/pages/<page>.txt"),
@@ -89,25 +96,24 @@ build.each({
   *tasks(vars, matched) {
     const index = Number(vars.page)
     const image = new FileArtifact(`out/${vars.book}/images/${vars.page}.png`)
-    const inputs: Ref[] = [matched.page.data, matched.style.data]
-    let previous: FileArtifact | null = null
-    if (index > 0) {
-      previous = new FileArtifact(`out/${vars.book}/images/${pageName(index - 1)}.png`)
-      inputs.push(previous)
+    const earlierImages: FileArtifact[] = []
+    for (let earlier = 0; earlier < index; earlier++) {
+      earlierImages.push(new FileArtifact(`out/${vars.book}/images/${pageName(earlier)}.png`))
     }
+    const inputs: Ref[] = [matched.page.data, matched.style.data, ...earlierImages]
     yield new Task({
       id: `image:${vars.book}/${vars.page}`,
       inputs,
       outputs: [image],
       run: async () => {
         const style = await Bun.file(matched.style.data.path).text()
-        const sentence = await Bun.file(matched.page.data.path).text()
-        let previousBytes: Uint8Array | null = null
-        if (previous !== null) {
-          previousBytes = await previous.read()
+        const pageText = await Bun.file(matched.page.data.path).text()
+        const earlierBytes: Uint8Array[] = []
+        for (const earlier of earlierImages) {
+          earlierBytes.push(await earlier.read())
         }
-        const prompt = `A picture book illustration. Style: ${style.trim()}\nScene: ${sentence}`
-        await Bun.write(image.path, await drawImage(prompt, previousBytes))
+        const prompt = `A picture book illustration. Style: ${style.trim()}\nScene: ${pageText}`
+        await Bun.write(image.path, await drawImage(prompt, earlierBytes))
       },
     })
   },
@@ -130,8 +136,8 @@ build.each({
         const figures: string[] = []
         for (const file of pageFiles) {
           const name = path.basename(file, ".txt")
-          const sentence = await Bun.file(file).text()
-          figures.push(`<figure><img src="images/${name}.png"><figcaption>${sentence}</figcaption></figure>`)
+          const pageText = await Bun.file(file).text()
+          figures.push(`<figure><img src="images/${name}.png"><figcaption>${pageText}</figcaption></figure>`)
         }
         await Bun.write(book.path, `<!doctype html>\n<title>${vars.book}</title>\n${figures.join("\n")}\n`)
       },
