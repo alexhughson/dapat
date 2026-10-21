@@ -18,7 +18,7 @@ Use dapat for data pipelines, generated files, and agent loops, where a step is 
 
 ```
 Status: version 0.1.0. dapat is not published to a registry, and the API can change.
-`build.each` makes tasks for each artifact that a matcher finds. With several matchers, it joins their matches on shared var names, like a database join. dapat has no built-in matchers yet.
+`build.each` makes tasks for each artifact that a matcher finds. With several matchers, it joins their matches on shared var names, like a database join. `FileMatcher` finds files that fit a pattern, such as `content/<lang>/<slug>.md`.
 ```
 
 ```
@@ -108,7 +108,7 @@ if (!result.success) {
 | Import          | Contents                                                                                                                                  |
 | --------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
 | `dapat`         | the engine: `Build`, `Task`, `Artifact`, `Prefix`, `MemoryStore`, `Result`, `Emitter`, `Matcher`                                          |
-| `dapat/contrib` | `FileArtifact`, `FilesystemPrefix` (a folder), `S3ObjectArtifact`, `S3Prefix`. Stores that write to JSON or SQLite. |
+| `dapat/contrib` | `FileArtifact`, `FilesystemPrefix` (a folder), `FileMatcher` (a matcher of files), `S3ObjectArtifact`, `S3Prefix`. Stores that write to JSON or SQLite. |
 
 
 
@@ -128,6 +128,8 @@ if (!result.success) {
 - the full API reference
 
 [examples/first-build.ts](examples/first-build.ts) is a runnable version of the example above. It keeps its state in `.dapat/state.json`, so a second run skips both tasks. Edit `in.txt` to see them run again. Run it from a folder that contains `in.txt`, with `bun run <path to dapat>/examples/first-build.ts`.
+
+[examples/file-pipeline.ts](examples/file-pipeline.ts) uses `build.each` and `FileMatcher`. It makes one HTML page for each `content/<lang>/<slug>.md`, with the template `templates/<lang>.html`. It writes sample files when `content/` is missing. Run it two times from an empty folder: the second run skips each page.
 
 
 
