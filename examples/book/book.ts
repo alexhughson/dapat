@@ -1,29 +1,48 @@
 // Makes a picture book from each books/<book>/text.txt: one page for each sentence, one image for
-// each page, and out/<book>/book.html. Each image also reads the image before it, so the look stays
-// the same from page to page. drawImage is a fake for a paid image model, and it counts its calls.
+// each page, and out/<book>/book.html. drawImage calls the OpenRouter image API, and each call costs
+// money. Each image also gets the image before it as a reference, so the look stays the same from
+// page to page.
 //
-// Run it from an empty folder, two times: the second run draws no image. Then add a sentence at the
-// end of a text: the next run draws 1 image. Edit a style: it draws every image of that book.
+// Set OPENROUTER_API_KEY, and run it from an empty folder two times: the second run draws no image.
+// Then add a sentence at the end of a text: the next run draws 1 image.
 import * as fs from "node:fs"
 import * as fsPromises from "node:fs/promises"
 import path from "node:path"
 import { Build, Task, type Ref } from "dapat"
 import { FileArtifact, FileMatcher, FilesystemPrefix, JsonStore } from "dapat/contrib"
 
+const IMAGE_MODEL = "google/gemini-2.5-flash-image"
+const apiKey = process.env.OPENROUTER_API_KEY
+if (apiKey === undefined || apiKey.length === 0) {
+  throw new Error("set OPENROUTER_API_KEY to an OpenRouter API key")
+}
+
 if (!fs.existsSync("books")) {
   await fsPromises.cp(path.join(import.meta.dir, "books"), "books", { recursive: true })
 }
 
 let imageCalls = 0
-async function drawImage(prompt: string, previous: Uint8Array | null): Promise<string> {
+async function drawImage(prompt: string, previous: Uint8Array | null): Promise<Uint8Array> {
   imageCalls += 1
-  const hasher = new Bun.CryptoHasher("sha256")
-  hasher.update(prompt)
+  const inputReferences = []
   if (previous !== null) {
-    hasher.update(previous)
+    const url = `data:image/png;base64,${Buffer.from(previous).toString("base64")}`
+    inputReferences.push({ type: "image_url", image_url: { url } })
   }
-  const colour = hasher.digest("hex").slice(0, 6)
-  return `<svg xmlns="http://www.w3.org/2000/svg" width="400" height="300"><rect width="400" height="300" fill="#${colour}"/></svg>`
+  const response = await fetch("https://openrouter.ai/api/v1/images", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ model: IMAGE_MODEL, prompt, input_references: inputReferences }),
+  })
+  if (!response.ok) {
+    throw new Error(`image API: ${response.status} ${await response.text()}`)
+  }
+  const body = (await response.json()) as { data: { b64_json: string; media_type?: string }[] }
+  const image = body.data[0]!
+  if (image.media_type !== "image/png") {
+    throw new Error(`image API: expected image/png, got ${image.media_type}`)
+  }
+  return Buffer.from(image.b64_json, "base64")
 }
 
 const pageName = (index: number) => String(index).padStart(3, "0")
@@ -69,11 +88,11 @@ build.each({
   },
   *tasks(vars, matched) {
     const index = Number(vars.page)
-    const image = new FileArtifact(`out/${vars.book}/images/${vars.page}.svg`)
+    const image = new FileArtifact(`out/${vars.book}/images/${vars.page}.png`)
     const inputs: Ref[] = [matched.page.data, matched.style.data]
     let previous: FileArtifact | null = null
     if (index > 0) {
-      previous = new FileArtifact(`out/${vars.book}/images/${pageName(index - 1)}.svg`)
+      previous = new FileArtifact(`out/${vars.book}/images/${pageName(index - 1)}.png`)
       inputs.push(previous)
     }
     yield new Task({
@@ -87,7 +106,8 @@ build.each({
         if (previous !== null) {
           previousBytes = await previous.read()
         }
-        await Bun.write(image.path, await drawImage(`${style}\n${sentence}`, previousBytes))
+        const prompt = `A picture book illustration. Style: ${style.trim()}\nScene: ${sentence}`
+        await Bun.write(image.path, await drawImage(prompt, previousBytes))
       },
     })
   },
@@ -111,7 +131,7 @@ build.each({
         for (const file of pageFiles) {
           const name = path.basename(file, ".txt")
           const sentence = await Bun.file(file).text()
-          figures.push(`<figure><img src="images/${name}.svg"><figcaption>${sentence}</figcaption></figure>`)
+          figures.push(`<figure><img src="images/${name}.png"><figcaption>${sentence}</figcaption></figure>`)
         }
         await Bun.write(book.path, `<!doctype html>\n<title>${vars.book}</title>\n${figures.join("\n")}\n`)
       },

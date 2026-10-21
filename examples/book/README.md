@@ -1,22 +1,23 @@
 # Children's book example
 
-[book.ts](book.ts) makes a picture book from a text: one page for each sentence, one image for each page, and one HTML file. Each image also reads the image before it, so the look stays the same from page to page.
+[book.ts](book.ts) makes a picture book from a text: one page for each sentence, one image for each page, and one HTML file. Each image also gets the image before it as a reference, so the look stays the same from page to page.
 
-The image step is a fake for a paid model call. So the number to watch is how many images a build draws after an edit.
+The images come from the [OpenRouter image API](https://openrouter.ai/docs/guides/overview/multimodal/image-generation), with the model `google/gemini-2.5-flash-image`. **Each image costs money.** So the number to watch is how many images a run draws after an edit, and the script prints it.
 
 ```sh
+export OPENROUTER_API_KEY=...
 mkdir /tmp/book && cd /tmp/book
 bun run <path to dapat>/examples/book/book.ts
 ```
 
-The first run copies the sample books (`hamlet`, 9 sentences, and `owl`, 4 sentences) into `books/`.
+The first run copies the sample books (`hamlet`, 9 sentences, and `owl`, 4 sentences) into `books/`, and it draws 13 images.
 
 ## The tasks
 
 ```
 chunk:<book>         books/<book>/text.txt  ->  FilesystemPrefix("out/<book>/pages/")
                      writes 000.txt, 001.txt, ... and calls ctx.produced for each page
-image:<book>/<page>  pages/<page>.txt + books/<book>/style.txt + images/<page - 1>.svg  ->  images/<page>.svg
+image:<book>/<page>  pages/<page>.txt + books/<book>/style.txt + images/<page - 1>.png  ->  images/<page>.png
 assemble:<book>      FilesystemPrefix(pages/) + FilesystemPrefix(images/)  ->  out/<book>/book.html
 ```
 
@@ -33,4 +34,4 @@ On the first run, `pages/` is empty. Each `ctx.produced(page)` makes the page ma
 | change `books/owl/style.txt` | 4, every `owl` image |
 | change sentence 4 of `hamlet` | 6: that image and each image after it |
 
-`chunk` writes every page again on each run. The default stamp is a hash of the bytes, so only the pages with new bytes make their images run again.
+`chunk` writes every page again on each run. The default stamp is a hash of the bytes, so only the pages with new bytes make their images run again. With `{ stamp: "time" }`, adding one sentence would draw all 10 `hamlet` images again.
