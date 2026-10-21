@@ -66,9 +66,9 @@ describe("FileMatcher pattern", () => {
   })
 
   test("throws for a pattern with * or **", () => {
-    expect(() => new FileMatcher("content/*.md")).toThrow("'*' and '**' are not supported yet")
-    expect(() => new FileMatcher("content/**/<slug>.md")).toThrow("'*' and '**' are not supported yet")
-    expect(() => new FileMatcher("content/<lang>/*")).toThrow("'*' and '**' are not supported yet")
+    expect(() => new FileMatcher("content/*.md")).toThrow("'*' and '**' are not allowed")
+    expect(() => new FileMatcher("content/**/<slug>.md")).toThrow("'*' and '**' are not allowed")
+    expect(() => new FileMatcher("content/<lang>/*")).toThrow("'*' and '**' are not allowed")
   })
 
   test("throws for two vars with nothing between them, and for an empty pattern", () => {
@@ -247,9 +247,9 @@ describe("FileMatcher artifact events", () => {
     matcher.receiveArtifactEvent({ kind: "promised", output: kept, taskId: "write" })
     expect(events).toEqual(["found slug=kept posts/kept.md"])
     // The record map is private. Bracket access reads it here only to show that it does not grow.
-    expect(matcher["knownFiles"].size).toBe(1)
+    expect(matcher["fileStates"]["knownFiles"].size).toBe(1)
     matcher.receiveArtifactEvent({ kind: "withdrawn", output: kept, taskId: "write" })
-    expect(matcher["knownFiles"].size).toBe(0)
+    expect(matcher["fileStates"]["knownFiles"].size).toBe(0)
   })
 
   test("an output that moves from one task to another gives gone and then found", async () => {

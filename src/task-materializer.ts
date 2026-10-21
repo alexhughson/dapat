@@ -1,7 +1,7 @@
 import type { Artifact } from "./artifact"
 import type { AnyMatcher, DataOf } from "./matcher"
 import type { MatchedArtifact, MatchedArtifactEvent, MatchedData, Vars } from "./matched-artifact"
-import { JoinIndex, MatchTable, joinFrom, planJoins, type BaseSet, type JoinStep, type JoinedSet, type StoredMatch } from "./match-join"
+import { JoinIndex, MatchTable, joinFrom, planJoins, type ArtifactIds, type BaseSet, type JoinStep, type JoinedSet, type StoredMatch } from "./match-join"
 import type { Task } from "./task"
 import { TaskGroup } from "./task-group"
 
@@ -152,7 +152,7 @@ export class TaskMaterializer<M extends Record<string, AnyMatcher>, R extends ke
     const artifactIds = artifactIdsOf(found.data)
     const current = table.get(found.vars)
     if (current !== undefined) {
-      if (current.artifactIds === artifactIds) return
+      if (sameArtifactIds(current.artifactIds, artifactIds)) return
       // The vars are the same, so the match is in the same joined sets. Only their tasks change.
       current.matched = found
       current.artifactIds = artifactIds
@@ -345,13 +345,25 @@ export class TaskMaterializer<M extends Record<string, AnyMatcher>, R extends ke
 }
 
 /** The artifact ids of the data. Two matches with the same ids hold the same data. */
-function artifactIdsOf(data: MatchedData): string {
+function artifactIdsOf(data: MatchedData): ArtifactIds {
   if (Array.isArray(data)) {
     const ids: string[] = []
     for (const artifact of data as readonly Artifact[]) {
       ids.push(artifact.id)
     }
-    return JSON.stringify(ids)
+    return { kind: "list", ids }
   }
-  return JSON.stringify((data as Artifact).id)
+  return { kind: "one", id: (data as Artifact).id }
+}
+
+/** True when both are one artifact with the same id, or both are lists with the same ids in the same order. */
+function sameArtifactIds(left: ArtifactIds, right: ArtifactIds): boolean {
+  if (left.kind === "one" && right.kind === "one") return left.id === right.id
+  if (left.kind !== "list" || right.kind !== "list") return false
+  // A list that gets or loses a file has a new length, so this check is fast for a group of files.
+  if (left.ids.length !== right.ids.length) return false
+  for (let index = 0; index < left.ids.length; index++) {
+    if (left.ids[index] !== right.ids[index]) return false
+  }
+  return true
 }
