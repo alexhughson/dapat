@@ -516,3 +516,81 @@ class MovingBuild extends Build {
     this.setTasksOfGroups([{ group, tasks }])
   }
 }
+
+describe("FileMatcher syntax option", () => {
+  test("the default syntax is '<' '>' '*' '**'", () => {
+    const matcher = new FileMatcher("content/<lang>/<slug>.md")
+    expect(matcher.varNames).toEqual(["lang", "slug"])
+    const sameMatcher = new FileMatcher("content/<lang>/<slug>.md", { syntax: {} })
+    expect(sameMatcher.varNames).toEqual(["lang", "slug"])
+    expect(() => new FileMatcher("content/<lang>/*.md", { syntax: {} })).toThrow("'*' and '**' are not allowed")
+  })
+
+  test("finds the files under a root folder whose real name holds '<x>' and '*'", async () => {
+    const root = await tempDir()
+    const strangeFolder = path.join(root, "a<x>*b")
+    await writeText(path.join(strangeFolder, "en", "hello.md"), "")
+    await writeText(path.join(strangeFolder, "fr", "salut.md"), "")
+    await writeText(path.join(root, "aXb", "en", "other.md"), "")
+    const syntax = { varStart: "{", varEnd: "}", anyName: "%", anyFolders: "%%" }
+    const matcher = new FileMatcher(path.join(strangeFolder, "{lang}/{slug}.md"), { syntax })
+    expect(matcher.varNames).toEqual(["lang", "slug"])
+    const events = recordEvents(matcher, root)
+    await matcher.scan(new AbortController().signal)
+    expect(events).toEqual([
+      "found lang=en slug=hello a<x>*b/en/hello.md",
+      "found lang=fr slug=salut a<x>*b/fr/salut.md",
+    ])
+  })
+
+  test("with a custom varStart and varEnd, '<' and '>' are literals in each part", async () => {
+    const root = await tempDir()
+    await writeText(path.join(root, "<old>", "a<1>.md"), "")
+    await writeText(path.join(root, "<old>", "b.md"), "")
+    const matcher = new FileMatcher(path.join(root, "<old>/{slug}<1>.md"), { syntax: { varStart: "{", varEnd: "}" } })
+    expect(matcher.varNames).toEqual(["slug"])
+    const events = recordEvents(matcher, root)
+    await matcher.scan(new AbortController().signal)
+    expect(events).toEqual(["found slug=a <old>/a<1>.md"])
+  })
+
+  test("with a custom anyName, '*' is a literal and the custom glob throws", async () => {
+    const root = await tempDir()
+    await writeText(path.join(root, "notes*", "a.md"), "")
+    const syntax = { anyName: "%", anyFolders: "%%" }
+    const matcher = new FileMatcher(path.join(root, "notes*/<slug>.md"), { syntax })
+    const events = recordEvents(matcher, root)
+    await matcher.scan(new AbortController().signal)
+    expect(events).toEqual(["found slug=a notes*/a.md"])
+    expect(() => new FileMatcher("notes/%.md", { syntax })).toThrow("'%' and '%%' are not allowed")
+    expect(() => new FileMatcher("notes/%%/<slug>.md", { syntax })).toThrow("'%' and '%%' are not allowed")
+  })
+
+  test("a stray custom var marker throws, and the message names the custom markers", () => {
+    const syntax = { varStart: "{", varEnd: "}" }
+    expect(() => new FileMatcher("content/{slug.md", { syntax })).toThrow("each '{' and '}' must enclose a var name")
+    expect(() => new FileMatcher("content/{a}{b}.md", { syntax })).toThrow("the vars {a} and {b} have nothing between them")
+  })
+
+  test("throws for a syntax that has no single parse", () => {
+    expect(() => new FileMatcher("a/<x>.md", { syntax: { varStart: "" } })).toThrow("FileMatcher syntax: varStart is empty")
+    expect(() => new FileMatcher("a/<x>.md", { syntax: { anyName: "" } })).toThrow("FileMatcher syntax: anyName is empty")
+    expect(() => new FileMatcher("a/{x}.md", { syntax: { varStart: "{", varEnd: "{" } })).toThrow(
+      "varStart and varEnd are both '{'",
+    )
+    expect(() => new FileMatcher("a/<x>.md", { syntax: { varEnd: "/" } })).toThrow("varEnd '/' holds '/'")
+    expect(() => new FileMatcher("a/<x>.md", { syntax: { anyFolders: "a/b" } })).toThrow("anyFolders 'a/b' holds '/'")
+    expect(() => new FileMatcher("a/<x>.md", { syntax: { anyName: "%", anyFolders: "%" } })).toThrow(
+      "anyName and anyFolders are both '%'",
+    )
+    expect(() => new FileMatcher("a/<x>.md", { syntax: { anyName: "%%", anyFolders: "%" } })).toThrow(
+      "anyName '%%' holds anyFolders '%'",
+    )
+    expect(() => new FileMatcher("a/<x>.md", { syntax: { varStart: "*" } })).toThrow("varStart and anyName are both '*'")
+    expect(() => new FileMatcher("a/{{x}.md", { syntax: { varStart: "{{", varEnd: "}", anyName: "{" } })).toThrow(
+      "varStart '{{' holds anyName '{'",
+    )
+    expect(() => new FileMatcher("a/<x>.md", { syntax: { anyFolders: "." } })).toThrow("anyFolders cannot be '.'")
+    expect(() => new FileMatcher("a/<x>.md", { syntax: { anyName: ".." } })).toThrow("anyName cannot be '..'")
+  })
+})

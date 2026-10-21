@@ -3,8 +3,8 @@ import type { Vars } from "../../src/matched-artifact"
 import { Matcher } from "../../src/matcher"
 import type { FileArtifact } from "./file"
 import { FileMatchStates, type FileMatchChange } from "./file-match-states"
-import { FilePattern } from "./file-pattern"
-import { stampMode, type FileStampOptions } from "./stamp"
+import { FilePattern, type FileMatcherOptions } from "./file-pattern"
+import { stampMode } from "./stamp"
 
 /** The files that have a match now and have the same vars. */
 type FileGroup = {
@@ -23,6 +23,7 @@ type FileGroup = {
  * so the task reads those names from the path of each file.
  * A file is in the list while the file is on disk, as far as the matcher knows, or while a task
  * declares it as an output, as for FileMatcher. A list that becomes empty sends `gone`.
+ * The `syntax` option sets other characters for the vars and the globs, as for FileMatcher.
  */
 export class FileGroupMatcher extends Matcher<readonly FileArtifact[]> {
   /** The pattern after normalization, for example `site/<lang>/**\/*.html`. */
@@ -35,17 +36,19 @@ export class FileGroupMatcher extends Matcher<readonly FileArtifact[]> {
   // Each group with one or more files, by key.
   private readonly groupsByKey = new Map<string, FileGroup>()
 
-  constructor(pattern: string, opts?: FileStampOptions) {
+  constructor(pattern: string, opts?: FileMatcherOptions) {
     super()
-    const filePattern = new FilePattern(pattern, "FileGroupMatcher")
+    const filePattern = new FilePattern(pattern, "FileGroupMatcher", opts?.syntax)
+    const anyName = filePattern.syntax.anyName
+    const anyFolders = filePattern.syntax.anyFolders
     if (!filePattern.hasGlob) {
       throw new Error(
-        `FileGroupMatcher pattern '${pattern}' has no '*' or '**'; use FileMatcher for one match for each file`,
+        `FileGroupMatcher pattern '${pattern}' has no '${anyName}' or '${anyFolders}'; use FileMatcher for one match for each file`,
       )
     }
     if (filePattern.hasVarAtOrAfterGlob) {
       throw new Error(
-        `FileGroupMatcher pattern '${pattern}': a var must come in a part before the first '*' or '**'; read the other names from the path of each file`,
+        `FileGroupMatcher pattern '${pattern}': a var must come in a part before the first '${anyName}' or '${anyFolders}'; read the other names from the path of each file`,
       )
     }
     this.filePattern = filePattern

@@ -316,3 +316,66 @@ describe("examples", () => {
     expect(second).toContain("executed: []")
   })
 })
+
+describe("FileGroupMatcher syntax option", () => {
+  test("the default syntax is unchanged", () => {
+    expect(new FileGroupMatcher("site/<lang>/**/*.html", { syntax: {} }).varNames).toEqual(["lang"])
+    expect(() => new FileGroupMatcher("site/<lang>/index.html", { syntax: {} })).toThrow(
+      "has no '*' or '**'; use FileMatcher",
+    )
+  })
+
+  test("custom glob characters find the files under a root folder whose real name holds '<x>' and '*'", async () => {
+    const root = await tempDir()
+    const strangeFolder = path.join(root, "a<x>*b")
+    await writeText(path.join(strangeFolder, "en", "a.html"), "")
+    await writeText(path.join(strangeFolder, "en", "blog", "b.html"), "")
+    await writeText(path.join(strangeFolder, "fr", "index.html"), "")
+    await writeText(path.join(strangeFolder, "fr", "notes.txt"), "")
+    const syntax = { varStart: "{", varEnd: "}", anyName: "%", anyFolders: "...." }
+    const matcher = new FileGroupMatcher(path.join(strangeFolder, "{lang}/..../%.html"), { syntax })
+    expect(matcher.varNames).toEqual(["lang"])
+    const events = recordEvents(matcher, root)
+    await matcher.scan(new AbortController().signal)
+    expect(events).toEqual([
+      "found lang=en [a<x>*b/en/a.html a<x>*b/en/blog/b.html]",
+      "found lang=fr [a<x>*b/fr/index.html]",
+    ])
+  })
+
+  test("with a custom anyName, '*' and '**' are literal names", async () => {
+    const root = await tempDir()
+    await writeText(path.join(root, "**", "*.md"), "")
+    await writeText(path.join(root, "**", "other.md"), "")
+    const syntax = { anyName: "?", anyFolders: "??" }
+    const literalMatcher = new FileGroupMatcher(path.join(root, "**/?.md"), { syntax })
+    const literalEvents = recordEvents(literalMatcher, root)
+    await literalMatcher.scan(new AbortController().signal)
+    expect(literalEvents).toEqual(["found  [**/*.md **/other.md]"])
+    const starMatcher = new FileGroupMatcher(path.join(root, "??/*.md"), { syntax })
+    const starEvents = recordEvents(starMatcher, root)
+    await starMatcher.scan(new AbortController().signal)
+    expect(starEvents).toEqual(["found  [**/*.md]"])
+  })
+
+  test("an anyFolders that does not hold anyName must still be a whole part", () => {
+    const syntax = { anyName: "%", anyFolders: "@@" }
+    expect(new FileGroupMatcher("site/<lang>/@@/%.html", { syntax }).varNames).toEqual(["lang"])
+    expect(() => new FileGroupMatcher("site/a@@b/%.html", { syntax })).toThrow("'@@' must be a whole part, as in 'a/@@/b'")
+    expect(() => new FileGroupMatcher("site/<lang>/@@", { syntax })).toThrow("not '@@'; use '@@/%' for every file")
+  })
+
+  test("the errors name the custom glob characters", () => {
+    const syntax = { anyName: "%", anyFolders: "%%" }
+    expect(() => new FileGroupMatcher("site/*.html", { syntax })).toThrow("has no '%' or '%%'; use FileMatcher")
+    expect(() => new FileGroupMatcher("site/%/<slug>.html", { syntax })).toThrow(
+      "a var must come in a part before the first '%' or '%%'",
+    )
+  })
+
+  test("throws for a syntax that has no single parse", () => {
+    expect(() => new FileGroupMatcher("a/*.md", { syntax: { anyFolders: "" } })).toThrow("FileGroupMatcher syntax: anyFolders is empty")
+    expect(() => new FileGroupMatcher("a/*.md", { syntax: { anyName: "**" } })).toThrow("anyName and anyFolders are both '**'")
+    expect(() => new FileGroupMatcher("a/*.md", { syntax: { anyName: "x/" } })).toThrow("anyName 'x/' holds '/'")
+  })
+})

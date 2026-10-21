@@ -2,14 +2,35 @@ import type { Dirent } from "node:fs"
 import * as fsPromises from "node:fs/promises"
 import path from "node:path"
 import type { Vars } from "../../src/matched-artifact"
-import { KeyPattern } from "../../src/pattern"
+import { DEFAULT_PATTERN_SYNTAX, KeyPattern, type PatternSyntax } from "../../src/pattern"
 import * as stamp from "./stamp"
+import type { FileStampOptions } from "./stamp"
 
 /**
  * One part of the pattern, for the scan: a literal name, a part with vars or `*` that filters
  * the names of one folder, or `**`, which takes the files under a folder at any depth.
  */
 type ScanSegment = { kind: "literal"; name: string } | { kind: "names"; pattern: KeyPattern } | { kind: "anyDepth" }
+
+/**
+ * The characters that have a special meaning in a file pattern. Each one you leave out keeps its default.
+ * Use other characters when a folder or file name in the pattern holds `<`, `>`, or `*`.
+ */
+export interface FilePatternSyntax {
+  /** The text before a var name. Default `<`. */
+  varStart?: string
+  /** The text after a var name. Default `>`. */
+  varEnd?: string
+  /** The glob that matches any text in one part of the path. Default `*`. */
+  anyName?: string
+  /** The glob part that matches zero or more folders. Default `**`. */
+  anyFolders?: string
+}
+
+/** The options of FileMatcher and FileGroupMatcher. */
+export interface FileMatcherOptions extends FileStampOptions {
+  syntax?: FilePatternSyntax
+}
 
 /**
  * A file pattern such as `content/<lang>/<slug>.md` or `site/<lang>/**\/*.html`, after its checks.
@@ -26,12 +47,16 @@ export class FilePattern {
   readonly hasGlob: boolean
   /** True when a var is in the part of the first `*` or `**`, or in a part after it. */
   readonly hasVarAtOrAfterGlob: boolean
+  /** The syntax of the pattern, with the defaults for each character that the caller left out. */
+  readonly syntax: PatternSyntax
   private readonly keyPattern: KeyPattern
   // The parts that the scan walks one at a time, in order: the parts up to the first `**`, or all parts.
   private readonly segments: ScanSegment[]
 
   /** `matcherName` is the class name at the start of each error message. */
-  constructor(pattern: string, matcherName: string) {
+  constructor(pattern: string, matcherName: string, syntaxOption?: FilePatternSyntax) {
+    const syntax = resolveSyntax(syntaxOption, matcherName)
+    const anyFolders = syntax.anyFolders
     if (pattern.length === 0) {
       throw new Error(`${matcherName}: the pattern is empty`)
     }
@@ -41,14 +66,17 @@ export class FilePattern {
           `${matcherName} pattern '${pattern}': a '..' part is not allowed; for a folder above the working directory, use path.resolve to make the pattern absolute`,
         )
       }
-      if (part !== "**" && part.includes("**")) {
-        throw new Error(`${matcherName} pattern '${pattern}': '**' must be a whole part, as in 'a/**/b'`)
+      if (part !== anyFolders && part.includes(anyFolders)) {
+        throw new Error(
+          `${matcherName} pattern '${pattern}': '${anyFolders}' must be a whole part, as in 'a/${anyFolders}/b'`,
+        )
       }
     }
-    const textOutsideVars = pattern.replace(VAR_TOKEN, "")
-    if (textOutsideVars.includes("<") || textOutsideVars.includes(">")) {
+    const varToken = varTokenRegexOf(syntax)
+    const textOutsideVars = pattern.replace(varToken, "")
+    if (textOutsideVars.includes(syntax.varStart) || textOutsideVars.includes(syntax.varEnd)) {
       throw new Error(
-        `${matcherName} pattern '${pattern}': each '<' and '>' must enclose a var name of letters, digits, and '_' that does not start with a digit`,
+        `${matcherName} pattern '${pattern}': each '${syntax.varStart}' and '${syntax.varEnd}' must enclose a var name of letters, digits, and '_' that does not start with a digit`,
       )
     }
     const normalized = path.posix.normalize(pattern)
@@ -57,16 +85,19 @@ export class FilePattern {
       throw new Error(`${matcherName} pattern '${pattern}' names no file`)
     }
     const lastText = segmentTexts[segmentTexts.length - 1]!
-    if (lastText === "**") {
-      throw new Error(`${matcherName} pattern '${pattern}': the last part must name files, not '**'; use '**/*' for every file`)
+    if (lastText === anyFolders) {
+      throw new Error(
+        `${matcherName} pattern '${pattern}': the last part must name files, not '${anyFolders}'; use '${anyFolders}/${syntax.anyName}' for every file`,
+      )
     }
-    const keyPattern = new KeyPattern(normalized)
+    const keyPattern = new KeyPattern(normalized, syntax)
     let root = process.cwd()
     if (path.posix.isAbsolute(normalized)) {
       root = "/"
     }
     this.pattern = normalized
     this.root = root
+    this.syntax = syntax
     this.keyPattern = keyPattern
     this.varNames = keyPattern.varNames
     this.hasGlob = keyPattern.hasGlob
@@ -76,11 +107,11 @@ export class FilePattern {
     let anyDepthSeen = false
     this.segments = []
     for (const text of segmentTexts) {
-      const segmentPattern = new KeyPattern(text)
+      const segmentPattern = new KeyPattern(text, syntax)
       if (segmentPattern.hasGlob) globSeen = true
       if (globSeen && segmentPattern.varNames.length > 0) varAtOrAfterGlob = true
       if (anyDepthSeen) continue
-      if (text === "**") {
+      if (text === anyFolders) {
         anyDepthSeen = true
         this.segments.push({ kind: "anyDepth" })
       } else if (segmentPattern.varNames.length === 0 && !segmentPattern.hasGlob) {
@@ -117,8 +148,67 @@ export class FilePattern {
   }
 }
 
-/** A var token of KeyPattern: `<` and a name of letters, digits, and `_` that does not start with a digit, and `>`. */
-const VAR_TOKEN = /<[A-Za-z_][A-Za-z0-9_]*>/g
+const SYNTAX_KEYS = ["varStart", "varEnd", "anyName", "anyFolders"] as const
+
+/**
+ * The syntax with the default for each character that `syntaxOption` leaves out. Throws for a syntax
+ * that has no single parse: an empty marker, a marker with a `/`, `anyName` or `anyFolders` that is
+ * `.` or `..`, two markers that are equal, and a marker that holds another marker. Only `anyFolders`
+ * can hold `anyName`, as `**` holds `*`.
+ */
+function resolveSyntax(syntaxOption: FilePatternSyntax | undefined, matcherName: string): PatternSyntax {
+  if (syntaxOption === undefined) return DEFAULT_PATTERN_SYNTAX
+  const syntax: PatternSyntax = {
+    varStart: syntaxOption.varStart ?? DEFAULT_PATTERN_SYNTAX.varStart,
+    varEnd: syntaxOption.varEnd ?? DEFAULT_PATTERN_SYNTAX.varEnd,
+    anyName: syntaxOption.anyName ?? DEFAULT_PATTERN_SYNTAX.anyName,
+    anyFolders: syntaxOption.anyFolders ?? DEFAULT_PATTERN_SYNTAX.anyFolders,
+  }
+  for (const key of SYNTAX_KEYS) {
+    const marker: unknown = syntax[key]
+    if (typeof marker !== "string") {
+      throw new Error(`${matcherName} syntax: ${key} must be a string, not ${typeof marker}`)
+    }
+    if (marker.length === 0) {
+      throw new Error(`${matcherName} syntax: ${key} is empty`)
+    }
+    if (marker.includes("/")) {
+      throw new Error(`${matcherName} syntax: ${key} '${marker}' holds '/', which separates the parts of a path`)
+    }
+  }
+  for (const key of ["anyName", "anyFolders"] as const) {
+    const marker = syntax[key]
+    if (marker === "." || marker === "..") {
+      throw new Error(`${matcherName} syntax: ${key} cannot be '${marker}', because it is a part of a path`)
+    }
+  }
+  for (const outerKey of SYNTAX_KEYS) {
+    for (const innerKey of SYNTAX_KEYS) {
+      if (outerKey === innerKey) continue
+      const outer = syntax[outerKey]
+      const inner = syntax[innerKey]
+      if (outer === inner) {
+        throw new Error(`${matcherName} syntax: ${outerKey} and ${innerKey} are both '${outer}'`)
+      }
+      if (outerKey === "anyFolders" && innerKey === "anyName") continue
+      if (outer.includes(inner)) {
+        throw new Error(`${matcherName} syntax: ${outerKey} '${outer}' holds ${innerKey} '${inner}', so a pattern has no single parse`)
+      }
+    }
+  }
+  return syntax
+}
+
+/** A var token: `varStart`, a name of letters, digits, and `_` that does not start with a digit, and `varEnd`. */
+function varTokenRegexOf(syntax: PatternSyntax): RegExp {
+  const start = escapeRegex(syntax.varStart)
+  const end = escapeRegex(syntax.varEnd)
+  return new RegExp(`${start}[A-Za-z_][A-Za-z0-9_]*${end}`, "g")
+}
+
+function escapeRegex(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+}
 
 function splitSegments(pattern: string): string[] {
   const segments: string[] = []
