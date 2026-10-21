@@ -50,7 +50,7 @@ export class FileMatcher extends Matcher<FileArtifact> {
     for (const part of pattern.split("/")) {
       if (part === "..") {
         throw new Error(
-          `FileMatcher pattern '${pattern}': a '..' part is not allowed; give an absolute pattern, for example from path.resolve`,
+          `FileMatcher pattern '${pattern}': a '..' part is not allowed; for a folder above the working directory, use path.resolve to make the pattern absolute`,
         )
       }
     }
@@ -195,9 +195,10 @@ function splitSegments(pattern: string): string[] {
 
 /**
  * Adds to `filePaths` each file below `folder` that fits `segments` from `index` on, in name order.
- * A literal part is joined with no read. A part with vars reads the folder, and stats only symlinks.
+ * A literal part is joined with no read. A part with vars reads the folder, and stats only symlinks
+ * and entries whose type the filesystem does not report.
  * The name check of a part is only a filter: `match` checks the whole path later, for a var that comes twice.
- * A folder that is missing, or that is not a folder, adds no file.
+ * A folder that is missing, that is not a folder, or that is a link loop, adds no file.
  */
 async function collectFiles(
   folder: string,
@@ -230,13 +231,13 @@ async function collectFiles(
   for (const entry of entries) {
     if (segment.pattern.match(entry.name) === null) continue
     const childPath = path.join(folder, entry.name)
-    let kind: "file" | "folder" | "other" = "other"
-    if (entry.isSymbolicLink()) {
-      kind = await kindOfPath(childPath)
-    } else if (entry.isFile()) {
+    let kind: "file" | "folder" | "other"
+    if (entry.isFile()) {
       kind = "file"
     } else if (entry.isDirectory()) {
       kind = "folder"
+    } else {
+      kind = await kindOfPath(childPath)
     }
     if (isLast) {
       if (kind === "file") filePaths.push(childPath)
@@ -261,7 +262,6 @@ async function kindOfPath(fullPath: string): Promise<"file" | "folder" | "other"
     info = await fsPromises.stat(fullPath)
   } catch (error) {
     if (isMissingPath(error)) return "other"
-    if (errorCode(error) === "ELOOP") return "other"
     throw error
   }
   if (info.isFile()) return "file"
@@ -269,11 +269,12 @@ async function kindOfPath(fullPath: string): Promise<"file" | "folder" | "other"
   return "other"
 }
 
-/** True for the errors of a path that is not there, or that goes through a file. */
+/** True for the errors of a path that is not there, that goes through a file, or that is a link loop. */
 function isMissingPath(error: unknown): boolean {
   const code = errorCode(error)
   if (code === "ENOENT") return true
   if (code === "ENOTDIR") return true
+  if (code === "ELOOP") return true
   return false
 }
 

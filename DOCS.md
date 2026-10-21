@@ -1016,7 +1016,7 @@ Each `FileArtifact` that the matcher sends has an absolute path. The `stamp` opt
 
 #### The scan
 
-The scan reads only the folders that the pattern names. For a part with no var, for example `content`, it adds the name to the path and reads nothing. For a part with a var, it reads the folder and keeps only the names that fit that part. It goes down to the depth of the pattern, and sends `found` for each file that fits, in name order. It stats only symlinks.
+The scan reads only the folders that the pattern names. For a part with no var, for example `content`, it adds the name to the path and reads nothing. For a part with a var, it reads the folder and keeps only the names that fit that part. It goes down to the depth of the pattern, and sends `found` for each file that fits, in name order. It stats only symlinks, and entries whose type the filesystem does not report. A link loop adds no file. On a filesystem that ignores case, such as the macOS default, a part with no var also finds a folder whose name differs only in case.
 
 - A missing folder has no files. This is not an error, because a task can make the folder later.
 - The scan follows symlinks. A link to a file counts as that file. A broken link adds nothing.
@@ -1725,7 +1725,7 @@ new FileMatcher(pattern: string, opts?: { stamp?: "time" | "hash" })
 | `pattern` | The pattern without `./`, for example `content/<lang>/<slug>.md`. |
 | `root` | The absolute folder that the pattern is relative to: the working directory when you create the matcher, or `/` for an absolute pattern. |
 | `varNames` | The vars of the pattern, in order. `templates/<lang>.html` gives `["lang"]`. |
-| `scan(signal)` | Sends `found` for each file on disk that fits, in name order. Reads a folder only for a part with a var, and stats only symlinks. A missing folder has no files. Follows symlinks. Throws for every other error. |
+| `scan(signal)` | Sends `found` for each file on disk that fits, in name order. Reads a folder only for a part with a var, and stats only symlinks and entries of unknown type. A link loop adds no file. A missing folder has no files. Follows symlinks. Throws for every other error. |
 | `receiveArtifactEvent(event)` | `promised` and `produced` of a `FileArtifact` that fits send `found`. `deleted` sends `gone` unless a task still declares the file. `withdrawn` sends `gone` unless the file is on disk. |
 
 The `stamp` option sets the stamp mode of each `FileArtifact` that the matcher sends. Default `"time"`. The constructor throws for an empty pattern, a pattern with `*` or `**`, a `..` part, a `<` or `>` that does not enclose a valid var name, and two vars with nothing between them. Each match is `{ vars, data: FileArtifact }`. See [`FileMatcher`](#filematcher-one-match-for-each-file).

@@ -186,6 +186,22 @@ describe("FileMatcher scan", () => {
     await matcher.scan(new AbortController().signal)
     expect(events).toEqual(["found slug=linked posts/linked.md"])
   })
+
+  test("a link loop adds nothing, also at a part with no var", async () => {
+    const root = await tempDir()
+    await writeText(path.join(root, "y", "sub", "ok.txt"), "")
+    await fsPromises.mkdir(path.join(root, "x"))
+    await fsPromises.symlink(path.join(root, "x", "sub"), path.join(root, "x", "sub"))
+    await fsPromises.symlink(path.join(root, "selfloop"), path.join(root, "selfloop"))
+    const afterVar = new FileMatcher(path.join(root, "<d>/sub/<f>.txt"))
+    const afterVarEvents = recordEvents(afterVar, root)
+    await afterVar.scan(new AbortController().signal)
+    expect(afterVarEvents).toEqual(["found d=y f=ok y/sub/ok.txt"])
+    const beforeVar = new FileMatcher(path.join(root, "selfloop/<f>.txt"))
+    const beforeVarEvents = recordEvents(beforeVar, root)
+    await beforeVar.scan(new AbortController().signal)
+    expect(beforeVarEvents).toEqual([])
+  })
 })
 
 describe("FileMatcher artifact events", () => {
