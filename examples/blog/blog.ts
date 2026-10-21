@@ -82,6 +82,7 @@ function pageUrl(lang: string, relativePath: string): string | null {
   }
   const section = parts[0]!
   const fileName = parts[1]!
+  // <slug> takes one or more characters, so ".md" alone is not a page.
   if (!fileName.endsWith(".md") || fileName === ".md") {
     return null
   }

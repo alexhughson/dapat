@@ -53,7 +53,7 @@ A page with no template gets no task, because the two matchers join on `lang` an
 
 ## What each edit runs
 
-The e2e test [blog.test.ts](blog.test.ts) copies the input files into a temp folder and makes these edits in order. Each row is a new build, as a new run of the program is.
+The e2e test [blog.test.ts](blog.test.ts) copies the input files into a temp folder and makes these edits in order. Each row is a new `Build` on the same folder and store, as a new run of the program is.
 
 | edit | tasks that run |
 | --- | --- |
@@ -64,6 +64,8 @@ The e2e test [blog.test.ts](blog.test.ts) copies the input files into a temp fol
 | change `templates/en.html` | the 3 en pages |
 | add `content/fr/docs/install.md` | `page:fr/docs/install`, `sitemap:fr` |
 | delete `content/en/docs/install.md` | `sitemap:en` |
+| add `content/es/blog/hola.md`, with no `templates/es.html` | none |
+| add `content/en/blog/notes.txt` and `content/en/blog/sub/deep.md` | `sitemap:en`, and it lists neither file |
 | add `templates/de.html` | `sitemap:de` |
 
 The file stamp is `"hash"`, the default. Thus a write of the same bytes runs no task.
@@ -74,8 +76,8 @@ dapat does not delete files. When you delete `content/en/docs/install.md`, the t
 
 The cost: `pageUrl` in `blog.ts` repeats the part of the page pattern under the lang folder, `<section>/<slug>.md`. If you change the page pattern, change `pageUrl` too.
 
-The sitemap also runs for each edit of a page text, because the stamp of `content/en/` changes. It then writes the same bytes. The stamp of a `FilesystemPrefix` includes the bytes of each file, not only the names.
+The sitemap also runs for each edit of a page text, because the stamp of `content/en/` changes. It then writes the same bytes. The stamp of a `FilesystemPrefix` includes the hash of each file under it, not only the names.
 
-## One writer for each folder
+## One writer for each file
 
-Each html file and each sitemap has one task that writes it. No task reads `site/`. If a task read `site/en/` and also wrote into it, the task would run again on a build with no edits. DOCS section 13 (Limits) shows that case.
+Each html file and each sitemap has one task that writes it. No task reads `site/`. If a task read `site/en/` and also wrote into it, the task would run one more time on the next build with no edits. With `stamp: "time"`, it would run on every build. DOCS section 13 (Limits) shows that case.

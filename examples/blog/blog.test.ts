@@ -157,6 +157,23 @@ test("the blog builds, skips, and runs only the tasks that each edit affects", a
     "https://example.com/en/blog/second-post.html",
   ])
 
+  // A page with no template of its lang gets no task. The es content folder has no sitemap task either.
+  await writeText(path.join(root, "content/es/blog/hola.md"), "Hola.\n")
+  const pageWithoutTemplate = await runBuild(root)
+  expect(pageWithoutTemplate.executed).toEqual([])
+  expect(await Bun.file(path.join(root, "site/es/blog/hola.html")).exists()).toBe(false)
+
+  // Files that do not fit <section>/<slug>.md get no task. They change the en folder stamp, so the en
+  // sitemap runs, and it does not list them.
+  await writeText(path.join(root, "content/en/blog/notes.txt"), "notes\n")
+  await writeText(path.join(root, "content/en/blog/sub/deep.md"), "deep\n")
+  const filesOutsidePattern = await runBuild(root)
+  expect(filesOutsidePattern.executed).toEqual(["sitemap:en"])
+  expect(await sitemapUrls(path.join(root, "site/en/sitemap.xml"))).toEqual([
+    "https://example.com/en/blog/hello.html",
+    "https://example.com/en/blog/second-post.html",
+  ])
+
   // A new template adds a lang. Its sitemap runs and lists no page, because the lang has no content.
   await writeText(path.join(root, "templates/de.html"), `<html lang="de"><body>{{body}}</body></html>\n`)
   const langAdd = await runBuild(root)
