@@ -7,11 +7,15 @@ type VarsKey = string
 /** The values of some join var names, in a fixed order, as a JSON list like a VarsKey. */
 type JoinKey = string
 
+/** The id of one artifact, or the ids of a list of artifacts, in order. */
+export type ArtifactIds = { kind: "one"; id: string } | { kind: "list"; ids: readonly string[] }
+
 /** The current match of one vars key of one matcher. */
 export type StoredMatch = {
   matched: MatchedArtifact
-  // A found event with the same artifact ids does nothing.
-  artifactIds: string
+  // The artifact ids of the data when it came: one id, or the ids of a list. A found event with the
+  // same artifact ids does nothing.
+  artifactIds: ArtifactIds
   // The joined sets that hold this match.
   sets: Set<JoinedSet>
 }
