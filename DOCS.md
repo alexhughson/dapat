@@ -440,12 +440,10 @@ A task that reads `map:pages/1` now waits for `split`. `ctx.produced()` throws w
 The `ctx` argument of `run` has these members:
 
 - `ctx.signal` is an `AbortSignal`. It aborts when the task is replaced or removed. Pass it to `fetch` and other APIs that accept a signal.
-- `ctx.add(task)` adds a task to the build. The task starts when its inputs are ready.
-- `ctx.remove(id)` removes a task from the build.
 - `ctx.produced(artifact)` tells dapat that the task wrote `artifact`.
 - `ctx.deleted(artifact)` tells dapat that the task deleted `artifact`. dapat does not delete it. An output of the task must cover `artifact`, as for `ctx.produced`.
 
-You can also call `build.add()` and `build.remove()` from outside a task while `build.run()` is running. `build.run()` returns when every task that it started has finished. Subscribers ([section 9](#9-subscribe-to-artifact-events)) run synchronously, so the build does not wait for them separately.
+You can also call `build.add()` and `build.remove()` from inside or outside a task while `build.run()` is running. To call them inside a task, the task keeps a reference to the build, for example by closing over it, as the examples do. `build.run()` returns when every task that it started has finished. Subscribers ([section 9](#9-subscribe-to-artifact-events)) run synchronously, so the build does not wait for them separately.
 
 ## 6. When a task skips
 
@@ -603,7 +601,7 @@ build.subscribe((event) => { ... })
 dapat sends a `promised` event for each declared output, an artifact or a prefix:
 
 - at the start of the first `build.run()`, for each task that you added before it. dapat sends these events before any task starts. Thus a subscriber that you add after `build.add` and before `build.run()` gets them.
-- when you add a task after `build.run()` started, with `build.add`, `ctx.add`, or from a subscriber. dapat sends the events before the outermost call returns ([The event queue](#the-event-queue)).
+- when you add a task after `build.run()` started, with `build.add` or from a subscriber. dapat sends the events before the outermost call returns ([The event queue](#the-event-queue)).
 
 A `promised` event means that the output will exist when the task finishes, unless the task reports it with `ctx.deleted`. Thus a subscriber knows about an output before any task runs.
 
@@ -665,7 +663,7 @@ When a subscriber throws, dapat does these steps:
 3. dapat aborts `ctx.signal` of each running task. It starts no more tasks, sends no more events, and writes no more store records.
 4. `build.run()` rejects with the error, after each running task returned.
 
-The call that caused the send does not throw. This applies to `build.add`, `build.remove`, `ctx.add`, `ctx.remove`, `ctx.produced`, and `ctx.deleted`. dapat changes its own state before it sends, so the call still adds, removes, or replaces the task.
+The call that caused the send does not throw. This applies to `build.add`, `build.remove`, `ctx.produced`, and `ctx.deleted`. dapat changes its own state before it sends, so the call still adds, removes, or replaces the task.
 
 dapat keeps only the first error. It clears the queue and sends no more events, so no later subscriber error can occur.
 
@@ -1560,7 +1558,7 @@ A new checkout changes the modification time of each file. The default `stamp: "
   - As an output, a prefix whose class overrides `covers()` is checked by each look of each artifact input of the build. An override of `overlaps()` alone does not do this.
 
   So n such tasks cost about n². The build counts a class as custom when it overrides the method, also with the same rule. For example, with `bun bench/scheduler.ts custom-prefix`, n tasks that each read one prefix take 0.7 s for 4,000 tasks and 9.9 s for 16,000. The same tasks with `IdPrefix` take 0.14 s and 0.40 s (`shared-prefix`). `IdPrefix`, `FilesystemPrefix`, and `S3Prefix` use the default rule. Override `covers()` and `overlaps()` only when the region is not an id prefix.
-- **A prefix input whose producers come one at a time costs about n².** For example, a task reads `out/`, and task k writes `out/k` and adds task k + 1 with `ctx.add` while it runs. The reader waits for task k. When task k ends, the reader looks for its producers again, finds task k + 1, and lists the k outputs under `out/` to do so. With `bun bench/scheduler.ts one-at-a-time`, 4,000 tasks take 0.9 s and 16,000 take 25 s. Without the reader, 16,000 tasks take 0.3 s. Add the producers in one step when you can, for example all of them before they end.
+- **A prefix input whose producers come one at a time costs about n².** For example, a task reads `out/`, and task k writes `out/k` and adds task k + 1 with `build.add` while it runs. The reader waits for task k. When task k ends, the reader looks for its producers again, finds task k + 1, and lists the k outputs under `out/` to do so. With `bun bench/scheduler.ts one-at-a-time`, 4,000 tasks take 0.9 s and 16,000 take 25 s. Without the reader, 16,000 tasks take 0.3 s. Add the producers in one step when you can, for example all of them before they end.
 - **A task that removes a producer with a report, and then waits for a task that reads an output of the removed task, waits forever.** After `ctx.produced` or `ctx.deleted` removes a task, each task that reads an output of the removed task waits for the reporting task to end ([How dapat finds dependencies](#how-dapat-finds-dependencies)). If the reporting task then waits for something that such a reader gives, neither task can go on. dapat does not see a deadlock, because the reporting task still runs. Do not make the reporting task wait for such a task.
 - **No timeout and no concurrency limit.** All ready tasks start at the same time. Add limits and timeouts in your task code ([section 12.2](#122-limit-parallel-work)), and use `ctx.signal` to stop work.
 - **Bun only.** The adapters use Bun APIs.
@@ -1631,8 +1629,6 @@ The object that the build passes to `task.run`.
 | Member | Description |
 | --- | --- |
 | `signal: AbortSignal` | Aborted when the task is replaced or removed. |
-| `add(task: Task): void` | Same as `build.add`. |
-| `remove(id: string): void` | Same as `build.remove`. |
 | `produced(artifact: Artifact): void` | Sends a `produced` event to each subscriber before it returns. Throws if no output of the task covers it. Does not throw when a subscriber throws: `build.run()` rejects instead ([section 9](#subscriber-errors)). Does nothing if the task was replaced or removed. |
 | `deleted(artifact: Artifact): void` | Call it after the task deleted `artifact`. Sends a `deleted` event to each subscriber before it returns. A declared output that the task last reported as deleted gets no `produced` event after the task returns. Throws and does nothing in the same cases as `produced`. |
 

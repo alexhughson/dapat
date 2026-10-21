@@ -78,8 +78,8 @@ describe("Build scheduling", () => {
       new Task({
         id: "first",
         outputs: [first],
-        run: async (ctx) => {
-          ctx.add(
+        run: async () => {
+          build.add(
             new Task({
               id: "second",
               outputs: [second],

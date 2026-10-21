@@ -482,9 +482,9 @@ describe("FileMatcher in a build", () => {
         id: "remover",
         inputs: [new FileArtifact(path.join(root, "seed.txt"))],
         outputs: [gate],
-        run: async (ctx) => {
+        run: async () => {
           await Bun.write(gate.path, "open")
-          ctx.remove("writer")
+          build.remove("writer")
         },
       }),
     )

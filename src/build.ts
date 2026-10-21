@@ -965,12 +965,6 @@ export class Build extends Emitter<ArtifactEvent> {
   private contextFor(slot: Slot, generation: number): Context {
     return {
       signal: slot.abort!.signal,
-      add: (task: Task) => {
-        this.add(task)
-      },
-      remove: (id: string) => {
-        this.remove(id)
-      },
       produced: (artifact: Artifact) => {
         if (generation !== slot.generation) return
         this.report(slot, "produced", artifact)

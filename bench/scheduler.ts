@@ -10,10 +10,10 @@
  *   chain          n tasks, each reads the output of the one before it
  *   fanin          n producers into mem:out/, and one task that reads the prefix mem:out/
  *   shared-prefix  n tasks that each read their own input and the prefix mem:cfg/; one task writes mem:cfg/a
- *   add-during-run one task adds n flat tasks with ctx.add while it runs
+ *   add-during-run one task adds n flat tasks with build.add while it runs
  *   replace        n flat tasks run; then build.add replaces each one again (each add is one step) and a 2nd run
  *   custom-prefix  as shared-prefix, but the prefix class overrides covers(), so each look scans every output
- *   one-at-a-time  one task reads the prefix mem:out/; task i writes mem:out/i and adds task i+1 with ctx.add
+ *   one-at-a-time  one task reads the prefix mem:out/; task i writes mem:out/i and adds task i+1 with build.add
  *   delete-rewrite a build.each makes task i from the match mem:gen/i; reader i reads its output mem:out/i.
  *                  One task reports each mem:gen/i as deleted, which removes the n tasks, and then as
  *                  produced, which adds them again. The readers wait for that task while it runs.
@@ -138,10 +138,10 @@ const scenarios: Record<string, Scenario> = {
         new Task({
           id: "spawner",
           inputs: [new Mem("mem:spawn", "x")],
-          run: async (ctx: Context) => {
+          run: async () => {
             for (let i = 0; i < n; i++) {
               const out = new Mem(`mem:out/${i}`)
-              ctx.add(new Task({ id: `t${i}`, inputs: [new Mem(`mem:in/${i}`, "x")], outputs: [out], run: write(out) }))
+              build.add(new Task({ id: `t${i}`, inputs: [new Mem(`mem:in/${i}`, "x")], outputs: [out], run: write(out) }))
             }
           },
         }),
@@ -170,10 +170,10 @@ const scenarios: Record<string, Scenario> = {
         id: `t${i}`,
         inputs: [new Mem(`mem:in/${i}`, "x")],
         outputs: [out],
-        run: async (ctx: Context) => {
+        run: async () => {
           out.write("v")
           if (i + 1 < n) {
-            ctx.add(makeTask(i + 1))
+            build.add(makeTask(i + 1))
           }
         },
       })
