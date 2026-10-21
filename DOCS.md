@@ -352,12 +352,12 @@ An input that no task writes is a **source**, for example `in.txt` in section 3.
 
 Only one task can declare a given artifact as an output. `build.add()` throws `duplicate output '<id>'` when a second task declares the same output id. One task also cannot declare the same output two times. Two tasks can still write into one folder, and a task can write into a folder that it reads. Those tasks can run again with no edits ([Prefix layouts](#prefix-layouts)).
 
-A waiting task finds its producers again each time a task is added, removed, or completed. When a producer finishes, the waiting task continues in this way:
+A waiting task looks for its producers again only when each producer that it waits for has ended, or was replaced or removed. It continues at once when one of them fails. The waiting task continues in this way:
 
 - If the producer executed or skipped, the waiting task goes on to the skip check.
 - If the producer failed, the waiting task fails with `dependency of '<id>' failed`.
 - If the producer was replaced, the waiting task waits for the new task with the same id.
-- If the producer was removed, the waiting task goes on to the skip check. It does not fail.
+- If the producer was removed, the waiting task does not fail. If a running task caused the removal during a call of `ctx.produced` or `ctx.deleted`, each task that reads an output of the removed task first waits for that running task to end. For example, a task deletes a file that a `FileMatcher` matched, and then writes it again: the matcher sends `gone` and then `found`, so the producer comes back. Then the waiting task goes on to the skip check. If that running task fails, the waiting task fails with `dependency of '<id>' failed`.
 
 After `build.run()` starts, a new task looks for its producers when the current synchronous code ends: at the next `await` or `return` of the code that added it. The subscriber calls that the add causes are part of that synchronous code ([The event queue](#the-event-queue)). A producer that you add after an `await` can come too late. Then the consumer waits for it only if the consumer is still waiting for other inputs. A consumer that has already started does not stop.
 
@@ -1561,6 +1561,7 @@ A new checkout changes the modification time of each file. The default `stamp: "
 
   So n such tasks cost about n². The build counts a class as custom when it overrides the method, also with the same rule. For example, with `bun bench/scheduler.ts custom-prefix`, n tasks that each read one prefix take 0.7 s for 4,000 tasks and 9.9 s for 16,000. The same tasks with `IdPrefix` take 0.14 s and 0.40 s (`shared-prefix`). `IdPrefix`, `FilesystemPrefix`, and `S3Prefix` use the default rule. Override `covers()` and `overlaps()` only when the region is not an id prefix.
 - **A prefix input whose producers come one at a time costs about n².** For example, a task reads `out/`, and task k writes `out/k` and adds task k + 1 with `ctx.add` while it runs. The reader waits for task k. When task k ends, the reader looks for its producers again, finds task k + 1, and lists the k outputs under `out/` to do so. With `bun bench/scheduler.ts one-at-a-time`, 4,000 tasks take 0.9 s and 16,000 take 25 s. Without the reader, 16,000 tasks take 0.3 s. Add the producers in one step when you can, for example all of them before they end.
+- **A task that removes a producer with a report, and then waits for a task that reads an output of the removed task, waits forever.** After `ctx.produced` or `ctx.deleted` removes a task, each task that reads an output of the removed task waits for the reporting task to end ([How dapat finds dependencies](#how-dapat-finds-dependencies)). If the reporting task then waits for something that such a reader gives, neither task can go on. dapat does not see a deadlock, because the reporting task still runs. Do not make the reporting task wait for such a task.
 - **No timeout and no concurrency limit.** All ready tasks start at the same time. Add limits and timeouts in your task code ([section 12.2](#122-limit-parallel-work)), and use `ctx.signal` to stop work.
 - **Bun only.** The adapters use Bun APIs.
 
