@@ -2,8 +2,8 @@ import type { ArtifactEvent } from "../../src/build"
 import { Matcher } from "../../src/matcher"
 import type { FileArtifact } from "./file"
 import { FileMatchStates, type FileMatchChange } from "./file-match-states"
-import { FilePattern } from "./file-pattern"
-import { stampMode, type FileStampOptions } from "./stamp"
+import { FilePattern, type FilePatternOptions } from "./file-pattern"
+import { stampMode } from "./stamp"
 
 /**
  * Finds the files that fit a pattern such as `content/<lang>/<slug>.md`, and sends one
@@ -12,6 +12,7 @@ import { stampMode, type FileStampOptions } from "./stamp"
  * as the path of a `FileArtifact` does.
  * A file has a match while the file is on disk, as far as the matcher knows, or while a task
  * declares it as an output.
+ * The `syntax` option sets other characters for the vars and the globs, for a path that holds `<`, `>`, or `*`.
  */
 export class FileMatcher extends Matcher<FileArtifact> {
   /** The pattern after normalization, for example `content/<lang>/<slug>.md`. */
@@ -22,12 +23,14 @@ export class FileMatcher extends Matcher<FileArtifact> {
   private readonly filePattern: FilePattern
   private readonly fileStates: FileMatchStates
 
-  constructor(pattern: string, opts?: FileStampOptions) {
+  constructor(pattern: string, opts?: FilePatternOptions) {
     super()
-    const filePattern = new FilePattern(pattern, "FileMatcher")
+    const filePattern = new FilePattern(pattern, "FileMatcher", opts?.syntax)
     if (filePattern.hasGlob) {
+      const syntax = filePattern.syntax
+      const varExample = `${syntax.varStart}name${syntax.varEnd}`
       throw new Error(
-        `FileMatcher pattern '${pattern}': '*' and '**' are not allowed; use a <name> var for each part that changes, or FileGroupMatcher for one match with a list of files`,
+        `FileMatcher pattern '${pattern}': '${syntax.anyName}' and '${syntax.anyFolders}' are not allowed; use a var such as ${varExample} for each part that changes, or FileGroupMatcher for one match with a list of files`,
       )
     }
     this.filePattern = filePattern
