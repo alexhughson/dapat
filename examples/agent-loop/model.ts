@@ -1,13 +1,14 @@
 // A fake model and fake tools for the agent loop example. Both are pure functions of their input,
 // so the same prompt gives the same step on every run, and a test can say which tasks run.
-// Replace `fakeModel` with a call to a real model; the pipeline does not change.
+// To use a real model, pass a different `Model` function to addAgentLoop.
 
 export type ToolCall = { id: string; name: "search"; term: string }
 
 /** One reply of the model: tool calls to run, or the final answer. Never both. */
 export type ModelStep = { kind: "tools"; calls: ToolCall[] } | { kind: "answer"; text: string }
 
-export type Model = (prompt: string) => ModelStep
+/** A real model call is async, so the type is async. The fake model answers at once. */
+export type Model = (prompt: string) => Promise<ModelStep>
 
 const NOTES: Record<string, string> = {
   dapat: "dapat is a build library: a task runs again only when its inputs change.",
@@ -25,6 +26,12 @@ export function search(term: string): string {
   return note
 }
 
+/** Runs one tool call and gives the text of its result file. fakeModel finds seen terms by this text. */
+export function runToolCall(call: ToolCall): string {
+  const note = search(call.term)
+  return `${call.name} ${call.term}: ${note}\n`
+}
+
 const OBSERVATIONS_HEADING = "## Observations"
 const MAX_CALLS_PER_STEP = 2
 
@@ -32,7 +39,7 @@ const MAX_CALLS_PER_STEP = 2
  * The fake model. It asks `search` for each known term in the question that has no observation yet,
  * at most two terms in one step. When every term has an observation, it answers with the observations.
  */
-export function fakeModel(prompt: string): ModelStep {
+export async function fakeModel(prompt: string): Promise<ModelStep> {
   const headingIndex = prompt.indexOf(OBSERVATIONS_HEADING)
   let question = prompt
   let observations = ""
@@ -41,11 +48,15 @@ export function fakeModel(prompt: string): ModelStep {
     observations = prompt.slice(headingIndex + OBSERVATIONS_HEADING.length)
   }
 
-  const words = question.toLowerCase().match(/[a-z]+/g) ?? []
+  const lowerQuestion = question.toLowerCase()
+  const words = lowerQuestion.match(/[a-z]+/g)
+  if (words === null) {
+    return { kind: "answer", text: "I have no notes for this question." }
+  }
   const unseenTerms: string[] = []
   for (const word of words) {
     const isKnown = NOTES[word] !== undefined
-    const isSeen = observations.includes(`search ${word}:`)
+    const isSeen = observations.includes(`search ${word}: `)
     if (isKnown && !isSeen && !unseenTerms.includes(word)) {
       unseenTerms.push(word)
     }

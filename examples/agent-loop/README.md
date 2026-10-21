@@ -4,15 +4,19 @@ This example runs an agent loop as a dapat build. A question goes in a file. The
 
 Each step writes a file. So when you run the build again, a step runs only when its input files changed. A rerun with no edits calls the model zero times.
 
-The model here is a fake: `fakeModel` in [model.ts](model.ts). It is a pure function, so the same prompt always gives the same reply. To use a real model, give `addAgentLoop` a different function. The pipeline does not change.
+The model here is a fake: `fakeModel` in [model.ts](model.ts). It gives the same reply for the same prompt, so the test can say which tasks run. To use a real model, give `addAgentLoop` a different async function of the type `Model`.
+
+The model function is not a task input. If you change the model or its settings, no task runs again, and the old replies stay. To run the loop again with a new model, put the model name in the prompt, or force the tasks to run (DOCS section 12.1).
 
 ## Run it
 
+Copy the sample to a folder that does not exist yet, then run the build two times:
+
 ```sh
-cp -r examples/agent-loop/sample /tmp/agent
-bun run examples/agent-loop/run.ts /tmp/agent    # runs every task
-bun run examples/agent-loop/run.ts /tmp/agent    # runs nothing
-cat /tmp/agent/answers/intro.txt
+cp -r examples/agent-loop/sample /tmp/agent-demo
+bun run examples/agent-loop/run.ts /tmp/agent-demo    # runs every task
+bun run examples/agent-loop/run.ts /tmp/agent-demo    # runs nothing
+cat /tmp/agent-demo/answers/intro.txt
 ```
 
 The sample has two questions. `inbox/intro.txt` asks about three terms. The fake model asks for at most two terms in one turn, so this session takes three turns. `inbox/matcher.txt` asks about one term and takes two turns.
@@ -74,13 +78,18 @@ build.run()
 
 `advance` writes the next prompt only when the model asked for tools. So the output of `advance` is the folder `prompts/<sid>/<n+1>/`, and it reports the file with `ctx.produced` when it writes one.
 
-Do not declare the file `prompts/<sid>/<n+1>/prompt.txt` as the output. A build sends a `promised` event for each declared file output when it starts. The prompt matcher then finds turn n+1 before any task runs. That match adds `think` for turn n+1, which declares `step.json`, which adds `advance` for turn n+1, which declares the prompt of turn n+2. The scan never ends, and `build.run()` rejects with `send limit`. The last test in [agent-loop.test.ts](agent-loop.test.ts) shows this.
+Do not declare the file `prompts/<sid>/<n+1>/prompt.txt` as the output. The build sends a `promised` event for each declared file output when it adds the task. The prompt matcher gets this event and finds turn n+1 before any task runs. So the build adds `think` for turn n+1. `think` declares `step.json`, so the build adds `advance` for turn n+1. That `advance` declares the prompt of turn n+2, and the chain does not stop. After 10,000 passes of the event queue, `build.run()` rejects with `send limit`. The last test in [agent-loop.test.ts](agent-loop.test.ts) shows this with a cut-down rule that has only `advance`.
 
 ### Each folder has one writer
 
 Only `advance:<sid>/<n-1>` writes into `prompts/<sid>/<n>/`. Only `act:<sid>/<n>` writes into `turns/<sid>/<n>/results/`.
 
-The first layout of this example kept each prompt in its turn folder, at `turns/<sid>/<n>/prompt.txt`. Then `advance:<sid>/<n-1>` declared the folder `turns/<sid>/<n>/`, and `think`, `act` and `advance` of turn n also wrote into it. The output stamp of `advance` changed after it ended, so on the second build with no edits, `advance:intro/0` and `advance:intro/1` ran again. With the default `"hash"` stamp they write the same bytes, so the build skips everything from build 3. With `stamp: "time"`, they run on every build. DOCS section 13 (Limits) describes this case.
+The first layout of this example kept each prompt in its turn folder, at `turns/<sid>/<n>/prompt.txt`. Then `advance:<sid>/<n-1>` declared the folder `turns/<sid>/<n>/` as its output. `think`, `act` and `advance` of turn n also wrote into that folder. So the folder changed after `advance` ended, and the record of `advance` was old on the next build.
+
+- With the default `"hash"` stamp, the second build with no edits ran `advance:intro/0` and `advance:intro/1` again. They wrote the same bytes, so the build skipped everything from build 3.
+- With `stamp: "time"`, every build with no edits ran 8 tasks again, with `think:intro/1` and `think:intro/2`. Each of these runs is a paid model call.
+
+DOCS section 13 (Limits) describes this case.
 
 `act` deletes the old files in its results folder before it writes the new ones. A turn with fewer tool calls than the run before must not leave old results, because `advance` reads the whole folder. No matcher watches this folder, so these deletes do not remove any task during the run.
 
@@ -92,7 +101,7 @@ For example, `inbox/intro.txt` took three turns. You change it to `What is a tas
 
 `answer:intro` follows the turns from turn 0 to the first answer, so it ignores turn 2. It does not take the highest turn number.
 
-`advance` does not delete the old prompt of the next turn. A delete sends a `deleted` event, and the prompt matcher then removes `think` for that turn during the run. In a test of that layout, `act:intro/1` was waiting for the removed `think`, so it skipped with the old `step.json`. It ran only on the next build.
+`advance` does not clear its output folder before it writes, as `act` does. A test of that version cleared `prompts/<sid>/<n+1>/` at the start of each `advance` run and then wrote the prompt again. The delete sent a `deleted` event, so the prompt matcher removed `think` for that turn during the run. `act:intro/1` was waiting for that `think`, so it went on to its skip check and skipped with the old `step.json`. It ran only on the next build.
 
 ## The test
 

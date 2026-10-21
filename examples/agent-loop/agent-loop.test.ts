@@ -87,8 +87,8 @@ describe("agent loop example", () => {
     expect(answer).toBe(`${DAPAT_NOTE}\n${STAMP_NOTE}\n${TASK_NOTE}\n`)
     const turn0Results = await fsPromises.readdir(path.join(root, "turns/intro/0/results"))
     expect(sorted(turn0Results)).toEqual(["1.txt", "2.txt"])
-    const turn2Prompt = Bun.file(path.join(root, "prompts/intro/3/prompt.txt"))
-    expect(await turn2Prompt.exists()).toBe(false)
+    const turn3Prompt = Bun.file(path.join(root, "prompts/intro/3/prompt.txt"))
+    expect(await turn3Prompt.exists()).toBe(false)
 
     const second = await runLoop(root)
     expect(ids(second.executed)).toEqual([])
@@ -143,7 +143,8 @@ describe("agent loop example", () => {
     expect(ids(third.executed)).toEqual([])
   })
 
-  test("an exact next-prompt output makes the scan add turns until the send limit", async () => {
+  test("an exact next-prompt output makes the build add turns until the send limit", async () => {
+    // This is a cut-down rule with only advance, not the example pipeline.
     // advance declares the file prompts/<sid>/<n+1>/prompt.txt, not its folder.
     // Each declared output sends a promised event at the scan, so the prompt matcher
     // finds turn n+1 before any task runs, which adds advance for turn n+1, and so on.
@@ -163,6 +164,6 @@ describe("agent loop example", () => {
         })
       },
     })
-    expect(build.run()).rejects.toThrow("send limit")
+    await expect(build.run()).rejects.toThrow("send limit")
   })
 })

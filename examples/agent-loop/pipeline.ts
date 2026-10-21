@@ -57,7 +57,7 @@ export function addAgentLoop(build: Build, root: string, think: model.Model): vo
         outputs: [step],
         run: async () => {
           const promptText = await Bun.file(prompt.path).text()
-          const modelStep = think(promptText)
+          const modelStep = await think(promptText)
           await Bun.write(step.path, JSON.stringify(modelStep, null, 2))
         },
       })
@@ -87,15 +87,15 @@ export function addAgentLoop(build: Build, root: string, think: model.Model): vo
           }
           for (const call of modelStep.calls) {
             const result = new FileArtifact(path.join(results.path, `${call.id}.txt`))
-            await Bun.write(result.path, `${call.name} ${call.term}: ${model.search(call.term)}\n`)
+            await Bun.write(result.path, model.runToolCall(call))
             ctx.produced(result)
           }
         },
       })
 
       // advance writes the next prompt only when the model asked for tools. A declared output that
-      // may not be written must be a folder. When the model answers, advance does not delete an
-      // old next prompt from a longer loop. See README.md for both rules.
+      // may not be written must be a folder. advance does not clear this folder before it writes,
+      // as act does: a delete of a prompt removes a think task during the run. See README.md.
       yield new Task({
         id: `advance:${vars.sid}/${vars.n}`,
         inputs: [prompt, step, results],
@@ -146,7 +146,7 @@ async function readStep(stepPath: string): Promise<model.ModelStep> {
  */
 async function readAnswer(turnsFolder: string): Promise<string> {
   let turn = 0
-  for (;;) {
+  while (true) {
     const stepPath = path.join(turnsFolder, String(turn), "step.json")
     const exists = await fsPromises.exists(stepPath)
     if (!exists) {
