@@ -1,9 +1,8 @@
 import type { Artifact } from "./artifact"
 import { Emitter } from "./emitter"
-import { IdTrie } from "./id-trie"
 import type { AnyMatcher } from "./matcher"
 import type { MatchedArtifactEvent } from "./matched-artifact"
-import { Prefix } from "./prefix"
+import { OutputIndex } from "./output-index"
 import { Task, isArtifact, isPrefix, type Context, type Ref } from "./task"
 import type { Store, TaskState } from "./store"
 import { Outcome, Result } from "./result"
@@ -88,17 +87,8 @@ export class Build extends Emitter<ArtifactEvent> {
   // The groups that build.add made. A replacement with the same id keeps its group.
   private readonly addedTaskGroups = new WeakSet<TaskGroup>()
   private readonly exactOutputs = new Map<string, { artifact: Artifact; taskId: string }>()
-  // The ids of the tasks that declare each exact output, by output id. A prefix input with the
-  // default covers() finds the exact outputs under it here.
-  private readonly exactOutputTrie = new IdTrie<string>()
-  // The prefix outputs of all tasks, by prefix id. An artifact input finds the prefixes above it here.
-  // A prefix input with the default rules finds the prefixes above it and below it here.
-  private readonly prefixOutputTrie = new IdTrie<PrefixOutput>()
-  // The entries that each task put in prefixOutputTrie, so that unindex() can delete them.
-  private readonly prefixOutputsByTask = new Map<Task, PrefixOutput[]>()
-  // The prefix outputs whose class overrides covers(). Such a prefix can cover an id that does not
-  // start with its own id, so the tries cannot find it. Each artifact input checks each of them.
-  private readonly customPrefixOutputs = new Set<PrefixOutput>()
+  // The outputs of the tasks in the build, by the id of the task that declares them. producersOf looks here.
+  private readonly liveOutputs = new OutputIndex<string>()
   private readonly outcomes = new Map<Task, Outcome>()
   private readonly errors: Error[] = []
   // The events that wait to go to the subscribers, oldest first.
@@ -108,6 +98,14 @@ export class Build extends Emitter<ArtifactEvent> {
   private changeDepth = 0
   // The first subscriber error or send-limit error. Each later run() rejects with it.
   private fatal: Error | null = null
+  // The slot whose report the build sends now. null outside ctx.produced and ctx.deleted.
+  private reportingSlot: Slot | null = null
+  // The outputs of the tasks that a report removed, each with the running task that sent the report.
+  // Such a task can come back while the reporter runs: for example, the reporter deletes a matched
+  // file and then writes it again. Until the reporter ends, a reader of these outputs waits for it.
+  private readonly removedOutputs = new OutputIndex<RemovedTask>()
+  // The removed tasks that each reporter put in removedOutputs. finish() deletes them when the reporter ends.
+  private readonly removedTasksByReporter = new Map<Slot, RemovedTask[]>()
 
   // The matchers of every build.each, each one time, in the order of the build.each calls,
   // with the TaskMaterializers that use each one.
@@ -341,6 +339,11 @@ export class Build extends Emitter<ArtifactEvent> {
     // that moves from one task to another in one call is withdrawn before it is promised.
     const withdrawn: ArtifactEvent[] = []
     const promised: ArtifactEvent[] = []
+    // A task that a report removes still counts as a producer until the reporter ends.
+    const reporter = this.reportingSlot
+    if (reporter !== null && reporter.phase === "running" && dropped.length > 0) {
+      this.keepRemovedOutputs(reporter, dropped)
+    }
     // In both loops below, a stopped task sees the new generation, so its later
     // ctx.produced and ctx.deleted do nothing.
     for (const slot of dropped) {
@@ -667,24 +670,11 @@ export class Build extends Emitter<ArtifactEvent> {
   }
 
   private index(task: Task): void {
-    const entries: PrefixOutput[] = []
     for (const output of task.outputs) {
       if (isArtifact(output)) {
         this.exactOutputs.set(output.id, { artifact: output, taskId: task.id })
-        this.exactOutputTrie.add(output.id, task.id)
       }
-      if (isPrefix(output)) {
-        const entry = { output, taskId: task.id }
-        entries.push(entry)
-        this.prefixOutputTrie.add(output.id, entry)
-        // A class that overrides covers() counts as custom, also when its rule is the same as the default.
-        if (output.covers !== Prefix.prototype.covers) {
-          this.customPrefixOutputs.add(entry)
-        }
-      }
-    }
-    if (entries.length > 0) {
-      this.prefixOutputsByTask.set(task, entries)
+      this.liveOutputs.add(output, task.id)
     }
   }
 
@@ -695,14 +685,9 @@ export class Build extends Emitter<ArtifactEvent> {
         if (claimer && claimer.taskId === task.id) {
           this.exactOutputs.delete(output.id)
         }
-        this.exactOutputTrie.delete(output.id, task.id)
       }
+      this.liveOutputs.delete(output, task.id)
     }
-    for (const entry of this.prefixOutputsByTask.get(task) ?? []) {
-      this.prefixOutputTrie.delete(entry.output.id, entry)
-      this.customPrefixOutputs.delete(entry)
-    }
-    this.prefixOutputsByTask.delete(task)
   }
 
   /**
@@ -716,67 +701,56 @@ export class Build extends Emitter<ArtifactEvent> {
   private producersOf(task: Task): string[] {
     const ids = new Set<string>()
     for (const input of task.inputs) {
-      if (isPrefix(input)) {
-        this.addPrefixProducers(input, ids)
-      } else {
-        this.addArtifactProducers(input, ids)
-      }
+      this.liveOutputs.ownersFor(input, (taskId) => {
+        ids.add(taskId)
+      })
     }
     ids.delete(task.id)
     return [...ids]
   }
 
-  private addPrefixProducers(input: Prefix, ids: Set<string>): void {
-    const addTaskId = (taskId: string) => {
-      ids.add(taskId)
+  /** Keeps the outputs of each slot in `dropped` in removedOutputs, with `reporter`, the running task whose report dropped them. */
+  private keepRemovedOutputs(reporter: Slot, dropped: readonly Slot[]): void {
+    let removedTasks = this.removedTasksByReporter.get(reporter)
+    if (removedTasks === undefined) {
+      removedTasks = []
+      this.removedTasksByReporter.set(reporter, removedTasks)
     }
-    const addEntry = (entry: PrefixOutput) => {
-      ids.add(entry.taskId)
-    }
-    // The default covers() and overlaps() only compare the start of the id strings. So the tries find
-    // the same tasks as a scan: the exact outputs under the input, the prefix outputs under it, and
-    // the prefix outputs above it.
-    const defaultCovers = input.covers === Prefix.prototype.covers
-    const defaultOverlaps = input.overlaps === Prefix.prototype.overlaps
-    if (defaultCovers && defaultOverlaps) {
-      this.exactOutputTrie.withPrefix(input.id, addTaskId)
-      this.prefixOutputTrie.withPrefix(input.id, addEntry)
-      this.prefixOutputTrie.startsOf(input.id, addEntry)
-      return
-    }
-    // A class with its own rule: check every exact output and every prefix output. This costs one
-    // check for each output of the build, for each look of the task.
-    for (const entry of this.exactOutputs.values()) {
-      if (input.covers(entry.artifact)) {
-        ids.add(entry.taskId)
+    for (const slot of dropped) {
+      const removed: RemovedTask = { task: slot.task, reporter }
+      removedTasks.push(removed)
+      for (const output of slot.task.outputs) {
+        this.removedOutputs.add(output, removed)
       }
     }
-    // withPrefix("") visits every prefix output.
-    this.prefixOutputTrie.withPrefix("", (entry) => {
-      if (input.overlaps(entry.output)) {
-        ids.add(entry.taskId)
-      }
-    })
   }
 
-  private addArtifactProducers(input: Artifact, ids: Set<string>): void {
-    const exact = this.exactOutputs.get(input.id)
-    if (exact) {
-      ids.add(exact.taskId)
-    }
-    // A prefix with the default covers() covers the ids that start with its id, so its key is a start
-    // of input.id. covers() still decides, because a custom prefix is in the trie too.
-    this.prefixOutputTrie.startsOf(input.id, (entry) => {
-      if (entry.output.covers(input)) {
-        ids.add(entry.taskId)
-      }
-    })
-    // A custom covers() can cover any id, so check each custom prefix output.
-    for (const entry of this.customPrefixOutputs) {
-      if (entry.output.covers(input)) {
-        ids.add(entry.taskId)
+  /** Deletes the removed tasks that `reporter` put in removedOutputs. */
+  private forgetRemovedOutputs(reporter: Slot): void {
+    const removedTasks = this.removedTasksByReporter.get(reporter)
+    if (removedTasks === undefined) return
+    this.removedTasksByReporter.delete(reporter)
+    for (const removed of removedTasks) {
+      for (const output of removed.task.outputs) {
+        this.removedOutputs.delete(output, removed)
       }
     }
+  }
+
+  /**
+   * The running tasks whose report removed a task that wrote an input of `task`.
+   * The rules are the same as in producersOf. A removed task with the id of `task` does not count.
+   */
+  private reportersOfRemovedProducers(task: Task): Slot[] {
+    const reporters = new Set<Slot>()
+    for (const input of task.inputs) {
+      this.removedOutputs.ownersFor(input, (removed) => {
+        if (removed.task.id === task.id) return
+        if (removed.reporter.phase !== "running") return
+        reporters.add(removed.reporter)
+      })
+    }
+    return [...reporters]
   }
 
   private kick(slot: Slot): void {
@@ -899,6 +873,13 @@ export class Build extends Emitter<ArtifactEvent> {
           return "failed"
         }
       }
+      // A producer that a running task's report removed still counts until that task ends.
+      const reporters = this.reportersOfRemovedProducers(slot.task)
+      for (const reporter of reporters) {
+        if (reporter === slot) continue
+        if (unfinished.includes(reporter)) continue
+        unfinished.push(reporter)
+      }
       if (unfinished.length === 0) return "ok"
       // The look after a deadlock wake still finds an unfinished producer: the task is in the deadlock.
       if (deadlocked) return "deadlock"
@@ -1011,8 +992,14 @@ export class Build extends Emitter<ArtifactEvent> {
     // already has the last report for it, so the last report wins.
     slot.reported.add(artifact.id)
     const event: ArtifactEvent = { kind, artifact, taskId: slot.task.id }
-    this.push([event])
-    this.drain()
+    const previousReportingSlot = this.reportingSlot
+    this.reportingSlot = slot
+    try {
+      this.push([event])
+      this.drain()
+    } finally {
+      this.reportingSlot = previousReportingSlot
+    }
   }
 
   private outputCovers(task: Task, artifact: Artifact): boolean {
@@ -1116,6 +1103,7 @@ export class Build extends Emitter<ArtifactEvent> {
     }
     slot.phase = "completed"
     slot.outcome = outcome
+    this.forgetRemovedOutputs(slot)
     this.outcomes.set(slot.task, outcome)
     // A slot that ends while it waits (replaced or removed) wakes and sees its new generation.
     this.resume(slot, "wake")
@@ -1146,8 +1134,8 @@ export class Build extends Emitter<ArtifactEvent> {
 /** Stamps keyed by refKey, so a prefix and an artifact with the same id cannot collide. */
 type StampMap = Record<string, string | null>
 
-/** An output and the task that declares it. */
-type PrefixOutput = { output: Prefix; taskId: string }
+/** A task that a report removed, and the running task that sent the report. */
+type RemovedTask = { task: Task; reporter: Slot }
 
 /** An empty stamp map with no prototype, so that an id such as "__proto__" is a plain key. */
 function newStampMap(): StampMap {
