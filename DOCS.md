@@ -1110,30 +1110,29 @@ A file is in the list of its group while the file has a match by the rules of `F
 
 An event that does not change a list sends nothing. For example, the `produced` event of a file that a task declared sends nothing.
 
-Each `ctx.produced` call is one step ([Steps of task changes](#steps-of-task-changes)). So a task that reports 1,000 files one at a time makes 1,000 lists, and the build replaces the task of the group 1,000 times. With the folder input of the example below, each replaced task waits for the writer and does not run, so only the last task runs. A task that declares its files as outputs puts them all in one step, so the group gets one list. See [Limits](#13-limits) for the cost.
+Each `ctx.produced` call is one step ([Steps of task changes](#steps-of-task-changes)). So a task that reports 1,000 files one at a time makes 1,000 lists, and the build replaces the task of the group 1,000 times. Give the task of the group the writer's `FilesystemPrefix` as an input too. Then each replaced task waits for the writer and does not run, so only the last task runs. A task that declares its files as outputs puts them all in one step, so the group gets one list. See [Limits](#13-limits) for the cost.
 
 #### Example: one sitemap for each lang
 
 ```ts
 import path from "node:path"
 import { Task } from "dapat"
-import { FileArtifact, FileGroupMatcher, FilesystemPrefix } from "dapat/contrib"
+import { FileArtifact, FileGroupMatcher } from "dapat/contrib"
 
 build.each({
-  matchersByName: { html: new FileGroupMatcher("site/<lang>/**/*.html") },
+  matchersByName: { source: new FileGroupMatcher("content/<lang>/*.md") },
   *tasks(vars, matched) {
-    const pages = matched.html.data // readonly FileArtifact[], sorted by path
-    const siteFolder = new FilesystemPrefix(`site/${vars.lang}/`)
+    const sources = matched.source.data // readonly FileArtifact[], sorted by path
     const sitemap = new FileArtifact(`sitemaps/${vars.lang}.txt`)
-    const inputs = [...pages, siteFolder]
     yield new Task({
       id: `sitemap:${vars.lang}`,
-      inputs,
+      inputs: sources,
       outputs: [sitemap],
       run: async () => {
         const lines: string[] = []
-        for (const page of pages) {
-          lines.push(path.relative(siteFolder.path, page.path)) // for example blog/hello.html
+        for (const source of sources) {
+          const slug = path.basename(source.path, ".md")
+          lines.push(`${slug}.html`) // for example hello.html
         }
         await Bun.write(sitemap.path, `${lines.join("\n")}\n`)
       },
@@ -1142,11 +1141,9 @@ build.each({
 })
 ```
 
-- Each HTML file is an input, so the sitemap waits for each task that declares one of them.
-- The folder input `site/<lang>/` makes the sitemap also wait for each task that writes into that folder, for example a task with a `FilesystemPrefix` output that reports its files with `ctx.produced` while it runs. The sitemap thus does not run before the list is complete.
-- The sitemap is in `sitemaps/`, not in `site/<lang>/`. In `site/<lang>/`, the task would write into a folder that it reads, and run on every build ([Prefix layouts](#prefix-layouts)).
-- The sitemap runs again when a page is added, edited, or deleted. A new list makes a new task with new inputs. An edit changes the stamp of a page.
-- When you delete the last page of a lang, the list is empty. The matcher sends `gone`, and the sitemap task of that lang is not in the build. dapat does not delete old outputs, so `sitemaps/<lang>.txt` stays on disk with the old pages. Delete it yourself when this is a problem. dapat cannot do it for you, because it is not the only owner of the files in a folder ([Between runs](#between-runs)).
+- The group reads the sources in `content/<lang>/`, not the HTML in `site/<lang>/`. dapat does not delete old outputs, so when you delete `content/en/about.md`, `site/en/about.html` stays on disk. A group of `site/<lang>/**/*.html` would still list it, and the sitemap would keep the deleted page ([Between runs](#between-runs)).
+- The sitemap runs again when a source is added, edited, or deleted. A new list makes a new task with new inputs. An edit changes the stamp of a source.
+- When you delete the last source of a lang, the list is empty. The matcher sends `gone`, and the sitemap task of that lang is not in the build. `sitemaps/<lang>.txt` stays on disk with the old pages. Delete it yourself when this is a problem. dapat cannot do it for you, because it is not the only owner of the files in a folder ([Between runs](#between-runs)).
 
 [examples/file-pipeline.ts](examples/file-pipeline.ts) has this rule after the rule of the pages. Run it two times: the second run skips each task.
 

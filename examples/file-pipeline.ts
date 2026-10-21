@@ -1,11 +1,11 @@
 // Makes site/<lang>/<slug>.html from each content/<lang>/<slug>.md and the template templates/<lang>.html.
-// Then makes one sitemap for each lang, sitemaps/<lang>.txt, from the list of HTML files under site/<lang>/.
+// Then makes one sitemap for each lang, sitemaps/<lang>.txt, from the list of source files in content/<lang>/.
 // Run it from any folder. It writes sample files first when content/ is missing.
 // Run it two times: the second run skips each task.
 import { existsSync } from "node:fs"
 import path from "node:path"
 import { Build, Task } from "dapat"
-import { FileArtifact, FileGroupMatcher, FileMatcher, FilesystemPrefix, JsonStore } from "dapat/contrib"
+import { FileArtifact, FileGroupMatcher, FileMatcher, JsonStore } from "dapat/contrib"
 
 if (!existsSync("content")) {
   await Bun.write("content/en/hello.md", "Hello")
@@ -40,24 +40,23 @@ build.each({
   },
 })
 
-// One match for each lang, with the list of its HTML files, at any depth under site/<lang>/.
-// The sitemap goes next to site/, not in it: in site/<lang>/, it would change the stamp of its own input.
+// One match for each lang, with the list of its source files. The list comes from content/, not from site/:
+// dapat leaves the HTML of a deleted source on disk, so a list of site/ would keep the deleted page.
+// The sitemap goes next to site/, not in it.
 build.each({
-  matchersByName: { html: new FileGroupMatcher("site/<lang>/**/*.html") },
+  matchersByName: { source: new FileGroupMatcher("content/<lang>/*.md") },
   *tasks(vars, matched) {
-    const pages = matched.html.data
-    // The folder input makes the sitemap wait for each task that writes into site/<lang>/.
-    const siteFolder = new FilesystemPrefix(`site/${vars.lang}/`)
+    const sources = matched.source.data
     const sitemap = new FileArtifact(`sitemaps/${vars.lang}.txt`)
-    const inputs = [...pages, siteFolder]
     yield new Task({
       id: `sitemap:${vars.lang}`,
-      inputs,
+      inputs: sources,
       outputs: [sitemap],
       run: async () => {
         const lines: string[] = []
-        for (const page of pages) {
-          lines.push(path.relative(siteFolder.path, page.path))
+        for (const source of sources) {
+          const slug = path.basename(source.path, ".md")
+          lines.push(`${slug}.html`)
         }
         await Bun.write(sitemap.path, `${lines.join("\n")}\n`)
       },
