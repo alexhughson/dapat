@@ -1,4 +1,4 @@
-export { FileArtifact, FilesystemPrefix, FileMatcher } from "./fs"
+export { FileArtifact, FilesystemPrefix, FileMatcher, FileGroupMatcher } from "./fs"
 export type { FileStampMode, FileStampOptions } from "./fs"
 export { S3ObjectArtifact, S3Prefix, MemoryS3 } from "./s3"
 export type { S3Client, S3Head, S3ListEntry } from "./s3"
