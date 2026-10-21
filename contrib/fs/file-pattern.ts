@@ -72,20 +72,18 @@ export class FilePattern {
     this.hasGlob = keyPattern.hasGlob
     let globSeen = false
     let varAtOrAfterGlob = false
+    // True after a `**`. The scan takes every file under that folder, and `match` checks the parts after it.
+    let anyDepthSeen = false
+    this.segments = []
     for (const text of segmentTexts) {
       const segmentPattern = new KeyPattern(text)
       if (segmentPattern.hasGlob) globSeen = true
       if (globSeen && segmentPattern.varNames.length > 0) varAtOrAfterGlob = true
-    }
-    this.segments = []
-    for (const text of segmentTexts) {
+      if (anyDepthSeen) continue
       if (text === "**") {
-        // The scan takes every file under this folder, and `match` checks the parts after it.
+        anyDepthSeen = true
         this.segments.push({ kind: "anyDepth" })
-        break
-      }
-      const segmentPattern = new KeyPattern(text)
-      if (segmentPattern.varNames.length === 0 && !segmentPattern.hasGlob) {
+      } else if (segmentPattern.varNames.length === 0 && !segmentPattern.hasGlob) {
         this.segments.push({ kind: "literal", name: text })
       } else {
         this.segments.push({ kind: "names", pattern: segmentPattern })
@@ -152,6 +150,7 @@ async function collectFilesBelow(
     const folderKind = await kindOfPath(folder)
     if (folderKind !== "folder") return
     const filesUnder = await stamp.walkFiles(folder)
+    if (signal.aborted) return
     if (filesUnder === null) return
     for (const filePath of filesUnder) {
       filePaths.push(filePath)
