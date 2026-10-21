@@ -44,6 +44,11 @@ export class JsonStore implements Store {
     })
   }
 
+  async ids(): Promise<readonly string[]> {
+    const data = await this.load()
+    return Object.keys(data.tasks)
+  }
+
   /**
    * Runs `write` after the writes before it. The read and the write of one change
    * run together, so two changes do not drop each other's record.

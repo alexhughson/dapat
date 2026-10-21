@@ -302,4 +302,63 @@ describe("stores", () => {
     // The failed write leaves no temp file.
     expect(await readdir(dir)).toEqual(["state.json"])
   })
+
+  describe("ids", () => {
+    /** Writes three records, deletes one, and checks the ids. Returns the sorted ids. */
+    async function idsAfterChanges(store: Store): Promise<string[]> {
+      expect(await store.ids()).toEqual([])
+      await store.set("page:en/hello", sample)
+      await store.set("page:fr/hello", sample)
+      await store.set("index", sample)
+      await store.delete("index")
+      const storedIds = [...(await store.ids())]
+      storedIds.sort()
+      return storedIds
+    }
+
+    test("MemoryStore lists the id of each record", async () => {
+      const store = new MemoryStore()
+      expect(await idsAfterChanges(store)).toEqual(["page:en/hello", "page:fr/hello"])
+      await store.clear()
+      expect(await store.ids()).toEqual([])
+    })
+
+    test("JsonStore lists the id of each record, also from a new object on the same file", async () => {
+      const dir = await mkdtemp(path.join(tmpdir(), "dapat-json-"))
+      temps.push(dir)
+      const statePath = path.join(dir, "state.json")
+      const store = new JsonStore(statePath)
+      expect(await idsAfterChanges(store)).toEqual(["page:en/hello", "page:fr/hello"])
+      await store.set("__proto__", sample)
+
+      const reopened = new JsonStore(statePath)
+      const reopenedIds = [...(await reopened.ids())]
+      reopenedIds.sort()
+      expect(reopenedIds).toEqual(["__proto__", "page:en/hello", "page:fr/hello"])
+      await reopened.clear()
+      expect(await reopened.ids()).toEqual([])
+    })
+
+    test("SqliteStore lists the id of each record, also after it opens the file again", async () => {
+      const dir = await mkdtemp(path.join(tmpdir(), "dapat-sqlstore-"))
+      temps.push(dir)
+      const dbPath = path.join(dir, "state.db")
+      const store = new SqliteStore(dbPath)
+      expect(await idsAfterChanges(store)).toEqual(["page:en/hello", "page:fr/hello"])
+      store.close()
+
+      const reopened = new SqliteStore(dbPath)
+      expect(await reopened.ids()).toEqual(["page:en/hello", "page:fr/hello"])
+      await reopened.clear()
+      expect(await reopened.ids()).toEqual([])
+      reopened.close()
+    })
+
+    test("SqliteStore with an open Database lists the ids of that database", async () => {
+      const db = new Database(":memory:")
+      const store = new SqliteStore(db)
+      expect(await idsAfterChanges(store)).toEqual(["page:en/hello", "page:fr/hello"])
+      db.close()
+    })
+  })
 })

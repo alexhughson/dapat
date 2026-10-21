@@ -123,6 +123,7 @@ if (!result.success) {
 - failure, cancellation, and replacement of tasks
 - subscribers for the outputs that tasks declare and write during the build, and their errors
 - `build.each` and matchers, which make tasks for each artifact that a matcher finds
+- orphans: the store records of tasks that are gone, so that your program can delete their old outputs
 - recipes: force a rebuild, limit parallel work, run in CI
 - known limits
 - the full API reference

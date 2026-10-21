@@ -13,6 +13,8 @@ export interface Store {
   set(taskId: string, state: TaskState): Promise<void>
   delete(taskId: string): Promise<void>
   clear(): Promise<void>
+  /** The task id of each record in the store. The build reads it at the end of each run to find orphans. */
+  ids(): Promise<readonly string[]>
 }
 
 export class MemoryStore implements Store {
@@ -32,5 +34,9 @@ export class MemoryStore implements Store {
 
   async clear(): Promise<void> {
     this.tasks.clear()
+  }
+
+  async ids(): Promise<readonly string[]> {
+    return [...this.tasks.keys()]
   }
 }

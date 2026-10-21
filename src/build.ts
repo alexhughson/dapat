@@ -5,7 +5,7 @@ import type { MatchedArtifactEvent } from "./matched-artifact"
 import type { Prefix } from "./prefix"
 import { Task, isArtifact, isPrefix, type Context, type Ref } from "./task"
 import type { Store, TaskState } from "./store"
-import { Outcome, Result } from "./result"
+import { Outcome, Result, type Orphan } from "./result"
 import { TaskGroup, type GroupTasks } from "./task-group"
 import { TaskMaterializer, type TaskMaterializerConfig } from "./task-materializer"
 
@@ -401,7 +401,48 @@ export class Build extends Emitter<ArtifactEvent> {
     }
     await this.idle()
     if (this.fatal !== null) throw this.fatal
-    return new Result(this.outcomes, this.errors)
+    // With no store, the build reads nothing, and no record can be an orphan.
+    let orphans: Orphan[] = []
+    if (this.store) {
+      orphans = await this.findOrphans(this.store)
+    }
+    return new Result(this.outcomes, this.errors, orphans)
+  }
+
+  /**
+   * The records in the store whose task id is not a task of the build now. A task that the
+   * build dropped during the run had its record deleted, so it is not here, unless that delete
+   * failed. A store read that rejects goes to `errors`.
+   */
+  private async findOrphans(store: Store): Promise<Orphan[]> {
+    let storedIds: readonly string[]
+    try {
+      storedIds = await store.ids()
+    } catch (error) {
+      this.errors.push(toError(error))
+      return []
+    }
+    const orphanIds: string[] = []
+    for (const taskId of storedIds) {
+      if (this.slots.has(taskId)) continue
+      orphanIds.push(taskId)
+    }
+    orphanIds.sort()
+    const orphans: Orphan[] = []
+    for (const taskId of orphanIds) {
+      let record: TaskState | null
+      try {
+        record = await store.get(taskId)
+      } catch (error) {
+        this.errors.push(toError(error))
+        continue
+      }
+      // Another program can delete the record after the ids() read.
+      if (record === null) continue
+      const outputIds = artifactIdsOf(record)
+      orphans.push({ taskId, outputIds })
+    }
+    return orphans
   }
 
   /**
@@ -999,6 +1040,22 @@ function isStampMap(value: unknown): value is StampMap {
     if (typeof stamp !== "string") return false
   }
   return true
+}
+
+/**
+ * The ids of the artifact outputs in a record, in record order. A prefix output is not here,
+ * because the record has no key for a prefix with a null stamp. A record in an older shape gives no id.
+ */
+function artifactIdsOf(record: TaskState): string[] {
+  const artifactIds: string[] = []
+  if (!isStampMap(record.outputStamps)) return artifactIds
+  const artifactKeyStart = "artifact "
+  for (const key of Object.keys(record.outputStamps)) {
+    if (!key.startsWith(artifactKeyStart)) continue
+    const artifactId = key.slice(artifactKeyStart.length)
+    artifactIds.push(artifactId)
+  }
+  return artifactIds
 }
 
 /** An artifact and a prefix with the same id are different outputs. */

@@ -120,7 +120,8 @@ The repo has this build in `examples/first-build.ts`. Run it from a folder that 
 - `skipped` lists the tasks that dapat did not run, because every stamp equalled the record ([section 6](#6-when-a-task-skips)).
 - `failed` is a `Map<Task, Error>`.
 - `cancelled` lists the tasks that were replaced or removed before they finished ([section 8](#8-failure-cancellation-and-replacement)).
-- `errors` lists the errors that no task owns: a non-abort error that a task throws after it was replaced or removed ([section 8](#replacement)), and a store delete that rejects ([section 8](#removal)).
+- `errors` lists the errors that no task owns: a non-abort error that a task throws after it was replaced or removed ([section 8](#replacement)), a store delete that rejects ([section 8](#removal)), and a store read for the orphans that rejects.
+- `orphans` lists the records in the store that no task of the build owns at the end of the run. Each orphan has a `taskId` and the `outputIds` of its record ([Orphans](#orphans)).
 
 A failed task does not stop the build. The other tasks continue. `build.run()` does not throw when a task fails, so always check `result.success`. `build.run()` rejects in three cases only: a subscriber throws, a subscriber returns a promise, or subscribers reach the send limit ([section 9](#subscriber-errors)).
 
@@ -526,6 +527,61 @@ dapat treats a record from an older version as no record. The task runs, and dap
 
 Add the store file to `.gitignore`. To make tasks run again, see [section 12.1](#121-force-tasks-to-run-again).
 
+### Orphans
+
+An orphan is a record in the store that no task of this run owns. No `build.each` and no `build.add` made its task. For example, you delete `templates/fr.html` before the run. Then `build.each` does not make the task `page:fr/hello`. Its record from the last run is still in the store, and its output `site/fr/hello.html` is still on disk.
+
+At the end of each `build.run()`, the build reads `store.ids()`. Each id that is not the id of a task in the build is an orphan. The build reads the record of each orphan and puts it in `result.orphans`:
+
+```ts
+type Orphan = { taskId: string; outputIds: readonly string[] }
+```
+
+- `outputIds` are the ids of the artifact outputs in the record, in the order of the record. The id of a `FileArtifact` is `file:` and the absolute path, for example `file:/home/me/site/fr/hello.html`.
+- A record keeps an output that did not exist with a `null` stamp. Its id is in `outputIds` too.
+- A prefix output is not in `outputIds`. The record has no key for a prefix with a `null` stamp, so the record cannot list each prefix output.
+- A record in an older shape ([section 7](#7-stores)) gives an orphan with no `outputIds`.
+- `result.orphans` is in task id order.
+
+These records are not orphans:
+
+- The record of a task that ran, skipped, failed, or was cancelled, and is still in the build.
+- The record of a task that the build removed during the run. The build deletes that record ([Removal](#removal)). If that delete rejects, the error is in `result.errors`, and the record is an orphan, because no task owns it now.
+
+**dapat deletes nothing.** Your program decides what to delete. The orphan stays in each result until you delete its record with `store.delete(taskId)`. If you delete the record but not the outputs, dapat forgets the outputs.
+
+With no store, the build reads nothing, and `result.orphans` is empty. When `build.run()` rejects, you get no result, and so no orphans. A store read that rejects goes to `result.errors`. If `ids()` rejects, `result.orphans` is empty. If `get` rejects for one orphan, the other orphans stay.
+
+This program deletes the outputs of each orphan, and then its record:
+
+```ts
+import { rm } from "node:fs/promises"
+import { Build } from "dapat"
+import { JsonStore } from "dapat/contrib"
+
+const store = new JsonStore(".dapat/state.json")
+const build = new Build({ store })
+// ... build.each and build.add as before ...
+const result = await build.run()
+
+for (const orphan of result.orphans) {
+  for (const outputId of orphan.outputIds) {
+    // This program has only file outputs. Keep the outputs of other kinds.
+    if (!outputId.startsWith("file:")) continue
+    const filePath = outputId.slice("file:".length)
+    console.log(`delete ${filePath}, the old output of ${orphan.taskId}`)
+    await rm(filePath, { force: true })
+  }
+  await store.delete(orphan.taskId)
+}
+```
+
+Delete the outputs before the record. If the program stops between the two steps, the record stays, and the next run reports the orphan again.
+
+When a task with the id of an orphan comes back, for example when you put back `templates/fr.html`, the task owns the record again. If you deleted the record, the task runs, because it has no record.
+
+Two programs that use one store see the records of each other as orphans. Give each program its own store file, or look only at the orphans whose id your program makes.
+
 ## 8. Failure, cancellation, and replacement
 
 ### Failure
@@ -578,7 +634,7 @@ Your task code must stop work when `ctx.signal` aborts. dapat does not stop a ru
 
 `build.remove(id)` removes the task. It aborts the task if the task is running. It sends a `withdrawn` event for each output that the task declares. If the task had not finished, dapat marks it `cancelled` with the reason `"removed"`.
 
-`build.remove(id)` also starts to delete the store record for the task. `build.remove` does not wait for the delete, but `build.run()` does. A delete error goes into `result.errors`.
+`build.remove(id)` also starts to delete the store record for the task. `build.remove` does not wait for the delete, but `build.run()` does. A delete error goes into `result.errors`. Thus a removed task is not an orphan, unless its delete failed ([Orphans](#orphans)).
 
 dapat does not delete files or objects. A `withdrawn` event only tells subscribers that the output will not come ([section 9](#9-subscribe-to-artifact-events)).
 
@@ -1046,7 +1102,7 @@ A `promised` event of a `FilesystemPrefix` gives no file name, so it makes no ma
 
 #### Between runs
 
-dapat does not delete old outputs. When you delete a source file, the next scan does not find it, so its task is not in the build. But the outputs of that task from the last run stay on disk. A `FileMatcher` whose pattern fits those outputs finds them in its scan. For example, a task makes `upper/<slug>.txt` from `content/<slug>.md`, and a second `build.each` uses `new FileMatcher("upper/<slug>.txt")`. When you delete `content/b.md`, the task `upper:b` goes away, but `upper/b.txt` stays, and the task of the second `build.each` for `b` stays too. Delete the old outputs yourself when this is a problem.
+dapat does not delete old outputs. When you delete a source file, the next scan does not find it, so its task is not in the build. But the outputs of that task from the last run stay on disk. A `FileMatcher` whose pattern fits those outputs finds them in its scan. For example, a task makes `upper/<slug>.txt` from `content/<slug>.md`, and a second `build.each` uses `new FileMatcher("upper/<slug>.txt")`. When you delete `content/b.md`, the task `upper:b` goes away, but `upper/b.txt` stays, and the task of the second `build.each` for `b` stays too. Delete the old outputs yourself when this is a problem. `result.orphans` names the task `upper:b` and its output `upper/b.txt` ([Orphans](#orphans)). The run that reports the orphan still has the task of the second `build.each` for `b`. Delete `upper/b.txt` and the record, and the next run does not have that task. Then that task is an orphan in the next run, with its own outputs.
 
 ### Matchers
 
@@ -1430,7 +1486,8 @@ A new checkout changes the modification time of each file. With the default `sta
 - **A `FileMatcher` pattern needs text between two vars.** `FileMatcher` throws when two vars have nothing between them, for example `v/<lang><slug>.md`. A key such as `v/enintro.md` has more than one split. The error names the pattern and the two vars. Put text between the vars, for example `v/<lang>-<slug>.md`.
 - **A `FileMatcher` pattern cannot have `*` or `**` yet.** Use one var for each part that changes.
 - **A `FileMatcher` pattern cannot hold a `<` or `>` as text, or a `..` part.** A file name with `<` or `>` cannot fit a pattern.
-- **A `FileMatcher` finds the old outputs of a task that is gone.** dapat does not delete old outputs, so the scan finds them on the next build ([Between runs](#between-runs)).
+- **dapat does not delete the outputs of a task that is gone.** When you delete a source file, for example a page or a template, the next scan of a `FileMatcher` does not find it, so its task is not in the build. The outputs of that task from the last run stay on disk, and a `FileMatcher` whose pattern fits them finds them in its scan ([Between runs](#between-runs)). `result.orphans` lists each such task and its output ids, so your program can delete them ([Orphans](#orphans)).
+- **Two programs that use one store see the records of each other as orphans.** Give each program its own store, or filter `result.orphans` by task id ([Orphans](#orphans)).
 - **A `FileMatcher` does not see a change on disk during the run that no task reports.** It looks at the disk only in its scan. A file that another program writes during the run gets its match on the next build.
 - **A var that comes twice in one segment can be slow on long names.** For example, `<a>-<b>-<c>-<a>` tries each split of the segment. A 255-character file name that almost matches takes about 10 ms. A 1000-character key can take seconds. Each segment without such a repeated var keeps its first split, so it stays fast.
 - **Matches that come in separate steps after the scans can pass through a state in between.** For example, a file watcher sends one file at a time, or two tasks that write a page and its review end at different times. Then `build.each` can make a set with `matched.review === undefined` for a while, and later replace it. This is correct if each set gives its own task ids and outputs. It is not safe when the id or an output depends on a matcher that is not required being `undefined`, and other sets can give the same id. For example, the drafts rule gives `draft:${vars.lang}` for the page of a lang with no review. In the state in between, two pages of one lang have no review, so two sets give `draft:en`, and `build.run()` rejects. Or the id moves between sets in two steps, and its store record is deleted, so the task runs again on the next build. Two passes of one drain are separate steps too. For example, rule 1 promises the pages, and rule 1b promises the reviews only when it gets those page events. Then the drafts rule gets the pages in pass 1 and the reviews in pass 2, and it passes through the same state in between. The safe pattern: put every var of the required matchers in each task id and each output, for example `draft:${vars.lang}/${vars.slug}`.
@@ -1460,7 +1517,7 @@ new Build(opts?: { store?: Store; sendLimit?: number })
 | `subscribe(listener: (event: ArtifactEvent) => void): void` | From `Emitter`. Calls `listener` synchronously for each artifact event, in the order of the event queue. Does not replay earlier events. See [section 9](#9-subscribe-to-artifact-events). |
 | `protected setTasksOfGroups(changes: readonly GroupTasks[]): void` | Makes the tasks of each group in `changes` its new tasks, in one step ([Task groups](#task-groups)). `GroupTasks` is `{ group: TaskGroup; tasks: readonly Task[] }`. Adds each new id, replaces each known id, and removes each id that a group had before and that no group of the step gets now. A task id can move from one group of the step to another group of the step. That is a replacement, as a known id in one group is: the task ends as `cancelled` with the reason `"replaced"` if it had not finished, and its store record stays. A removed task ends as `cancelled` with the reason `"removed"` if it had not finished, and its store record is deleted. Changes all state first, then puts the events on the queue: all `withdrawn` events of the step first, then the `promised` events, by id in list order. Throws and changes nothing if two groups of the step or another group have one id, if a group gets one id two times, if two tasks declare one exact output, or if a group is in `changes` two times. The checks use the state after the whole step. **An open step:** while the first `run()` scans, during each pass of a drain over the event queue, and during each matcher event that comes from outside a drain, the build keeps a step open. Then a call does not throw: its changes join the open step, a later change of a group replaces its earlier one, and the build applies the step when the scans return, when the pass ends, or when the event ends. The events of the applied step make the next pass of the drain. An error then is fatal for the build. `build.each` gives its changes here. `add` never joins an open step. A subclass of `Build` can call it with its own `new TaskGroup(label)`. |
 | `each<M extends Record<string, AnyMatcher>, const R extends keyof M & string = keyof M & string>(config: TaskMaterializerConfig<M, R>): void` | Makes tasks for each joined set of matched artifacts ([section 10](#10-buildeach-tasks-for-each-matched-artifact)). TypeScript gets `R` from `required`. Subscribes to each matcher in `matchersByName`, joins their matches on shared var names, and gives the tasks of each joined set through `setTasksOfGroups`, with one task group for each set, labeled `build.each <number> <var name>=<var value> ...`. All the changes of one pass of a drain over the event queue are one step, and all the changes during the scans of the first `run()` are one step. The build sends each artifact event to `matcher.receiveArtifactEvent`, one time for each matcher. An error in `tasks` or in a matched artifact is fatal for the build, like a subscriber error. Throws if `matchersByName` has no matcher, if one matcher object is under two names, if `required` is empty or has a name that is not in `matchersByName`, if its required matchers do not form one connected group by shared var names, if `run()` has started, or if another `Build` uses a matcher. |
-| `run(): Promise<Result>` | The first time, sends a `promised` event for each output of each task that is in the build, and then runs the scan of each matcher and waits for all of them. A call during the scans waits for the same scans. Then starts every task and resolves when every started task has finished. Does not reject when a task fails. Rejects with the first subscriber error, `build.each` error, scan error, or send-limit error of the build, at once if that error happened before the call ([section 9](#subscriber-errors)). After a scan error, no task starts. |
+| `run(): Promise<Result>` | The first time, sends a `promised` event for each output of each task that is in the build, and then runs the scan of each matcher and waits for all of them. A call during the scans waits for the same scans. Then starts every task and waits until every started task has finished. With a store, it then reads `store.ids()` and the record of each orphan ([Orphans](#orphans)), and resolves. Does not reject when a task fails. Rejects with the first subscriber error, `build.each` error, scan error, or send-limit error of the build, at once if that error happened before the call ([section 9](#subscriber-errors)). After a scan error, no task starts. |
 
 ### `class TaskGroup`
 
@@ -1551,8 +1608,9 @@ A prefix whose region is the id string. Its stamp is `null`, because an id strin
 | `set(taskId, state): Promise<void>` | Writes a record. The build calls it after each successful run. |
 | `delete(taskId): Promise<void>` | Deletes a record. The build calls it from `remove`. |
 | `clear(): Promise<void>` | Deletes every record. The build does not call it. |
+| `ids(): Promise<readonly string[]>` | The task id of each record, in any order. The build calls it at the end of each `run()` to find the orphans ([Orphans](#orphans)). |
 
-To write your own store, implement these four methods. A record holds strings and `null` only, so `JSON.stringify` can encode it as it is. `get` can return a record in an older shape. The build then treats it as no record ([section 7](#7-stores)).
+To write your own store, implement these five methods. A store from an older version has no `ids()`. Add it: TypeScript rejects a store without it. A record holds strings and `null` only, so `JSON.stringify` can encode it as it is. `get` can return a record in an older shape. The build then treats it as no record ([section 7](#7-stores)).
 
 ### `interface TaskState`
 
@@ -1582,9 +1640,18 @@ Keeps records in a `Map`. The records are lost when the process ends. `MemorySto
 | `skipped` | `readonly Task[]` | Tasks that the skip rule skipped. |
 | `failed` | `ReadonlyMap<Task, Error>` | Tasks that threw, whose producer failed, or that were in a deadlock. |
 | `cancelled` | `readonly Task[]` | Tasks that were replaced or removed before they completed. |
-| `errors` | `readonly Error[]` | Errors that no task owns: a non-abort error that a task throws after it was replaced or removed, and a store delete that rejects. It keeps the errors of earlier runs of the same build. A subscriber error is not here: `run()` rejects with it. |
+| `errors` | `readonly Error[]` | Errors that no task owns: a non-abort error that a task throws after it was replaced or removed, a store delete that rejects, and a store read for the orphans that rejects. It keeps the errors of earlier runs of the same build. A subscriber error is not here: `run()` rejects with it. |
+| `orphans` | `readonly Orphan[]` | The records in the store that no task of the build owns at the end of this run, in task id order. Empty with no store. dapat deletes nothing. See [Orphans](#orphans). |
 
 `Result` does not say why a task ran. The build keeps an `Outcome` for each task, but no public member returns it. See [section 6.1](#61-why-did-a-task-run-or-skip).
+
+### `type Orphan`
+
+```ts
+type Orphan = { taskId: string; outputIds: readonly string[] }
+```
+
+A record in the store that no task of the build owns. `outputIds` are the ids of the artifact outputs in the record. Prefix outputs are not in it. See [Orphans](#orphans).
 
 ### `type Outcome`
 
