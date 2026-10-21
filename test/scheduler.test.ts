@@ -49,6 +49,16 @@ describe("IdTrie", () => {
   })
 })
 
+/** Covers the ids that end with its id. The index of outputs cannot find these ids, so the build scans. */
+class SuffixPrefix extends Prefix {
+  constructor(readonly id: string) {
+    super()
+  }
+  override covers(artifact: Artifact): boolean {
+    return artifact.id.endsWith(this.id)
+  }
+}
+
 describe("Build scheduling", () => {
   test("a waiting task also waits for a producer that a running task adds", async () => {
     const log: string[] = []
@@ -148,15 +158,6 @@ describe("Build scheduling", () => {
   })
 
   test("an artifact input waits for a prefix output with its own covers()", async () => {
-    /** Covers the ids that end with its id. */
-    class SuffixPrefix extends Prefix {
-      constructor(readonly id: string) {
-        super()
-      }
-      override covers(artifact: Artifact): boolean {
-        return artifact.id.endsWith(this.id)
-      }
-    }
     const log: string[] = []
     const build = new Build()
     build.add(
@@ -181,5 +182,71 @@ describe("Build scheduling", () => {
     const result = await build.run()
     expect(result.success).toBe(true)
     expect(log).toEqual(["writer", "reader"])
+  })
+
+  test("a prefix input with its own covers() waits for an exact output that it covers", async () => {
+    const log: string[] = []
+    const build = new Build()
+    // The output id does not start with the input id ".md", so only a scan with covers() finds the writer.
+    build.add(
+      new Task({
+        id: "reader",
+        inputs: [new SuffixPrefix(".md")],
+        run: async () => {
+          log.push("reader")
+        },
+      }),
+    )
+    const page = new Mem("mem:x/page.md")
+    build.add(
+      new Task({
+        id: "writer",
+        outputs: [page],
+        run: async () => {
+          await new Promise<void>((resolve) => setTimeout(resolve, 5))
+          page.write("text")
+          log.push("writer")
+        },
+      }),
+    )
+    const result = await build.run()
+    expect(result.success).toBe(true)
+    expect(log).toEqual(["writer", "reader"])
+  })
+
+  test("a task that waits for a task whose dependency failed fails with that message, also next to a cycle", async () => {
+    const f = new Mem("mem:f")
+    const g = new Mem("mem:g")
+    const h = new Mem("mem:h")
+    const p = new Mem("mem:p")
+    const build = new Build()
+    build.add(new Task({ id: "C", inputs: [p], run: async () => {} }))
+    build.add(new Task({ id: "P", inputs: [f, g], outputs: [p], run: async () => {} }))
+    build.add(
+      new Task({
+        id: "F",
+        outputs: [f],
+        run: async () => {
+          await new Promise<void>((resolve) => setTimeout(resolve, 5))
+          throw new Error("boom")
+        },
+      }),
+    )
+    // G and H wait for each other.
+    build.add(new Task({ id: "G", inputs: [h], outputs: [g], run: async () => {} }))
+    build.add(new Task({ id: "H", inputs: [g], outputs: [h], run: async () => {} }))
+    const result = await build.run()
+    const messages: string[] = []
+    for (const [task, error] of result.failed) {
+      messages.push(`${task.id}: ${error.message}`)
+    }
+    messages.sort()
+    expect(messages).toEqual([
+      "C: dependency of 'C' failed",
+      "F: boom",
+      "G: deadlock waiting for inputs of 'G'",
+      "H: deadlock waiting for inputs of 'H'",
+      "P: dependency of 'P' failed",
+    ])
   })
 })

@@ -1,11 +1,16 @@
 /**
  * A radix tree from id strings to sets of values. Build uses it to find the producers of an input
- * without a scan of every output: the values whose key starts with a string, and the values whose
- * key is a start of a string. Each operation costs the length of the string, plus the values it visits.
+ * without a scan of every output: the values whose key starts with a string (withPrefix), and the
+ * values whose key is a start of a string (startsOf). Each operation costs the length of the string,
+ * plus the values that it visits.
+ *
+ * Each edge holds a label of one or more characters, and the edges of one node start with different
+ * characters. A node stays only when it has values or two or more edges; delete() merges the others away.
  */
 export class IdTrie<V> {
   private readonly root = new TrieNode<V>("")
 
+  /** Adds `value` to the set of `key`. */
   add(key: string, value: V): void {
     let node = this.root
     let at = 0
@@ -34,6 +39,7 @@ export class IdTrie<V> {
     node.values.add(value)
   }
 
+  /** Deletes `value` from the set of `key`. Does nothing when it is not there. */
   delete(key: string, value: V): void {
     const path: TrieNode<V>[] = [this.root]
     let node = this.root
@@ -59,9 +65,10 @@ export class IdTrie<V> {
         continue
       }
       if (current.edges.size === 1) {
-        const only = current.edges.values().next().value!
-        only.label = current.label + only.label
-        parent.edges.set(only.label[0]!, only)
+        for (const only of current.edges.values()) {
+          only.label = current.label + only.label
+          parent.edges.set(only.label[0]!, only)
+        }
       }
       break
     }
@@ -93,7 +100,11 @@ export class IdTrie<V> {
     let node = this.root
     let at = 0
     while (true) {
-      if (node.values !== null) node.values.forEach((value) => visit(value))
+      if (node.values !== null) {
+        for (const value of node.values) {
+          visit(value)
+        }
+      }
       if (at >= id.length) return
       const child = node.edges.get(id[at]!)
       if (child === undefined || !id.startsWith(child.label, at)) return
@@ -117,8 +128,14 @@ function visitAll<V>(top: TrieNode<V>, visit: (value: V) => void): void {
   const stack = [top]
   while (stack.length > 0) {
     const node = stack.pop()!
-    if (node.values !== null) node.values.forEach((value) => visit(value))
-    for (const child of node.edges.values()) stack.push(child)
+    if (node.values !== null) {
+      for (const value of node.values) {
+        visit(value)
+      }
+    }
+    for (const child of node.edges.values()) {
+      stack.push(child)
+    }
   }
 }
 

@@ -12,11 +12,25 @@
  *   shared-prefix  n tasks that each read their own input and the prefix mem:cfg/; one task writes mem:cfg/a
  *   add-during-run one task adds n flat tasks with ctx.add while it runs
  *   replace        n flat tasks run; then build.add replaces each one again (each add is one step) and a 2nd run
+ *   custom-prefix  as shared-prefix, but the prefix class overrides covers(), so each look scans every output
+ *   one-at-a-time  one task reads the prefix mem:out/; task i writes mem:out/i and adds task i+1 with ctx.add
+ *
+ * custom-prefix and one-at-a-time are the two known cases whose cost grows with n².
  *
  * The time is from the first build.add to the end of build.run(), so it includes the task changes.
  */
-import { Build, IdPrefix, MemoryStore, Task, type Context } from "../src/index"
+import { Build, IdPrefix, MemoryStore, Prefix, Task, type Artifact, type Context } from "../src/index"
 import { Mem } from "../test/mem"
+
+/** A prefix with the default rule, but its own covers(). The build cannot use its index for it. */
+class CustomPrefix extends Prefix {
+  constructor(readonly id: string) {
+    super()
+  }
+  override covers(artifact: Artifact): boolean {
+    return artifact.id.startsWith(this.id)
+  }
+}
 
 type Scenario = (n: number) => Promise<{ ms: number; executed: number }>
 
@@ -101,6 +115,42 @@ const scenarios: Record<string, Scenario> = {
     })
   },
 
+  async "custom-prefix"(n) {
+    const build = new Build({ store: new MemoryStore() })
+    return timed(build, n + 1, () => {
+      const cfg = new Mem("mem:cfg/a")
+      build.add(new Task({ id: "cfg", inputs: [new Mem("mem:cfg-source", "x")], outputs: [cfg], run: write(cfg) }))
+      for (let i = 0; i < n; i++) {
+        const out = new Mem(`mem:out/${i}`)
+        const inputs = [new Mem(`mem:in/${i}`, "x"), new CustomPrefix("mem:cfg/")]
+        build.add(new Task({ id: `t${i}`, inputs, outputs: [out], run: write(out) }))
+      }
+    })
+  },
+
+  async "one-at-a-time"(n) {
+    const build = new Build({ store: new MemoryStore() })
+    const makeTask = (i: number): Task => {
+      const out = new Mem(`mem:out/${i}`)
+      return new Task({
+        id: `t${i}`,
+        inputs: [new Mem(`mem:in/${i}`, "x")],
+        outputs: [out],
+        run: async (ctx: Context) => {
+          out.write("v")
+          if (i + 1 < n) {
+            ctx.add(makeTask(i + 1))
+          }
+        },
+      })
+    }
+    return timed(build, n + 1, () => {
+      const total = new Mem("mem:total")
+      build.add(new Task({ id: "total", inputs: [new IdPrefix("mem:out/")], outputs: [total], run: write(total) }))
+      build.add(makeTask(0))
+    })
+  },
+
   async replace(n) {
     const build = new Build({ store: new MemoryStore() })
     const makeTask = (i: number, value: string) => {
@@ -122,6 +172,8 @@ const SIZES: Record<string, number[]> = {
   "shared-prefix": [1000, 2000, 4000, 8000, 16000, 32000],
   "add-during-run": [1000, 2000, 4000, 8000, 16000, 32000],
   replace: [1000, 2000, 4000, 8000, 16000, 32000],
+  "custom-prefix": [1000, 2000, 4000, 8000, 16000, 32000],
+  "one-at-a-time": [1000, 2000, 4000, 8000, 16000, 32000],
 }
 
 const [name, sizeText] = process.argv.slice(2)

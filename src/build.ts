@@ -20,7 +20,13 @@ type Phase = "pending" | "running" | "completed"
 
 type WaitResult = "ok" | "failed" | "cancelled" | "deadlock"
 
-// Why a blocked task wakes: its last unfinished producer ended ("wake"), a producer failed, or no task can make progress.
+/**
+ * Why a blocked task wakes:
+ * - "wake": each producer that it waited for has ended, or was replaced or removed. Also sent when
+ *   the task itself ends while it waits, and when the build fails. The task looks at its producers again.
+ * - "failed": a producer that it waited for failed.
+ * - "deadlock": no task runs, and every pending task waits for a producer.
+ */
 type WakeSignal = "wake" | "failed" | "deadlock"
 
 /** The default number of events that subscribers can cause during one drain of the event queue. */
@@ -49,14 +55,17 @@ class Slot {
   // The ids that this run reported with ctx.produced or ctx.deleted.
   reported = new Set<string>()
   outcome: Outcome | null = null
-  // While the task waits for its inputs: the producers it waits for, how many of them have not ended
-  // yet, and the function that wakes it. Each producer holds the waiting slot in its `waiters`.
+  // While the task waits for its inputs (Build.block until Build.resume):
+  // - waitingOn: the unfinished producers that its last look found. Each one holds this slot in its `waiters`.
+  // - waitCount: how many of them did not end yet, and were not replaced or removed. At 0 the task wakes.
+  // - wakeUp: the function that wakes the task. null when the task does not wait.
   waitingOn: Slot[] = []
   waitCount = 0
   wakeUp: ((signal: WakeSignal) => void) | null = null
-  // The slots that wait for this slot to end.
+  // The slots that wait for this slot to end. Build.endWait tells each of them when it ends.
   readonly waiters = new Set<Slot>()
   // The place of the task id in Build.slots. A replacement keeps the place, as Map.set does.
+  // A change starts its new slots in this order, as run() does.
   order = 0
 
   constructor(
@@ -70,7 +79,8 @@ export class Build extends Emitter<ArtifactEvent> {
   private readonly store: Store | undefined
   private readonly sendLimit: number
   private readonly slots = new Map<string, Slot>()
-  private slotCount = 0
+  // The last Slot.order that the build gave.
+  private lastOrder = 0
   // The slots that a change made and that did not start yet: before the first run(), or during its scans.
   private readonly notStarted = new Set<Slot>()
   // For each group, the ids of its tasks. Slot.group is the reverse.
@@ -78,12 +88,16 @@ export class Build extends Emitter<ArtifactEvent> {
   // The groups that build.add made. A replacement with the same id keeps its group.
   private readonly addedTaskGroups = new WeakSet<TaskGroup>()
   private readonly exactOutputs = new Map<string, { artifact: Artifact; taskId: string }>()
-  // The ids of the tasks that declare each exact output, by output id. The producer lookup of a prefix input uses it.
+  // The ids of the tasks that declare each exact output, by output id. A prefix input with the
+  // default covers() finds the exact outputs under it here.
   private readonly exactOutputTrie = new IdTrie<string>()
-  // The prefix outputs of all tasks, by prefix id, and the entries that each task put there.
+  // The prefix outputs of all tasks, by prefix id. An artifact input finds the prefixes above it here.
+  // A prefix input with the default rules finds the prefixes above it and below it here.
   private readonly prefixOutputTrie = new IdTrie<PrefixOutput>()
+  // The entries that each task put in prefixOutputTrie, so that unindex() can delete them.
   private readonly prefixOutputsByTask = new Map<Task, PrefixOutput[]>()
-  // The prefix outputs whose class overrides covers(). An artifact input checks each of them.
+  // The prefix outputs whose class overrides covers(). Such a prefix can cover an id that does not
+  // start with its own id, so the tries cannot find it. Each artifact input checks each of them.
   private readonly customPrefixOutputs = new Set<PrefixOutput>()
   private readonly outcomes = new Map<Task, Outcome>()
   private readonly errors: Error[] = []
@@ -114,6 +128,9 @@ export class Build extends Emitter<ArtifactEvent> {
   private runningCount = 0
   // The slots in the phase "pending", and the slots among them that wait for a producer.
   // When no task runs and every pending slot waits, no task can make progress: a deadlock.
+  // pendingCount changes in three places only: +1 for each new slot in change(), -1 when execute()
+  // sets "running", and -1 when finish() ends a slot that is still pending.
+  // A pending slot that is not in `blocked` (not started yet, or in its stamp phase) prevents a deadlock.
   private pendingCount = 0
   private readonly blocked = new Set<Slot>()
   private workCount = 0
@@ -327,7 +344,12 @@ export class Build extends Emitter<ArtifactEvent> {
           before = outputsByKey(existing.task)
         }
         const slot = new Slot(task, group)
-        slot.order = existing ? existing.order : ++this.slotCount
+        if (existing) {
+          slot.order = existing.order
+        } else {
+          this.lastOrder += 1
+          slot.order = this.lastOrder
+        }
         this.slots.set(task.id, slot)
         this.pendingCount += 1
         created.push(slot)
@@ -384,14 +406,25 @@ export class Build extends Emitter<ArtifactEvent> {
       if (slot.abort) slot.abort.abort()
     }
     // A task that waited for a replaced or removed task looks for its producers again.
-    for (const slot of dropped) this.endWait(slot, false)
-    for (const slot of replaced) this.endWait(slot, false)
-    for (const slot of created) this.notStarted.add(slot)
+    // finish() above already did this for the slots that it ended. A replaced running slot ends later.
+    for (const slot of dropped) {
+      this.endWait(slot, false)
+    }
+    for (const slot of replaced) {
+      this.endWait(slot, false)
+    }
+    for (const slot of created) {
+      this.notStarted.add(slot)
+    }
+    // Before the first run(), and during its scans, run() starts the slots later.
     if (this.started && !this.scanning && this.fatal === null) {
       // In the order of this.slots, as run() starts them.
-      const starts = [...this.notStarted].sort((a, b) => a.order - b.order)
+      const starts = [...this.notStarted]
+      starts.sort((a, b) => a.order - b.order)
       this.notStarted.clear()
-      for (const slot of starts) this.kick(slot)
+      for (const slot of starts) {
+        this.kick(slot)
+      }
     }
     this.checkDeadlock()
     this.maybeIdle()
@@ -557,7 +590,10 @@ export class Build extends Emitter<ArtifactEvent> {
       if (slot.phase === "running" && slot.abort) slot.abort.abort()
     }
     // Wakes the waiting tasks, so that they see the error and stop.
-    for (const slot of [...this.blocked]) this.resume(slot, "wake")
+    const blocked = [...this.blocked]
+    for (const slot of blocked) {
+      this.resume(slot, "wake")
+    }
     this.maybeIdle()
   }
 
@@ -625,10 +661,15 @@ export class Build extends Emitter<ArtifactEvent> {
         const entry = { output, taskId: task.id }
         entries.push(entry)
         this.prefixOutputTrie.add(output.id, entry)
-        if (output.covers !== Prefix.prototype.covers) this.customPrefixOutputs.add(entry)
+        // A class that overrides covers() counts as custom, also when its rule is the same as the default.
+        if (output.covers !== Prefix.prototype.covers) {
+          this.customPrefixOutputs.add(entry)
+        }
       }
     }
-    if (entries.length > 0) this.prefixOutputsByTask.set(task, entries)
+    if (entries.length > 0) {
+      this.prefixOutputsByTask.set(task, entries)
+    }
   }
 
   private unindex(task: Task): void {
@@ -670,23 +711,35 @@ export class Build extends Emitter<ArtifactEvent> {
   }
 
   private addPrefixProducers(input: Prefix, ids: Set<string>): void {
+    const addTaskId = (taskId: string) => {
+      ids.add(taskId)
+    }
     const addEntry = (entry: PrefixOutput) => {
       ids.add(entry.taskId)
     }
-    // The default covers() and overlaps() compare the id strings, so the tries find the same tasks as a scan.
-    if (input.covers === Prefix.prototype.covers && input.overlaps === Prefix.prototype.overlaps) {
-      this.exactOutputTrie.withPrefix(input.id, (taskId) => ids.add(taskId))
+    // The default covers() and overlaps() only compare the start of the id strings. So the tries find
+    // the same tasks as a scan: the exact outputs under the input, the prefix outputs under it, and
+    // the prefix outputs above it.
+    const defaultCovers = input.covers === Prefix.prototype.covers
+    const defaultOverlaps = input.overlaps === Prefix.prototype.overlaps
+    if (defaultCovers && defaultOverlaps) {
+      this.exactOutputTrie.withPrefix(input.id, addTaskId)
       this.prefixOutputTrie.withPrefix(input.id, addEntry)
       this.prefixOutputTrie.startsOf(input.id, addEntry)
       return
     }
+    // A class with its own rule: check every exact output and every prefix output. This costs one
+    // check for each output of the build, for each look of the task.
     for (const entry of this.exactOutputs.values()) {
       if (input.covers(entry.artifact)) {
         ids.add(entry.taskId)
       }
     }
+    // withPrefix("") visits every prefix output.
     this.prefixOutputTrie.withPrefix("", (entry) => {
-      if (input.overlaps(entry.output)) ids.add(entry.taskId)
+      if (input.overlaps(entry.output)) {
+        ids.add(entry.taskId)
+      }
     })
   }
 
@@ -695,12 +748,18 @@ export class Build extends Emitter<ArtifactEvent> {
     if (exact) {
       ids.add(exact.taskId)
     }
-    // A prefix with the default covers() covers the ids that start with its id.
+    // A prefix with the default covers() covers the ids that start with its id, so its key is a start
+    // of input.id. covers() still decides, because a custom prefix is in the trie too.
     this.prefixOutputTrie.startsOf(input.id, (entry) => {
-      if (entry.output.covers(input)) ids.add(entry.taskId)
+      if (entry.output.covers(input)) {
+        ids.add(entry.taskId)
+      }
     })
+    // A custom covers() can cover any id, so check each custom prefix output.
     for (const entry of this.customPrefixOutputs) {
-      if (entry.output.covers(input)) ids.add(entry.taskId)
+      if (entry.output.covers(input)) {
+        ids.add(entry.taskId)
+      }
     }
   }
 
@@ -825,6 +884,7 @@ export class Build extends Emitter<ArtifactEvent> {
         }
       }
       if (unfinished.length === 0) return "ok"
+      // The look after a deadlock wake still finds an unfinished producer: the task is in the deadlock.
       if (deadlocked) return "deadlock"
       const signal = await this.block(slot, unfinished)
       if (signal === "failed") {
@@ -836,14 +896,19 @@ export class Build extends Emitter<ArtifactEvent> {
     }
   }
 
-  /** Makes the slot wait for each producer in `unfinished`. Resolves when resume() wakes it. */
+  /**
+   * Makes the slot wait for each producer in `unfinished`. Resolves when resume() wakes it.
+   * `unfinished` holds each producer one time, and each one is pending or running.
+   */
   private block(slot: Slot, unfinished: Slot[]): Promise<WakeSignal> {
     const woken = new Promise<WakeSignal>((resolve) => {
       slot.wakeUp = resolve
     })
     slot.waitingOn = unfinished
     slot.waitCount = unfinished.length
-    for (const producer of unfinished) producer.waiters.add(slot)
+    for (const producer of unfinished) {
+      producer.waiters.add(slot)
+    }
     this.blocked.add(slot)
     this.checkDeadlock()
     return woken
@@ -855,7 +920,9 @@ export class Build extends Emitter<ArtifactEvent> {
     if (wakeUp === null) return
     slot.wakeUp = null
     this.blocked.delete(slot)
-    for (const producer of slot.waitingOn) producer.waiters.delete(slot)
+    for (const producer of slot.waitingOn) {
+      producer.waiters.delete(slot)
+    }
     slot.waitingOn = []
     wakeUp(signal)
   }
@@ -863,9 +930,13 @@ export class Build extends Emitter<ArtifactEvent> {
   /**
    * Tells each slot that waits for `producer` that the producer ended, or was replaced or removed.
    * A slot wakes when the last producer it waits for has ended, or at once when one failed.
+   * Each path that ends, replaces, or removes a slot must call this: finish() and change().
+   * Else a task that waits for that slot never wakes.
    */
   private endWait(producer: Slot, failed: boolean): void {
-    for (const waiter of [...producer.waiters]) {
+    // resume() deletes the waiter from producer.waiters, so loop over a copy.
+    const waiters = [...producer.waiters]
+    for (const waiter of waiters) {
       waiter.waitCount -= 1
       if (failed) {
         this.resume(waiter, "failed")
@@ -880,8 +951,12 @@ export class Build extends Emitter<ArtifactEvent> {
   private checkDeadlock(): void {
     if (this.fatal !== null) return
     if (this.runningCount !== 0) return
-    if (this.blocked.size === 0 || this.blocked.size !== this.pendingCount) return
-    for (const slot of [...this.blocked]) this.resume(slot, "deadlock")
+    if (this.blocked.size === 0) return
+    if (this.blocked.size !== this.pendingCount) return
+    const blocked = [...this.blocked]
+    for (const slot of blocked) {
+      this.resume(slot, "deadlock")
+    }
   }
 
   private contextFor(slot: Slot, generation: number): Context {
