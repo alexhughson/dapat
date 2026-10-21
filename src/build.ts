@@ -7,7 +7,7 @@ import { Task, isArtifact, isPrefix, type Context, type Ref } from "./task"
 import type { Store, TaskState } from "./store"
 import { Outcome, Result } from "./result"
 import { TaskGroup, type GroupTasks } from "./task-group"
-import { TaskMaterializer, type TaskMaterializerConfig } from "./task-materializer"
+import { TaskMaterializer, type OutputTemplates, type TaskMaterializerConfig } from "./task-materializer"
 
 export type ArtifactEvent =
   | { kind: "promised"; output: Ref; taskId: string }
@@ -133,8 +133,12 @@ export class Build extends Emitter<ArtifactEvent> {
    * Makes tasks for each joined set of the matches of its matchers.
    * Call it before the first run(): that run scans each matcher before any task starts.
    */
-  each<M extends Record<string, AnyMatcher>, const R extends keyof M & string = keyof M & string>(
-    config: TaskMaterializerConfig<M, R>,
+  each<
+    M extends Record<string, AnyMatcher>,
+    const R extends keyof M & string = keyof M & string,
+    O extends OutputTemplates = {},
+  >(
+    config: TaskMaterializerConfig<M, R, O>,
   ): void {
     if (this.started) {
       throw new Error("build.each must come before the first build.run()")

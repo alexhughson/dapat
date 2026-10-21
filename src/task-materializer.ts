@@ -2,7 +2,8 @@ import type { Artifact } from "./artifact"
 import type { AnyMatcher, DataOf } from "./matcher"
 import type { MatchedArtifact, MatchedArtifactEvent, MatchedData, Vars } from "./matched-artifact"
 import { JoinIndex, MatchTable, joinFrom, planJoins, type ArtifactIds, type BaseSet, type JoinStep, type JoinedSet, type StoredMatch } from "./match-join"
-import type { Task } from "./task"
+import type { ArtifactTemplate, RefOf } from "./artifact-template"
+import { Task, type Context, type Ref } from "./task"
 import { TaskGroup } from "./task-group"
 
 /**
@@ -23,7 +24,13 @@ export type JoinedVars<M extends Record<string, AnyMatcher>, R extends keyof M &
   ? Vars
   : Readonly<Record<string, string | undefined>>
 
-export type TaskMaterializerConfig<M extends Record<string, AnyMatcher>, R extends keyof M & string = keyof M & string> = {
+/** The templates of `outputsByName`, by name. */
+export type OutputTemplates = Record<string, ArtifactTemplate>
+
+/** What `tasks` and `run` get: each template of `outputsByName` expanded with the vars of the set. */
+export type OutputsByName<O extends OutputTemplates> = { readonly [K in keyof O]: RefOf<O[K]> }
+
+type CommonConfig<M extends Record<string, AnyMatcher>, R extends keyof M & string, O extends OutputTemplates> = {
   /** The matchers to listen to, by name. Their matches join on the var names that they share. */
   matchersByName: M
   /**
@@ -31,12 +38,41 @@ export type TaskMaterializerConfig<M extends Record<string, AnyMatcher>, R exten
    * Each other matcher left-joins onto them, in name order, and is undefined in a set where it has no match.
    */
   required?: readonly R[]
+  /** Output templates, by name. Each var of a template must be a var of a required matcher. */
+  outputsByName?: O
+}
+
+/** The full form: `tasks` gives any number of tasks for each joined set. */
+export type TasksConfig<M extends Record<string, AnyMatcher>, R extends keyof M & string, O extends OutputTemplates> = CommonConfig<M, R, O> & {
   /**
    * Gives the tasks for one joined set of matches. It can give any number of tasks.
    * A var of a matcher that is not required is undefined when the set has no match of it.
    */
-  tasks: (vars: JoinedVars<M, R>, matched: MatchedByName<M, R>) => Iterable<Task>
+  tasks: (vars: JoinedVars<M, R>, matched: MatchedByName<M, R>, outputs: OutputsByName<O>) => Iterable<Task>
 }
+
+/** What `run` gets. */
+export type RunArgs<M extends Record<string, AnyMatcher>, R extends keyof M & string, O extends OutputTemplates> = {
+  vars: JoinedVars<M, R>
+  matched: MatchedByName<M, R>
+  outputs: OutputsByName<O>
+  ctx: Context
+}
+
+/**
+ * The one-task form: one task for each joined set. Its id is `<name>:<var values joined by />`,
+ * its inputs are the matched artifacts, and its outputs are the expanded output templates.
+ */
+export type RunConfig<M extends Record<string, AnyMatcher>, R extends keyof M & string, O extends OutputTemplates> = CommonConfig<M, R, O> & {
+  name: string
+  run: (args: RunArgs<M, R, O>) => Promise<void>
+}
+
+export type TaskMaterializerConfig<
+  M extends Record<string, AnyMatcher>,
+  R extends keyof M & string = keyof M & string,
+  O extends OutputTemplates = {},
+> = TasksConfig<M, R, O> | RunConfig<M, R, O>
 
 /** Gives the new tasks of one group to the build. The build applies them in steps: see Build.setTasksOfGroups. */
 type SetGroupTasks = (group: TaskGroup, tasks: readonly Task[]) => void
@@ -68,7 +104,7 @@ type Branch = {
  * of a set that changes and removes the tasks of a set that is gone.
  * The build never calls `hear` while another `hear` runs (see build.each).
  */
-export class TaskMaterializer<M extends Record<string, AnyMatcher>, R extends keyof M & string> {
+export class TaskMaterializer<M extends Record<string, AnyMatcher>, R extends keyof M & string, O extends OutputTemplates> {
   private readonly tablesByName = new Map<string, MatchTable>()
   // For each required matcher: the join steps from one of its matches to the other required matchers.
   private readonly joinStepsByName: Map<string, JoinStep[]>
@@ -79,7 +115,7 @@ export class TaskMaterializer<M extends Record<string, AnyMatcher>, R extends ke
 
   constructor(
     readonly number: number,
-    private readonly config: TaskMaterializerConfig<M, R>,
+    private readonly config: TaskMaterializerConfig<M, R, O>,
     private readonly setGroupTasks: SetGroupTasks,
   ) {
     const names = Object.keys(config.matchersByName)
@@ -135,6 +171,16 @@ export class TaskMaterializer<M extends Record<string, AnyMatcher>, R extends ke
       this.optionalMatchersByName.set(table.name, { table, sharedVarNames, onVarNames, baseIndex: new JoinIndex(sharedVarNames) })
     }
     this.joinStepsByName = planJoins(requiredTables, number)
+    const outputTemplates: OutputTemplates = config.outputsByName ?? {}
+    for (const [outputName, template] of Object.entries(outputTemplates)) {
+      for (const varName of template.varNames) {
+        if (!requiredVarNames.has(varName)) {
+          throw new Error(
+            `build.each ${number}: output '${outputName}' uses the var '${varName}', which no required matcher has; a set can have no value for it`,
+          )
+        }
+      }
+    }
   }
 
   hear(matcherName: string, event: MatchedArtifactEvent): void {
@@ -327,11 +373,47 @@ export class TaskMaterializer<M extends Record<string, AnyMatcher>, R extends ke
     }
     // fromEntries makes each name an own property, also a matcher named __proto__.
     const matched = Object.fromEntries(matchedEntries)
+    const outputEntries: [string, Ref][] = []
+    for (const [outputName, template] of Object.entries(this.config.outputsByName ?? {})) {
+      outputEntries.push([outputName, template.expand(set.vars)])
+    }
+    const outputs = Object.fromEntries(outputEntries) as OutputsByName<O>
+    const vars = set.vars as JoinedVars<M, R>
+    const matchedByName = matched as MatchedByName<M, R>
+    const config = this.config
+    if ("run" in config) {
+      this.setGroupTasks(set.group, [this.oneTask(config, vars, matchedByName, outputs)])
+      return
+    }
     const tasks: Task[] = []
-    for (const task of this.config.tasks(set.vars as JoinedVars<M, R>, matched as MatchedByName<M, R>)) {
+    for (const task of config.tasks(vars, matchedByName, outputs)) {
       tasks.push(task)
     }
     this.setGroupTasks(set.group, tasks)
+  }
+
+  /** The task of the one-task form: the matched artifacts in, the expanded templates out. */
+  private oneTask(config: RunConfig<M, R, O>, vars: JoinedVars<M, R>, matched: MatchedByName<M, R>, outputs: OutputsByName<O>): Task {
+    const values: string[] = []
+    for (const name of this.unionVarNames) {
+      const value = vars[name]
+      if (value !== undefined) values.push(value)
+    }
+    const inputs: Ref[] = []
+    for (const match of Object.values(matched) as (MatchedArtifact | undefined)[]) {
+      if (match === undefined) continue
+      if (Array.isArray(match.data)) {
+        inputs.push(...(match.data as readonly Artifact[]))
+      } else {
+        inputs.push(match.data as Artifact)
+      }
+    }
+    return new Task({
+      id: `${config.name}:${values.join("/")}`,
+      inputs,
+      outputs: Object.values(outputs) as Ref[],
+      run: (ctx) => config.run({ vars, matched, outputs, ctx }),
+    })
   }
 
   /** `build.each <number> <name>=<value> ...`, for each var of the set, in unionVarNames order. Only for error messages. */
