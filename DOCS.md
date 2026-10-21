@@ -997,22 +997,26 @@ const templates = new FileMatcher("templates/<lang>.html", { stamp: "hash" })
 
 - The parts of a pattern are separated by `/`. `<name>` is a var. A var matches one or more characters, but not `/`. Thus a var never crosses a folder.
 - The matcher reads its `varNames` from the pattern, in order. `templates/<lang>.html` has the var names `["lang"]`. For the file `templates/en.html`, the match is `{ vars: { lang: "en" }, data: <FileArtifact of templates/en.html> }`. `content/<lang>/<section>/<slug>.md` has the var names `["lang", "section", "slug"]`.
-- One part can hold text and vars together, for example `<slug>.md` or `v<major>.<minor>.json`.
+- One part can hold text and vars together, for example `<slug>.md` or `v<major>.<minor>.json`. When a name has more than one split, the first var takes as much text as it can. `v1.2.3.json` gives `major` `"1.2"` and `minor` `"3"`.
 - Two vars must have text between them. `<a><b>.md` throws, because a name such as `xy.md` has more than one split.
+- A var name has letters, digits, and `_`, and does not start with a digit. Each `<` and `>` must enclose a var name. `<lang-x>`, `<1>`, and a `<` or `>` in a file name throw.
+- A `..` part throws, also a `..` that would remove a var, as in `a/<x>/../b.md`. For a folder above the working directory, give an absolute pattern, for example `path.resolve("../shared/<slug>.md")`.
+- A var also matches a name that starts with `.`. `content/<slug>.md` finds `content/._a.md` with `slug` `"._a"`.
 - A var can come two times. `docs/<lang>/<lang>.md` matches `docs/en/en.md`, and it does not match `docs/en/fr.md`.
 - A pattern with no var names one file. Its `varNames` is `[]`, and it has one match or none.
 - `*` and `**` are not supported yet. The constructor throws for a pattern with `*` or `**`. Use one var for each part that changes. A later version adds them.
 - An empty pattern throws.
+- A var never takes the value `..`. A file outside the root of the pattern never fits.
 
 #### Paths
 
-A relative pattern resolves against the current working directory when you create the matcher, as the path of a `FileArtifact` does. An absolute pattern stays as it is. The matcher removes `./` and `x/../` from the pattern. `matcher.root` is the folder that the pattern is relative to, and `matcher.pattern` is the pattern after this change.
+A relative pattern resolves against the current working directory when you create the matcher, as the path of a `FileArtifact` does. An absolute pattern stays as it is. The matcher removes each `./` from the pattern. `matcher.root` is the folder that the pattern is relative to, and `matcher.pattern` is the pattern after this change.
 
 Each `FileArtifact` that the matcher sends has an absolute path. The `stamp` option goes to each of these `FileArtifact` objects.
 
 #### The scan
 
-The scan reads only the folders that the pattern names. It starts at the text before the first var, for example `content/`, and goes down to the depth of the pattern. It sends `found` for each file that fits, in name order.
+The scan reads only the folders that the pattern names. For a part with no var, for example `content`, it adds the name to the path and reads nothing. For a part with a var, it reads the folder and keeps only the names that fit that part. It goes down to the depth of the pattern, and sends `found` for each file that fits, in name order. It stats only symlinks.
 
 - A missing folder has no files. This is not an error, because a task can make the folder later.
 - The scan follows symlinks. A link to a file counts as that file. A broken link adds nothing.
@@ -1034,7 +1038,9 @@ A file has a match while one of these is true:
 | `deleted`: a task deleted the file | sends `gone`, unless a task still declares the file |
 | `withdrawn`: the task that declared the file leaves the build | sends `gone`, unless the file is on disk |
 
-The matcher sends `found` one time for each file. It sends `gone` only for a file that it sent `found` for. After `gone`, a new `promised` or `produced` sends `found` again.
+The matcher sends `found` one time for each file. It sends `gone` only for a file that it sent `found` for. After `gone`, a new `promised` or `produced` sends `found` again. The matcher keeps a record only for a file that has a match now.
+
+An output can move from one task to another task in one step, for example when a `build.each` set changes the id of its task. The build sends the `withdrawn` event before the `promised` event, so the matcher sends `gone` and then `found`. `build.each` applies both in the same step. Thus the task of the match stays in the build: the build replaces it, and it keeps its store record.
 
 A `promised` event of a `FilesystemPrefix` gives no file name, so it makes no match. A task that writes files into a prefix output must call `ctx.produced` for each file ([Matches during the run](#matches-during-the-run)).
 
@@ -1239,7 +1245,7 @@ An error in `build.each` is fatal for the build, as a subscriber error is. The `
 | `build.each` | one matcher object is under two names | `build.each` throws |
 | `build.each` | you call it after `build.run()` | `build.each` throws |
 | `build.each` | one of its matchers is used by another `Build` | `build.each` throws, and names the matcher |
-| `new FileMatcher` | the pattern has `*` or `**`, two vars with nothing between them, or no text | the constructor throws |
+| `new FileMatcher` | the pattern has `*`, `**`, a `..` part, a `<` or `>` that does not enclose a valid var name, two vars with nothing between them, or no text | the constructor throws |
 | a scan | it throws, for example your own matcher reads a folder that does not exist | `build.run()` rejects at once, and no task runs. The other scans get an aborted `signal`. `build.run()` does not wait for them. |
 | a matched artifact or a `gone` | its vars are not the `varNames` of its matcher | `build.run()` rejects |
 | `tasks` | two matches give one task id | `build.run()` rejects with `task 'x' is in two groups: 'build.each 1 slug=a' and 'build.each 1 slug=b'` |
@@ -1423,6 +1429,7 @@ A new checkout changes the modification time of each file. With the default `sta
 - **The skip rule ignores the order and the repeats of the inputs.** The record keeps the stamps by id. So a task that ran with the inputs `[a, b]` skips with `[b, a]`, and a task that ran with `[a]` skips with `[a, a]`. If the result of a task depends on the order of its inputs, put the order in the task id, or force the task to run ([section 12.1](#121-force-tasks-to-run-again)).
 - **A `FileMatcher` pattern needs text between two vars.** `FileMatcher` throws when two vars have nothing between them, for example `v/<lang><slug>.md`. A key such as `v/enintro.md` has more than one split. The error names the pattern and the two vars. Put text between the vars, for example `v/<lang>-<slug>.md`.
 - **A `FileMatcher` pattern cannot have `*` or `**` yet.** Use one var for each part that changes.
+- **A `FileMatcher` pattern cannot hold a `<` or `>` as text, or a `..` part.** A file name with `<` or `>` cannot fit a pattern.
 - **A `FileMatcher` finds the old outputs of a task that is gone.** dapat does not delete old outputs, so the scan finds them on the next build ([Between runs](#between-runs)).
 - **A `FileMatcher` does not see a change on disk during the run that no task reports.** It looks at the disk only in its scan. A file that another program writes during the run gets its match on the next build.
 - **A var that comes twice in one segment can be slow on long names.** For example, `<a>-<b>-<c>-<a>` tries each split of the segment. A 255-character file name that almost matches takes about 10 ms. A 1000-character key can take seconds. Each segment without such a repeated var keeps its first split, so it stays fast.
@@ -1715,15 +1722,13 @@ new FileMatcher(pattern: string, opts?: { stamp?: "time" | "hash" })
 
 | Member | Value |
 | --- | --- |
-| `pattern` | The pattern without `./` and `x/../`, for example `content/<lang>/<slug>.md`. |
+| `pattern` | The pattern without `./`, for example `content/<lang>/<slug>.md`. |
 | `root` | The absolute folder that the pattern is relative to: the working directory when you create the matcher, or `/` for an absolute pattern. |
 | `varNames` | The vars of the pattern, in order. `templates/<lang>.html` gives `["lang"]`. |
-| `stampMode` | The stamp mode of each `FileArtifact` that the matcher sends. Default `"time"`. |
-| `match(path)` | The vars of the file at `path`, or `null` when the file does not fit. A relative `path` resolves against the working directory. |
-| `scan(signal)` | Sends `found` for each file on disk that fits, in name order. Reads only the folders of the pattern. A missing folder has no files. Follows symlinks. Throws for every other error. |
+| `scan(signal)` | Sends `found` for each file on disk that fits, in name order. Reads a folder only for a part with a var, and stats only symlinks. A missing folder has no files. Follows symlinks. Throws for every other error. |
 | `receiveArtifactEvent(event)` | `promised` and `produced` of a `FileArtifact` that fits send `found`. `deleted` sends `gone` unless a task still declares the file. `withdrawn` sends `gone` unless the file is on disk. |
 
-The constructor throws for an empty pattern, a pattern with `*` or `**`, and two vars with nothing between them. Each match is `{ vars, data: FileArtifact }`. See [`FileMatcher`](#filematcher-one-match-for-each-file).
+The `stamp` option sets the stamp mode of each `FileArtifact` that the matcher sends. Default `"time"`. The constructor throws for an empty pattern, a pattern with `*` or `**`, a `..` part, a `<` or `>` that does not enclose a valid var name, and two vars with nothing between them. Each match is `{ vars, data: FileArtifact }`. See [`FileMatcher`](#filematcher-one-match-for-each-file).
 
 ## S3 (`dapat/contrib`)
 

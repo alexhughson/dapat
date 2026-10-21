@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test"
 import * as fsPromises from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
-import { Build, Task, type MatchedArtifactEvent } from "../../src/index"
+import { Build, Task, TaskGroup, type MatchedArtifactEvent } from "../../src/index"
 import { FileArtifact, FileMatcher } from "../../contrib/fs"
 import { JsonStore } from "../../contrib/store"
 
@@ -75,6 +75,50 @@ describe("FileMatcher pattern", () => {
     expect(() => new FileMatcher("content/<a><b>.md")).toThrow("have nothing between them")
     expect(() => new FileMatcher("")).toThrow("the pattern is empty")
     expect(() => new FileMatcher(".")).toThrow("names no file")
+  })
+
+  test("throws for a '<' or '>' that does not enclose a valid var name", () => {
+    const message = "must enclose a var name"
+    expect(() => new FileMatcher("content/<lang-x>.md")).toThrow(message)
+    expect(() => new FileMatcher("content/<1>.md")).toThrow(message)
+    expect(() => new FileMatcher("content/<>.md")).toThrow(message)
+    expect(() => new FileMatcher("content/a>b.md")).toThrow(message)
+    expect(() => new FileMatcher("content/<slug.md")).toThrow(message)
+  })
+
+  test("throws for a '..' part, also one that removes a var", () => {
+    const message = "a '..' part is not allowed"
+    expect(() => new FileMatcher("a/<x>/../b.md")).toThrow(message)
+    expect(() => new FileMatcher("../shared/<slug>.md")).toThrow(message)
+    expect(() => new FileMatcher("/abs/../<slug>.md")).toThrow(message)
+  })
+
+  test("an absolute pattern has the root '/'", async () => {
+    const root = await tempDir()
+    await writeText(path.join(root, "posts", "a.md"), "")
+    const matcher = new FileMatcher(`${root}/./posts/<slug>.md`)
+    expect(matcher.root).toBe("/")
+    expect(matcher.pattern).toBe(`${root}/posts/<slug>.md`)
+    const events = recordEvents(matcher, root)
+    await matcher.scan(new AbortController().signal)
+    expect(events).toEqual(["found slug=a posts/a.md"])
+  })
+
+  test("a var never takes '..': a file outside the root of a relative pattern does not fit", async () => {
+    const parent = await tempDir()
+    const project = path.join(parent, "project")
+    await writeText(path.join(parent, "notes.txt"), "")
+    await writeText(path.join(project, "docs", "intro.txt"), "")
+    process.chdir(project)
+    const matcher = new FileMatcher("<dir>/<name>.txt")
+    process.chdir(startFolder)
+    const events = recordEvents(matcher, project)
+    await matcher.scan(new AbortController().signal)
+    const outside = new FileArtifact(path.join(parent, "notes.txt"))
+    const twoUp = new FileArtifact(path.join(parent, "..", "x.txt"))
+    matcher.receiveArtifactEvent({ kind: "promised", output: outside, taskId: "write" })
+    matcher.receiveArtifactEvent({ kind: "produced", artifact: twoUp, taskId: "write" })
+    expect(events).toEqual(["found dir=docs name=intro docs/intro.txt"])
   })
 
   test("a relative pattern resolves against the working directory when you create the matcher", async () => {
@@ -171,6 +215,38 @@ describe("FileMatcher artifact events", () => {
       "found slug=new posts/new.md",
       "gone slug=new",
     ])
+  })
+
+  test("a file with no match keeps no record", async () => {
+    const root = await tempDir()
+    const matcher = new FileMatcher(path.join(root, "posts/<slug>.md"))
+    const events = recordEvents(matcher, root)
+    await matcher.scan(new AbortController().signal)
+    for (let index = 0; index < 1000; index++) {
+      const post = new FileArtifact(path.join(root, "posts", `p${index}.md`))
+      matcher.receiveArtifactEvent({ kind: "deleted", artifact: post, taskId: "clean" })
+      matcher.receiveArtifactEvent({ kind: "withdrawn", output: post, taskId: "write" })
+    }
+    const kept = new FileArtifact(path.join(root, "posts", "kept.md"))
+    matcher.receiveArtifactEvent({ kind: "promised", output: kept, taskId: "write" })
+    expect(events).toEqual(["found slug=kept posts/kept.md"])
+    // The record map is private. Bracket access reads it here only to show that it does not grow.
+    expect(matcher["knownFiles"].size).toBe(1)
+    matcher.receiveArtifactEvent({ kind: "withdrawn", output: kept, taskId: "write" })
+    expect(matcher["knownFiles"].size).toBe(0)
+  })
+
+  test("an output that moves from one task to another gives gone and then found", async () => {
+    const root = await tempDir()
+    const matcher = new FileMatcher(path.join(root, "posts/<slug>.md"))
+    const events = recordEvents(matcher, root)
+    await matcher.scan(new AbortController().signal)
+    const post = new FileArtifact(path.join(root, "posts", "a.md"))
+    matcher.receiveArtifactEvent({ kind: "promised", output: post, taskId: "first" })
+    // The build sends every withdrawn event of a change before its promised events.
+    matcher.receiveArtifactEvent({ kind: "withdrawn", output: post, taskId: "first" })
+    matcher.receiveArtifactEvent({ kind: "promised", output: post, taskId: "second" })
+    expect(events).toEqual(["found slug=a posts/a.md", "gone slug=a", "found slug=a posts/a.md"])
   })
 
   test("a file that only a task declares is gone when the task withdraws it", async () => {
@@ -295,6 +371,58 @@ describe("FileMatcher in a build", () => {
     expect(taskIds(third.skipped)).toEqual(["html:a", "html:b", "upper:a"])
   })
 
+  test("an output that moves to another task in one step keeps the task of its match", async () => {
+    const root = await tempDir()
+    await writeText(path.join(root, "seed.txt"), "seed")
+    const gate = new FileArtifact(path.join(root, "gate.txt"))
+    const draft = new FileArtifact(path.join(root, "drafts", "x.md"))
+    const writers = new TaskGroup("writers")
+    const build = new MovingBuild()
+    function writer(id: string): Task {
+      return new Task({
+        id,
+        inputs: [gate],
+        outputs: [draft],
+        run: async () => {
+          await Bun.write(draft.path, id)
+        },
+      })
+    }
+    build.setTasks(writers, [writer("first-writer")])
+    // "mover" runs first. In one step, it gives the output of "first-writer" to "second-writer".
+    build.add(
+      new Task({
+        id: "mover",
+        inputs: [new FileArtifact(path.join(root, "seed.txt"))],
+        outputs: [gate],
+        run: async () => {
+          await Bun.write(gate.path, "open")
+          build.setTasks(writers, [writer("second-writer")])
+        },
+      }),
+    )
+    const publishedTexts: string[] = []
+    build.each({
+      matchersByName: { draft: new FileMatcher(path.join(root, "drafts/<slug>.md")) },
+      *tasks(vars, matched) {
+        const draftFile = matched.draft.data
+        yield new Task({
+          id: `publish:${vars.slug}`,
+          inputs: [draftFile],
+          run: async () => {
+            publishedTexts.push(await Bun.file(draftFile.path).text())
+          },
+        })
+      },
+    })
+    const result = await build.run()
+    expect(result.success).toBe(true)
+    expect(taskIds(result.executed)).toEqual(["mover", "publish:x", "second-writer"])
+    expect(publishedTexts).toEqual(["second-writer"])
+    // build.each replaces publish:x in the same step: the old task object ends as cancelled "replaced".
+    expect(taskIds(result.cancelled)).toEqual(["first-writer", "publish:x"])
+  })
+
   test("a task that leaves the build during the run removes the tasks of its declared file", async () => {
     const root = await tempDir()
     await writeText(path.join(root, "seed.txt"), "seed")
@@ -343,3 +471,10 @@ describe("FileMatcher in a build", () => {
     expect(publishRuns).toBe(0)
   })
 })
+
+/** A build that sets the tasks of one group in one step, as build.each does. */
+class MovingBuild extends Build {
+  setTasks(group: TaskGroup, tasks: readonly Task[]): void {
+    this.setTasksOfGroups([{ group, tasks }])
+  }
+}

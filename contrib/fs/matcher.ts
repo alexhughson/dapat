@@ -1,3 +1,4 @@
+import type { Dirent } from "node:fs"
 import * as fsPromises from "node:fs/promises"
 import path from "node:path"
 import type { ArtifactEvent } from "../../src/build"
@@ -33,14 +34,12 @@ export class FileMatcher extends Matcher<FileArtifact> {
   /** The absolute folder that the pattern is relative to: the working directory, or `/` for an absolute pattern. */
   readonly root: string
   readonly varNames: readonly string[]
-  /** The stamp mode of each `FileArtifact` that the matcher sends. */
-  readonly stampMode: FileStampMode
+  // The stamp mode of each `FileArtifact` that the matcher sends.
+  private readonly stampMode: FileStampMode
   private readonly keyPattern: KeyPattern
-  // The number of `/`-separated parts of the pattern.
-  private readonly segmentCount: number
-  // The literal folder of the pattern before its first var, relative to the root. Empty or ends with `/`.
-  private readonly staticPrefix: string
-  // Each file that fits the pattern and that the matcher knows about, by absolute path.
+  // One entry for each `/`-separated part of the pattern, in order.
+  private readonly segments: ScanSegment[]
+  // Each file that has a match now, by absolute path. A file with no match has no record.
   private readonly knownFiles = new Map<string, KnownFile>()
 
   constructor(pattern: string, opts?: FileStampOptions) {
@@ -48,9 +47,22 @@ export class FileMatcher extends Matcher<FileArtifact> {
     if (pattern.length === 0) {
       throw new Error("FileMatcher: the pattern is empty")
     }
+    for (const part of pattern.split("/")) {
+      if (part === "..") {
+        throw new Error(
+          `FileMatcher pattern '${pattern}': a '..' part is not allowed; give an absolute pattern, for example from path.resolve`,
+        )
+      }
+    }
+    const textOutsideVars = pattern.replace(VAR_TOKEN, "")
+    if (textOutsideVars.includes("<") || textOutsideVars.includes(">")) {
+      throw new Error(
+        `FileMatcher pattern '${pattern}': each '<' and '>' must enclose a var name of letters, digits, and '_' that does not start with a digit`,
+      )
+    }
     const normalized = path.posix.normalize(pattern)
-    const segments = splitSegments(normalized)
-    if (segments.length === 0) {
+    const segmentTexts = splitSegments(normalized)
+    if (segmentTexts.length === 0) {
       throw new Error(`FileMatcher pattern '${pattern}' names no file`)
     }
     const keyPattern = new KeyPattern(normalized)
@@ -67,40 +79,37 @@ export class FileMatcher extends Matcher<FileArtifact> {
     this.root = root
     this.keyPattern = keyPattern
     this.varNames = keyPattern.varNames
-    this.segmentCount = segments.length
-    this.staticPrefix = keyPattern.staticPrefix()
     this.stampMode = stampMode(opts)
+    this.segments = []
+    for (const text of segmentTexts) {
+      const segmentPattern = new KeyPattern(text)
+      if (segmentPattern.varNames.length === 0) {
+        this.segments.push({ kind: "literal", name: text })
+      } else {
+        this.segments.push({ kind: "vars", pattern: segmentPattern })
+      }
+    }
   }
 
-  /**
-   * The vars of the file at `filePath`, or null when the file does not fit the pattern.
-   * A relative `filePath` resolves against the working directory.
-   */
-  match(filePath: string): Vars | null {
-    const absolutePath = path.resolve(filePath)
-    const relativePath = path.relative(this.root, absolutePath)
+  /** The vars of the file at the absolute `filePath`, or null when the file does not fit the pattern. */
+  private match(filePath: string): Vars | null {
+    const relativePath = path.relative(this.root, filePath)
     if (path.isAbsolute(relativePath)) return null
+    // The pattern has no '..' part, so a file outside the root never fits. A var must not take '..'.
+    if (relativePath === "..") return null
+    if (relativePath.startsWith(`..${path.sep}`)) return null
     const key = relativePath.split(path.sep).join("/")
     return this.keyPattern.match(key)
   }
 
   /**
    * Reads the folders of the pattern and sends `found` for each file that fits it.
+   * It joins a literal part to the path with no read, and reads a folder only for a part with a var.
    * A folder that does not exist has no files. A symlink to a file counts as that file.
    */
   async scan(signal: AbortSignal): Promise<void> {
     const filePaths: string[] = []
-    const prefixSegmentCount = splitSegments(this.staticPrefix).length
-    const depthBelowPrefix = this.segmentCount - prefixSegmentCount
-    if (depthBelowPrefix === 0) {
-      // The pattern has no var, so it names one file.
-      const filePath = path.join(this.root, this.pattern)
-      const kind = await kindOfPath(filePath)
-      if (kind === "file") filePaths.push(filePath)
-    } else {
-      const startFolder = path.join(this.root, this.staticPrefix)
-      await collectFiles(startFolder, depthBelowPrefix, filePaths, signal)
-    }
+    await collectFiles(this.root, this.segments, 0, filePaths, signal)
     if (signal.aborted) return
     for (const filePath of filePaths) {
       const known = this.knownFileFor(filePath)
@@ -158,12 +167,21 @@ export class FileMatcher extends Matcher<FileArtifact> {
       this.send({ kind: "found", matched: { vars: known.vars, data: file } })
       return
     }
-    if (!hasMatch && known.sent) {
+    if (hasMatch) return
+    // A file with no match needs no record. A later event makes a new one.
+    this.knownFiles.delete(known.filePath)
+    if (known.sent) {
       known.sent = false
       this.send({ kind: "gone", vars: known.vars })
     }
   }
 }
+
+/** A var token of KeyPattern: `<` and a name of letters, digits, and `_` that does not start with a digit, and `>`. */
+const VAR_TOKEN = /<[A-Za-z_][A-Za-z0-9_]*>/g
+
+/** One part of the pattern: a literal name, or a part with one or more vars. */
+type ScanSegment = { kind: "literal"; name: string } | { kind: "vars"; pattern: KeyPattern }
 
 function splitSegments(pattern: string): string[] {
   const segments: string[] = []
@@ -176,30 +194,64 @@ function splitSegments(pattern: string): string[] {
 }
 
 /**
- * Adds to `filePaths` each file that is `depth` levels below `folder`, in name order.
+ * Adds to `filePaths` each file below `folder` that fits `segments` from `index` on, in name order.
+ * A literal part is joined with no read. A part with vars reads the folder, and stats only symlinks.
+ * The name check of a part is only a filter: `match` checks the whole path later, for a var that comes twice.
  * A folder that is missing, or that is not a folder, adds no file.
  */
-async function collectFiles(folder: string, depth: number, filePaths: string[], signal: AbortSignal): Promise<void> {
+async function collectFiles(
+  folder: string,
+  segments: readonly ScanSegment[],
+  index: number,
+  filePaths: string[],
+  signal: AbortSignal,
+): Promise<void> {
   if (signal.aborted) return
-  let names: string[]
+  const segment = segments[index]!
+  const isLast = index === segments.length - 1
+  if (segment.kind === "literal") {
+    const childPath = path.join(folder, segment.name)
+    if (!isLast) {
+      await collectFiles(childPath, segments, index + 1, filePaths, signal)
+      return
+    }
+    const kind = await kindOfPath(childPath)
+    if (kind === "file") filePaths.push(childPath)
+    return
+  }
+  let entries: Dirent[]
   try {
-    names = await fsPromises.readdir(folder)
+    entries = await fsPromises.readdir(folder, { withFileTypes: true })
   } catch (error) {
-    if (isMissingFolder(error)) return
+    if (isMissingPath(error)) return
     throw error
   }
-  names.sort()
-  for (const name of names) {
-    const fullPath = path.join(folder, name)
-    const kind = await kindOfPath(fullPath)
-    if (depth === 1) {
-      if (kind === "file") filePaths.push(fullPath)
+  entries.sort(compareNames)
+  for (const entry of entries) {
+    if (segment.pattern.match(entry.name) === null) continue
+    const childPath = path.join(folder, entry.name)
+    let kind: "file" | "folder" | "other" = "other"
+    if (entry.isSymbolicLink()) {
+      kind = await kindOfPath(childPath)
+    } else if (entry.isFile()) {
+      kind = "file"
+    } else if (entry.isDirectory()) {
+      kind = "folder"
+    }
+    if (isLast) {
+      if (kind === "file") filePaths.push(childPath)
       continue
     }
     if (kind === "folder") {
-      await collectFiles(fullPath, depth - 1, filePaths, signal)
+      await collectFiles(childPath, segments, index + 1, filePaths, signal)
     }
   }
+}
+
+function compareNames(left: Dirent, right: Dirent): number {
+  if (left.name < right.name) return -1
+  if (left.name > right.name) return 1
+  return 0
 }
 
 /** "file" or "folder", after symlinks. "other" for a missing path, a broken link, a socket, or a device. */
@@ -208,7 +260,7 @@ async function kindOfPath(fullPath: string): Promise<"file" | "folder" | "other"
   try {
     info = await fsPromises.stat(fullPath)
   } catch (error) {
-    if (isMissingFolder(error)) return "other"
+    if (isMissingPath(error)) return "other"
     if (errorCode(error) === "ELOOP") return "other"
     throw error
   }
@@ -218,7 +270,7 @@ async function kindOfPath(fullPath: string): Promise<"file" | "folder" | "other"
 }
 
 /** True for the errors of a path that is not there, or that goes through a file. */
-function isMissingFolder(error: unknown): boolean {
+function isMissingPath(error: unknown): boolean {
   const code = errorCode(error)
   if (code === "ENOENT") return true
   if (code === "ENOTDIR") return true
