@@ -131,6 +131,8 @@ if (!result.success) {
 
 [examples/file-pipeline.ts](examples/file-pipeline.ts) uses `build.each` and `FileMatcher`. It makes one HTML page for each `content/<lang>/<slug>.md`, with the template `templates/<lang>.html`. It writes sample files when `content/` is missing. Run it two times from an empty folder: the second run skips each page.
 
+[examples/book/](examples/book/README.md) makes a picture book: one page for each sentence of a text, and one image for each page. Each image also reads the image before it. The image step is a substitute for a paid model call, and the test counts how many images each edit draws.
+
 
 
 ## Development
