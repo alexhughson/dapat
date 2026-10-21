@@ -283,6 +283,28 @@ describe("FileMatcher artifact events", () => {
 })
 
 describe("FileMatcher in a build", () => {
+  test("vars with different names do not join: each page gets each banner of its lang", async () => {
+    const root = await tempDir()
+    await writeText(path.join(root, "content", "en", "hello.md"), "")
+    await writeText(path.join(root, "content", "en", "install.md"), "")
+    await writeText(path.join(root, "banners", "en", "blue.png"), "")
+    await writeText(path.join(root, "banners", "en", "red.png"), "")
+    const build = new Build()
+    build.each({
+      matchersByName: {
+        page: new FileMatcher(path.join(root, "content/<lang>/<page>.md")),
+        banner: new FileMatcher(path.join(root, "banners/<lang>/<banner>.png")),
+      },
+      *tasks(vars) {
+        const name = `${vars.lang}/${vars.page}/${vars.banner}`
+        yield new Task({ id: `card:${name}`, outputs: [new FileArtifact(path.join(root, "cards", `${name}.png`))], run: async () => {} })
+      },
+    })
+    const result = await build.run()
+    const executed = taskIds(result.executed)
+    expect(executed).toEqual(["card:en/hello/blue", "card:en/hello/red", "card:en/install/blue", "card:en/install/red"])
+  })
+
   test("pages joined to a template, and the second build skips", async () => {
     const root = await tempDir()
     await writeText(path.join(root, "content", "en", "hello.md"), "Hello")
