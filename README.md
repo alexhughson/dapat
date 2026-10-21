@@ -131,7 +131,7 @@ if (!result.success) {
 
 [examples/file-pipeline.ts](examples/file-pipeline.ts) uses `build.each` and `FileMatcher`. It makes one HTML page for each `content/<lang>/<slug>.md`, with the template `templates/<lang>.html`. It writes sample files when `content/` is missing. Run it two times from an empty folder: the second run skips each page.
 
-[examples/blog/](examples/blog/README.md) is a blog in two languages with one sitemap for each language. Its e2e test shows which tasks run after each edit.
+[examples/blog/](examples/blog/README.md) is a blog in two languages with one sitemap for each language, in 62 lines.
 
 
 ## Development
