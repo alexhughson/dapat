@@ -5,7 +5,7 @@ import path from "node:path"
 import { Build, IdPrefix, Task } from "../../src/index"
 import type { Result } from "../../src/index"
 import { FileArtifact, FilesystemPrefix } from "../../contrib/fs"
-import type { FileStampMode } from "../../contrib/fs"
+import type { FileStampMode, FileStampOptions } from "../../contrib/fs"
 import { JsonStore } from "../../contrib/store"
 
 const temps: string[] = []
@@ -220,7 +220,7 @@ describe("prefix stamps", () => {
 })
 
 describe("prefix layouts that overlap", () => {
-  test("a task that reads pages/ and writes pages/index.html runs on every build", async () => {
+  test('stamp "time": a task that reads pages/ and writes pages/index.html runs on every build', async () => {
     const root = await tempDir()
     const pagesDir = path.join(root, "pages")
     const indexPath = path.join(pagesDir, "index.html")
@@ -234,8 +234,8 @@ describe("prefix layouts that overlap", () => {
       build.add(
         new Task({
           id: "index",
-          inputs: [new FilesystemPrefix(pagesDir)],
-          outputs: [new FileArtifact(indexPath)],
+          inputs: [new FilesystemPrefix(pagesDir, { stamp: "time" })],
+          outputs: [new FileArtifact(indexPath, { stamp: "time" })],
           run: async () => {
             runs += 1
             const names = await readdir(pagesDir)
@@ -265,7 +265,7 @@ describe("prefix layouts that overlap", () => {
     expect(runs).toBe(3)
   })
 
-  test("a new FilesystemPrefix() input whose list() includes the output of its own task also runs on every build", async () => {
+  test('stamp "time": a new FilesystemPrefix() input whose list() includes the output of its own task also runs on every build', async () => {
     const root = await tempDir()
     const pagesDir = path.join(root, "pages")
     const indexPath = path.join(pagesDir, "index.html")
@@ -275,13 +275,13 @@ describe("prefix layouts that overlap", () => {
     let runs = 0
 
     const runOnce = async () => {
-      const pages = new FilesystemPrefix(pagesDir)
+      const pages = new FilesystemPrefix(pagesDir, { stamp: "time" })
       const build = new Build({ store })
       build.add(
         new Task({
           id: "index",
           inputs: [pages],
-          outputs: [new FileArtifact(indexPath)],
+          outputs: [new FileArtifact(indexPath, { stamp: "time" })],
           run: async () => {
             runs += 1
             const files = await pages.list()
@@ -301,7 +301,7 @@ describe("prefix layouts that overlap", () => {
     expect(ids(third.executed)).toEqual(["index"])
   })
 
-  test("two tasks that write into out/ and a reader of out/ run on every build", async () => {
+  test('stamp "time": two tasks that write into out/ and a reader of out/ run on every build', async () => {
     const root = await tempDir()
     const outDir = path.join(root, "out")
     const pagePath = path.join(outDir, "page.html")
@@ -322,8 +322,8 @@ describe("prefix layouts that overlap", () => {
       build.add(
         new Task({
           id: "split",
-          inputs: [new FileArtifact(path.join(root, "book.txt"))],
-          outputs: [new FilesystemPrefix(outDir)],
+          inputs: [new FileArtifact(path.join(root, "book.txt"), { stamp: "time" })],
+          outputs: [new FilesystemPrefix(outDir, { stamp: "time" })],
           run: async () => {
             runs.push("split")
             await mkdir(outDir, { recursive: true })
@@ -334,8 +334,8 @@ describe("prefix layouts that overlap", () => {
       build.add(
         new Task({
           id: "index",
-          inputs: [new FileArtifact(pagePath)],
-          outputs: [new FileArtifact(indexPath)],
+          inputs: [new FileArtifact(pagePath, { stamp: "time" })],
+          outputs: [new FileArtifact(indexPath, { stamp: "time" })],
           run: async () => {
             runs.push("index")
             await writeFile(indexPath, `page.html ${marks}`)
@@ -345,8 +345,8 @@ describe("prefix layouts that overlap", () => {
       build.add(
         new Task({
           id: "list",
-          inputs: [new FilesystemPrefix(outDir)],
-          outputs: [new FileArtifact(listPath)],
+          inputs: [new FilesystemPrefix(outDir, { stamp: "time" })],
+          outputs: [new FileArtifact(listPath, { stamp: "time" })],
           run: async () => {
             runs.push("list")
             const names = await readdir(outDir)
@@ -694,6 +694,126 @@ describe("file stamp modes", () => {
     await rewriteSameBytes(path.join(pagesDir, "a.md"))
     const timed = await runOnce("time")
     expect(timed.executed.length).toBe(1)
+  })
+
+  /**
+   * Runs one build of two tasks. "chunk" writes the first line of book.txt to page.txt.
+   * "draw" reads page.txt and counts its runs, as a paid image task does.
+   * With no mode, each file uses the default stamp.
+   */
+  async function runChunkAndDraw(
+    root: string,
+    store: JsonStore,
+    mode: FileStampMode | undefined,
+    drawRuns: string[],
+  ): Promise<Result> {
+    let opts: FileStampOptions | undefined = undefined
+    if (mode !== undefined) {
+      opts = { stamp: mode }
+    }
+    const book = new FileArtifact(path.join(root, "book.txt"), opts)
+    const page = new FileArtifact(path.join(root, "page.txt"), opts)
+    const image = new FileArtifact(path.join(root, "image.txt"), opts)
+    const build = new Build({ store })
+    build.add(
+      new Task({
+        id: "chunk",
+        inputs: [book],
+        outputs: [page],
+        run: async () => {
+          const text = new TextDecoder().decode(await book.read())
+          const firstLine = text.split("\n")[0]!
+          await writeFile(page.path, firstLine)
+        },
+      }),
+    )
+    build.add(
+      new Task({
+        id: "draw",
+        inputs: [page],
+        outputs: [image],
+        run: async () => {
+          const pageText = new TextDecoder().decode(await page.read())
+          drawRuns.push(pageText)
+          await writeFile(image.path, `image of ${pageText}`)
+        },
+      }),
+    )
+    return build.run()
+  }
+
+  /** Edits book.txt so that chunk runs again and writes the same page.txt. */
+  async function editBookButNotPage(root: string): Promise<void> {
+    await writeFile(path.join(root, "book.txt"), "page one\nnotes v2")
+    // An old modified time on page.txt makes sure that the rewrite gives it a new one.
+    const earlier = new Date(Date.now() - 60_000)
+    await utimes(path.join(root, "page.txt"), earlier, earlier)
+  }
+
+  test("default stamp: a task rewrites its output with the same bytes, and the task that reads it skips", async () => {
+    const root = await tempDir()
+    await writeFile(path.join(root, "book.txt"), "page one\nnotes v1")
+    const store = new JsonStore(path.join(root, "state.json"))
+    const drawRuns: string[] = []
+
+    const first = await runChunkAndDraw(root, store, undefined, drawRuns)
+    expect(ids(first.executed).toSorted()).toEqual(["chunk", "draw"])
+    expect(drawRuns).toEqual(["page one"])
+
+    await editBookButNotPage(root)
+    const second = await runChunkAndDraw(root, store, undefined, drawRuns)
+    expect(second.success).toBe(true)
+    expect(ids(second.executed)).toEqual(["chunk"])
+    expect(ids(second.skipped)).toEqual(["draw"])
+    expect(drawRuns).toEqual(["page one"])
+  })
+
+  test('stamp "time": a task rewrites its output with the same bytes, and the task that reads it runs', async () => {
+    const root = await tempDir()
+    await writeFile(path.join(root, "book.txt"), "page one\nnotes v1")
+    const store = new JsonStore(path.join(root, "state.json"))
+    const drawRuns: string[] = []
+
+    await runChunkAndDraw(root, store, "time", drawRuns)
+    expect(drawRuns).toEqual(["page one"])
+
+    await editBookButNotPage(root)
+    const second = await runChunkAndDraw(root, store, "time", drawRuns)
+    expect(second.success).toBe(true)
+    expect(ids(second.executed).toSorted()).toEqual(["chunk", "draw"])
+    expect(drawRuns).toEqual(["page one", "page one"])
+  })
+
+  test("default stamp: a task that reads pages/ and writes the same pages/index.html skips from build 3", async () => {
+    const root = await tempDir()
+    const pagesDir = path.join(root, "pages")
+    const indexPath = path.join(pagesDir, "index.html")
+    await mkdir(pagesDir)
+    await writeFile(path.join(pagesDir, "a.md"), "A")
+    const store = new JsonStore(path.join(root, "state.json"))
+
+    const runOnce = async () => {
+      const build = new Build({ store })
+      build.add(
+        new Task({
+          id: "index",
+          inputs: [new FilesystemPrefix(pagesDir)],
+          outputs: [new FileArtifact(indexPath)],
+          run: async () => {
+            await writeFile(indexPath, "index of pages")
+          },
+        }),
+      )
+      return build.run()
+    }
+
+    const first = await runOnce()
+    expect(ids(first.executed)).toEqual(["index"])
+    // Build 1 recorded pages/ before index.html was in it.
+    const second = await runOnce()
+    expect(ids(second.executed)).toEqual(["index"])
+    const third = await runOnce()
+    expect(ids(third.skipped)).toEqual(["index"])
   })
 
   test("an unknown stamp mode throws", () => {

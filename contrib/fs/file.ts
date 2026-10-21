@@ -16,7 +16,7 @@ export class FileArtifact extends Artifact<Uint8Array> {
   }
 
   /**
-   * "time": the modified time in nanoseconds and the size. "hash": the SHA-256 hex of the bytes.
+   * "hash" (the default): the SHA-256 hex of the bytes. "time": the modified time in nanoseconds and the size.
    * null when the file is missing. Throws when the path is not a file, and for every other error.
    */
   async stamp(): Promise<string | null> {

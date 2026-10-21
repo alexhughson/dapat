@@ -5,9 +5,10 @@ import { hashLines, sha256Hex } from "../hash"
 
 /**
  * How a file stamp sees a change.
+ * "hash" (the default): the SHA-256 of the bytes. It reads each file in full.
+ *   A rewrite with the same bytes keeps the stamp.
  * "time": the modified time in nanoseconds and the size. Fast: it reads no bytes.
- *   A touch or a git checkout that keeps the bytes still changes the stamp.
- * "hash": the SHA-256 of the bytes. It reads each file in full.
+ *   A touch, a rewrite with the same bytes, or a git checkout still changes the stamp.
  */
 export type FileStampMode = "time" | "hash"
 
@@ -23,9 +24,9 @@ const HASH_BATCH = 8
 // A file larger than this is streamed into the hash, not read whole.
 const STREAM_FROM = 1024 * 1024
 
-/** The stamp mode in `opts`. Default "time". Throws for an unknown mode. */
+/** The stamp mode in `opts`. Default "hash". Throws for an unknown mode. */
 export function stampMode(opts: FileStampOptions | undefined): FileStampMode {
-  const mode = opts?.stamp ?? "time"
+  const mode = opts?.stamp ?? "hash"
   if (mode !== "time" && mode !== "hash") {
     throw new Error(`stamp must be "time" or "hash", not ${JSON.stringify(mode)}`)
   }
