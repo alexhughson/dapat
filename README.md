@@ -77,7 +77,7 @@ Make each change in the table, in order. Run the program after each one.
 
 ## Documentation
 
-Next, read part 1 of the [guide](docs/guide.md). [docs/README.md](docs/README.md) lists every page by goal and defines the core terms. [Troubleshooting](docs/troubleshooting.md) lists problems that give no error message. [examples/README.md](examples/README.md) lists the examples.
+Next, read part 1 of the [guide](docs/guide.md). [docs/README.md](docs/README.md) lists every page by goal, and [Terms](docs/glossary.md) gives the meaning of the main terms. [Troubleshooting](docs/troubleshooting.md) lists problems that give no error message. [examples/README.md](examples/README.md) lists the examples.
 
 ## Development
 

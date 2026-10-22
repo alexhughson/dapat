@@ -25,15 +25,15 @@ A `Build` holds tasks, runs each task after its producers, and saves a record of
 <!-- no-run -->
 ```ts
 class Build extends Emitter<ArtifactEvent> {
-  constructor(opts?: { store?: Store; sendLimit?: number }) // no store: the build calls no stamp(), and no task skips
-  add(task: Task): void // adds the task, or replaces the task with the same id
-  remove(id: string): void // removes the task; with a store, starts store.delete(id); an unknown id does nothing; a build.each task comes back only when build.each makes the tasks of its set again
+  constructor(opts?: { store?: Store; sendLimit?: number })
+  add(task: Task): void
+  remove(id: string): void
   each<M extends Record<string, AnyMatcher>, const R extends keyof M & string = keyof M & string, O extends Record<string, ArtifactTemplate> = {}>(config: TaskMaterializerConfig<M, R, O>): void
-  run(): Promise<Result> // only the first call scans; each call starts the tasks that did not start, waits until no task waits or runs and no store.delete is pending, and resolves with every outcome so far
-  subscribe(listener: (event: ArtifactEvent) => void): void // from Emitter; the listener gets only events sent after this call, so call it before the first run() to get them all
+  run(): Promise<Result>
+  subscribe(listener: (event: ArtifactEvent) => void): void // from Emitter; gets only the events sent after the call
   protected setTasksOfGroups(changes: readonly GroupTasks[]): void // gives each group its whole task list (see TaskGroup)
-  protected send(event: ArtifactEvent): void // from Emitter; the build calls it for each event of its queue; a call from a subclass skips the queue and the send limit
-  protected override rejected(): void // does nothing: the build already failed with the error that send threw
+  protected send(event: ArtifactEvent): void // from Emitter; a direct call skips the queue and send limit
+  protected override rejected(): void // does nothing: the build failed when send threw
 }
 type ArtifactEvent =
   | { kind: "promised"; output: Ref; taskId: string }
@@ -43,11 +43,11 @@ type ArtifactEvent =
 const SEND_LIMIT = 10_000 // the default sendLimit
 ```
 
-- `sendLimit` caps the events that subscribers cause in one pass, and the passes in one drain ([The event queue](semantics.md#the-event-queue), [The send limit](semantics.md#the-send-limit)). It must be a positive integer, or the constructor throws.
-- `add` throws and changes nothing when another task has an [exact output](guide.md#tasks-and-dependencies) of the task, or when the task declares one exact output two times. It also throws when `build.each` or `setTasksOfGroups` already gave a task with this id ([Error messages](#error-messages)).
-- After the first `run()` starts its tasks, `add` starts the task immediately, unless the `Build` has a fatal error. Before that, the task waits, with one exception ([The order rule](semantics.md#the-order-rule)).
+- `constructor`: with no `store`, the build calls no `stamp()`, and no task skips. `sendLimit` caps the events that subscribers cause in one pass, and the passes in one drain ([The event queue](semantics.md#the-event-queue), [The send limit](semantics.md#the-send-limit)). It must be a positive integer, or the constructor throws.
+- `add` adds the task, or replaces the task that has its id. It throws and changes nothing when another task has an [exact output](guide.md#tasks-and-dependencies) of the task, when the task declares one exact output two times, or when `build.each` or `setTasksOfGroups` gave the task that has its id ([Error messages](#error-messages)). Once the first `run()` has started its tasks, `add` starts the task immediately, unless the `Build` has a fatal error; until then, the task waits, with one exception ([The order rule](semantics.md#the-order-rule)).
+- `remove` removes the task, and with a store it starts `store.delete(id)`. An unknown id does nothing. A removed `build.each` task comes back only when `build.each` makes the tasks of its set again.
 - [`each`](build-each.md) makes tasks for each [joined set](guide.md#buildeach) of matches. It throws after the first `run()` starts, or for a bad config.
-- `run()` rejects with the first [fatal error](semantics.md#fatal-errors). [build.run()](semantics.md#buildrun) gives the order of its calls and events.
+- `run()` scans the matchers on the first call only. Each call starts the tasks that have not started, waits until no task waits or runs and no `store.delete` is pending, and resolves with every outcome so far. It rejects with the first [fatal error](semantics.md#fatal-errors). [build.run()](semantics.md#buildrun) gives the order of its calls and events.
 
 ### Task
 
@@ -67,9 +67,9 @@ class Task {
   readonly run: (ctx: Context) => Promise<void>
 }
 interface Context {
-  readonly signal: AbortSignal // aborts with an AbortError when the build replaces or removes the task, or on a fatal error
-  produced(artifact: Artifact): void // sends a produced event; throws when no output is the artifact or covers it
-  deleted(artifact: Artifact): void // sends a deleted event; throws when no output is the artifact or covers it
+  readonly signal: AbortSignal // aborts on replacement, removal or a fatal error
+  produced(artifact: Artifact): void // sends a produced event; throws if no output is the artifact or covers it
+  deleted(artifact: Artifact): void // sends a deleted event; throws if no output is the artifact or covers it
 }
 ```
 
@@ -81,22 +81,22 @@ Extend `Artifact` for one value that a task reads or writes ([artifacts](guide.m
 ```ts
 abstract class Artifact<T = unknown> {
   abstract readonly id: string // the build finds the producers of an input by this string
-  abstract stamp(): Promise<string | null> // null: missing; compared with ===; a throw fails the task
+  abstract stamp(): Promise<string | null> // null if missing; compared with ===; a throw fails the task
   abstract read(): Promise<T> // your task code calls it; the build never does
 }
 ```
 
 ### Prefix
 
-Extend `Prefix` for a group of artifacts, usually the artifacts whose ids start with one id, such as the files in one folder ([Folders: prefixes](guide.md#folders-prefixes), [A prefix for keys with unknown names](write-an-artifact.md#step-2-a-prefix-for-keys-with-unknown-names)). [How the build uses your classes](write-an-artifact.md#how-the-build-uses-your-classes) tells which `covers` and `overlaps` the build calls, and what a throw in them does. [`IdPrefix`](builtins.md#idprefix) has only an id.
+Extend `Prefix` for a group of artifacts, usually the artifacts whose ids start with one id, such as the files in one folder ([Folders: prefixes](guide.md#folders-prefixes), [A prefix for keys with unknown names](write-an-artifact.md#step-2-a-prefix-for-keys-with-unknown-names)). [How the build uses your classes](write-an-artifact.md#how-the-build-uses-your-classes) tells which `covers` and `overlaps` the build calls, what a throw in them does, and what an override costs. [`IdPrefix`](builtins.md#idprefix) has only an id.
 
 <!-- no-run -->
 ```ts
 abstract class Prefix {
   abstract readonly id: string
   stamp(): Promise<string | null> // default: null, so no task that has the prefix skips
-  covers(artifact: Artifact): boolean // default: artifact.id starts with this.id; an override costs more, as an input and as an output
-  overlaps(other: Prefix): boolean // default: one id starts with the other; an override costs more as an input
+  covers(artifact: Artifact): boolean // default: artifact.id starts with this.id
+  overlaps(other: Prefix): boolean // default: one id starts with the other
 }
 class IdPrefix extends Prefix { constructor(readonly id: string) } // keeps the null stamp
 ```
@@ -107,7 +107,7 @@ A [store](guide.md#what-a-build-does) keeps one record, a `TaskState`, for each 
 
 <!-- no-run -->
 ```ts
-interface TaskState { inputStamps: Record<string, string | null>; outputStamps: Record<string, string | null> } // each key is "artifact <id>" or "prefix <id>"; a prefix with a null stamp has no key
+interface TaskState { inputStamps: Record<string, string | null>; outputStamps: Record<string, string | null> } // each key is "artifact <id>" or "prefix <id>"
 interface Store {
   get(taskId: string): Promise<TaskState | null>
   set(taskId: string, state: TaskState): Promise<void>
@@ -123,7 +123,7 @@ class MemoryStore implements Store { constructor() } // a Map in this process
 
 <!-- no-run -->
 ```ts
-type RunReason = // why an executed task ran; the kinds go in the order of the checks
+type RunReason = // the kinds go in the order of the checks
   | { kind: "no-store" } | { kind: "no-inputs" } | { kind: "input-unstamped"; id: string } | { kind: "no-record" }
   | { kind: "input-ids-changed" } | { kind: "input-changed"; id: string }
   | { kind: "output-unstamped"; id: string } | { kind: "output-ids-changed" }
@@ -150,8 +150,8 @@ An `Emitter` calls its [subscribers](guide.md#events) with each event, one at a 
 ```ts
 class Emitter<E> {
   constructor()
-  subscribe(listener: (event: E) => void): void // there is no unsubscribe; a subscriber added during a send gets the next event
-  protected send(event: E): void // a subscriber that throws stops the send, and the caller gets the error
+  subscribe(listener: (event: E) => void): void // a subscriber added during a send gets the next event
+  protected send(event: E): void // a subscriber's throw stops the send and goes to the caller
   protected rejected(reason: unknown): void // default: throws reason again
 }
 ```
@@ -162,33 +162,35 @@ Extend `Matcher` to find artifacts for [`build.each`](guide.md#buildeach) ([Writ
 
 <!-- no-run -->
 ```ts
-type Vars = Readonly<Record<string, string>> // the values of one match by var name; tsc does not check the var names
+type Vars = Readonly<Record<string, string>> // var values by name; tsc does not check the names
 type MatchedData = Artifact | readonly Artifact[]
 type MatchedArtifact<D extends MatchedData = MatchedData> = { vars: Vars; data: D } // one match
 type MatchedArtifactEvent<D extends MatchedData = MatchedData> =
   | { kind: "found"; matched: MatchedArtifact<D> } // a new match, or new data for known vars
   | { kind: "gone"; vars: Vars }
 abstract class Matcher<D extends MatchedData = MatchedData> extends Emitter<MatchedArtifactEvent<D>> {
-  abstract readonly varNames: readonly string[] // the vars of each event that it sends have exactly these names, else run() rejects; build.each reads it when you call build.each
-  abstract scan(signal: AbortSignal): Promise<void> // the first run() calls it; signal aborts on a fatal error; a throw makes run() reject
-  receiveArtifactEvent(event: ArtifactEvent): void // gets each ArtifactEvent of the Build; default: does nothing; a throw makes run() reject
+  abstract readonly varNames: readonly string[]
+  abstract scan(signal: AbortSignal): Promise<void> // the first run() calls it; signal aborts on a fatal error
+  receiveArtifactEvent(event: ArtifactEvent): void // default: does nothing; a throw makes run() reject
   subscribe(listener: (event: MatchedArtifactEvent<D>) => void): void // from Emitter; for example, to log each event
   protected send(event: MatchedArtifactEvent<D>): void // from Emitter: sends one event
 }
-type AnyMatcher = Matcher<any> // tsc does not accept a Matcher<FileArtifact> as a Matcher<MatchedData>
+type AnyMatcher = Matcher<any> // any matcher; a FileMatcher is not a Matcher<MatchedData>
 ```
+
+- `varNames`: `build.each` reads it when you call `build.each`. The vars of each event that the matcher sends must have exactly these names, or `run()` rejects.
 
 ### TaskMaterializerConfig
 
-`TaskMaterializerConfig` is the type of the `build.each` config ([The config](build-each.md#the-config)). tsc rejects a config with both `tasks` and `run`, with neither, or with `run` and no `name`.
+`TaskMaterializerConfig` is the type of the `build.each` config ([The config](build-each.md#the-config)). For a config with both `tasks` and `run`, with neither, or with `run` and no `name`, tsc gives an error, and `build.each` throws.
 
 <!-- no-run -->
 ```ts
 type TaskMaterializerConfig<M extends Record<string, AnyMatcher>, R extends keyof M & string = keyof M & string, O extends Record<string, ArtifactTemplate> = {}> =
-  TasksConfig<M, R, O> | RunConfig<M, R, O> // build.each throws for both, for neither, and for run with no name
+  TasksConfig<M, R, O> | RunConfig<M, R, O>
 type TasksConfig<M extends Record<string, AnyMatcher>, R extends keyof M & string, O extends Record<string, ArtifactTemplate>> = {
-  matchersByName: M; required?: readonly R[]; outputsByName?: O // with no required, every matcher is required; outputsByName: the output templates by name
-  tasks: (vars: JoinedVars<M, R>, matched: MatchedByName<M, R>, outputs: OutputsByName<O>) => Iterable<Task> // called for each new or changed joined set; can return no task
+  matchersByName: M; required?: readonly R[]; outputsByName?: O // with no required list, every matcher is required
+  tasks: (vars: JoinedVars<M, R>, matched: MatchedByName<M, R>, outputs: OutputsByName<O>) => Iterable<Task> // for each new or changed joined set; can return no task
   name?: never; run?: never
 }
 type RunConfig<M extends Record<string, AnyMatcher>, R extends keyof M & string, O extends Record<string, ArtifactTemplate>> = { // one task for each set
@@ -198,10 +200,12 @@ type RunConfig<M extends Record<string, AnyMatcher>, R extends keyof M & string,
   tasks?: never
 }
 type RunArgs<M extends Record<string, AnyMatcher>, R extends keyof M & string, O extends Record<string, ArtifactTemplate>> = { vars: JoinedVars<M, R>; matched: MatchedByName<M, R>; outputs: OutputsByName<O>; ctx: Context }
-type JoinedVars<M extends Record<string, AnyMatcher>, R extends keyof M & string = keyof M & string> // Vars when R names every matcher; else Readonly<Record<string, string | undefined>>
-type MatchedByName<M extends Record<string, AnyMatcher>, R extends keyof M & string = keyof M & string> // readonly; for each name, a MatchedArtifact with the data type of that matcher (FileArtifact for a FileMatcher); | undefined for a name not in R
-type OutputsByName<O extends Record<string, ArtifactTemplate>> // readonly; for each name, the type that its template gives, such as FileArtifact for a FileTemplate
+type JoinedVars<M extends Record<string, AnyMatcher>, R extends keyof M & string = keyof M & string> // Vars if R names every matcher; else values can be undefined
+type MatchedByName<M extends Record<string, AnyMatcher>, R extends keyof M & string = keyof M & string>
+type OutputsByName<O extends Record<string, ArtifactTemplate>> // readonly; for each name, the type that its template gives
 ```
+
+- `MatchedByName` has a readonly property for each matcher name. Its type is a `MatchedArtifact` with the data type of that matcher, such as `FileArtifact` for a `FileMatcher`, and it can be `undefined` for a name that is not in `R`.
 
 ### ArtifactTemplate
 
@@ -210,10 +214,12 @@ Write an `ArtifactTemplate` for an output of your own artifact type in `outputsB
 <!-- no-run -->
 ```ts
 interface ArtifactTemplate<R extends Ref = Ref> {
-  readonly varNames: readonly string[] // build.each calls expand only for a set with a value for each name
-  expand(vars: Vars): R // build.each calls it with every var of the joined set, not only varNames, and does not check the values; a throw makes run() reject
+  readonly varNames: readonly string[] // the var names that expand reads
+  expand(vars: Vars): R
 }
 ```
+
+- `expand`: `build.each` calls it only for a joined set that has a value for each name in `varNames`. It gets every var of the set, not only those in `varNames`, and `build.each` does not check the values. A throw makes `run()` reject.
 
 ### TaskGroup
 
@@ -221,7 +227,7 @@ A `TaskGroup` names one [task group](semantics.md#subclass-build-settasksofgroup
 
 <!-- no-run -->
 ```ts
-class TaskGroup { constructor(readonly label: string) } // each object is one group; the label shows only in error messages
+class TaskGroup { constructor(readonly label: string) } // one group per object; the label is for error messages
 type GroupTasks = { group: TaskGroup; tasks: readonly Task[] } // one group and its whole new task list
 ```
 
@@ -237,10 +243,10 @@ type FileStampMode = "time" | "hash"
 interface FileStampOptions { stamp?: FileStampMode }
 class FileArtifact extends Artifact<Uint8Array> {
   constructor(p: string, opts?: FileStampOptions)
-  readonly path: string // the absolute path: p resolved against the current folder at construction, with no "/" at the end
+  readonly path: string // p resolved at construction, with no "/" at the end
   readonly id: string // "file:" + path
   readonly stampMode: FileStampMode
-  stamp(): Promise<string | null> // null for a missing file; throws `not a file: <path>` for a folder or a FIFO; throws ENOTDIR for a path through a file, such as out.txt/x
+  stamp(): Promise<string | null> // null for a missing file; throws for a folder or a FIFO
   read(): Promise<Uint8Array> // for a missing file, it throws ENOENT
 }
 ```
@@ -253,11 +259,11 @@ class FileArtifact extends Artifact<Uint8Array> {
 ```ts
 class FilesystemPrefix extends Prefix {
   constructor(p: string, opts?: FileStampOptions)
-  readonly path: string // the absolute path: p resolved against the current folder at construction, with a "/" at the end
+  readonly path: string // p resolved at construction, with a "/" at the end
   readonly id: string // "file:" + path
   readonly stampMode: FileStampMode
   stamp(): Promise<string | null> // never null; throws ENOTDIR when p is a file
-  list(): Promise<string[]> // the absolute path of each file at any depth, not sorted; [] for a missing folder; throws ENOTDIR when p is a file; the build never calls it
+  list(): Promise<string[]> // absolute file paths at any depth, unsorted; [] if missing
 }
 ```
 
@@ -270,26 +276,26 @@ class FilesystemPrefix extends Prefix {
 interface FilePatternSyntax { varStart?: string; varEnd?: string; anyName?: string; anyFolders?: string } // defaults "<", ">", "*", "**"
 interface FilePatternOptions extends FileStampOptions { syntax?: FilePatternSyntax }
 class FileMatcher extends Matcher<FileArtifact> {
-  constructor(pattern: string, opts?: FilePatternOptions) // throws for a bad pattern, syntax or stamp; see Error messages
+  constructor(pattern: string, opts?: FilePatternOptions) // throws for a bad pattern, syntax or stamp
   readonly pattern: string // the pattern after path.posix.normalize
-  readonly root: string // the current folder at construction, or "/" for an absolute pattern
+  readonly root: string // "/" for an absolute pattern, else the current folder
   readonly varNames: readonly string[] // each var one time, in the order of the pattern
   scan(signal: AbortSignal): Promise<void> // sends found for each file that fits
-  receiveArtifactEvent(event: ArtifactEvent): void // starts or ends the match of a FileArtifact that fits, by the rules of Matches during the run
+  receiveArtifactEvent(event: ArtifactEvent): void // starts or ends the match of a FileArtifact that fits
 }
 ```
 
 ### FileGroupMatcher
 
-`new FileGroupMatcher(pattern, opts)` takes a pattern with a `*` or `**` (the `anyName` or `anyFolders` of its syntax), such as `content/<lang>/**/*.md`. It makes one match for each value of its vars. The data is the list of the files that fit, sorted by path ([FileGroupMatcher](build-each.md#filegroupmatcher)).
+`new FileGroupMatcher(pattern, opts)` takes a pattern with a `*` or `**` (the `anyName` or `anyFolders` of its syntax) and with each var in a part before the first `*` or `**`, such as `content/<lang>/**/*.md`. It makes one match for each value of its vars. The data is the list of the files that fit, sorted by path ([FileGroupMatcher](build-each.md#filegroupmatcher)).
 
 <!-- no-run -->
 ```ts
 class FileGroupMatcher extends Matcher<readonly FileArtifact[]> {
-  constructor(pattern: string, opts?: FilePatternOptions) // throws for a bad pattern, syntax or stamp, for a pattern with no * or **, and for a var at or after the first * or **; see Error messages
+  constructor(pattern: string, opts?: FilePatternOptions) // throws for a bad pattern, syntax or stamp
   readonly pattern: string; readonly root: string; readonly varNames: readonly string[] // as in FileMatcher
   scan(signal: AbortSignal): Promise<void> // sends one found for each list after the whole scan
-  receiveArtifactEvent(event: ArtifactEvent): void // the FileMatcher rules for each file; sends found with the new list, or gone when the list is empty
+  receiveArtifactEvent(event: ArtifactEvent): void // sends found with the new list, or gone for an empty one
 }
 ```
 
@@ -303,7 +309,7 @@ class FileTemplate implements ArtifactTemplate<FileArtifact> {
   constructor(pattern: string, opts?: FilePatternOptions) // throws for a bad pattern or syntax; does not check stamp
   readonly pattern: string // the pattern after path.posix.normalize
   readonly varNames: readonly string[] // each var one time, in the order of the pattern
-  expand(vars: Vars): FileArtifact // throws for a var value that is empty, ".", ".." or holds "/", for a missing var, and for a bad stamp
+  expand(vars: Vars): FileArtifact // throws for a bad var value, a missing var or a bad stamp
 }
 class FolderTemplate implements ArtifactTemplate<FilesystemPrefix> {
   constructor(pattern: string, opts?: FilePatternOptions) // as FileTemplate
@@ -314,7 +320,7 @@ class FolderTemplate implements ArtifactTemplate<FilesystemPrefix> {
 
 ### JsonStore and SqliteStore
 
-`new JsonStore(path)` keeps all records in one JSON file. `new SqliteStore(db)` keeps each record in one row of the SQLite table `dapat_task_state` ([Stores](builtins.md#stores)).
+`JsonStore` and `SqliteStore` each implement [`Store`](#store) (`get`, `set`, `delete`, `clear`). `new JsonStore(path)` keeps all records in one JSON file, and `new SqliteStore(db)` keeps each record in one row of the SQLite table `dapat_task_state` ([Stores](builtins.md#stores)).
 
 <!-- no-run -->
 ```ts
@@ -347,13 +353,13 @@ class S3ObjectArtifact extends Artifact<Uint8Array> { // the artifact for one S3
 }
 class S3Prefix extends Prefix { // the prefix for the keys of one bucket under keyPrefix
   constructor(readonly client: S3Client, readonly bucket: string, readonly keyPrefix: string)
-  readonly id: string // "s3://<bucket>/<keyPrefix>/"; the constructor adds no "/" to "" or to a keyPrefix that ends with "/"
-  stamp(): Promise<string | null> // never null; one client.list call, with the id after "s3://<bucket>/" as the prefix; throws for an entry that is not a { key, etag } object
+  readonly id: string // "s3://<bucket>/<keyPrefix>", always ending with "/"
+  stamp(): Promise<string | null> // never null; one client.list call
 }
 class MemoryS3 implements S3Client {
   constructor()
   head(bucket: string, key: string): Promise<S3Head | null> // null for a missing key
-  get(bucket: string, key: string): Promise<Uint8Array> // the array that put got, not a copy; throws `missing s3://<bucket>/<key>`
+  get(bucket: string, key: string): Promise<Uint8Array> // the array that put got, not a copy; throws if missing
   put(bucket: string, key: string, body: Uint8Array): Promise<S3Head> // the etag is the SHA-256 hash of body, in hex
   list(bucket: string, prefix: string): Promise<S3ListEntry[]> // sorted by key
 }
@@ -363,18 +369,16 @@ class MemoryS3 implements S3Client {
 
 This table gives the exact text of each error message of dapat, and of some messages from Bun. In the messages:
 
-- `<…>` is a value from your build.
-- `<class>` is `FileMatcher`, `FileGroupMatcher`, `FileTemplate` or `FolderTemplate`.
-- In the pattern messages, `'<'`, `'>'`, `'*'`, `'**'` and `<name>` are the default markers. A `syntax` option puts its own markers there.
-- `<group>` is the label of a task group, such as `build.add <id>` or `build.each 1 lang=en`. A `build.each` label holds `<n>`, then the vars of the set in the order of `vars`.
-- `<n>` is the number of the `build.each` call, counted from 1 over the calls that did not throw.
+- `<…>` is a value from your build. `<class>` is `FileMatcher`, `FileGroupMatcher`, `FileTemplate` or `FolderTemplate`.
+- `<n>` is the number of the `build.each` call. The count starts at 1 and skips each call that threw. `<group>` is the label of a [task group](semantics.md#subclass-build-settasksofgroups): `build.add <id>` for a task of `build.add`, `build.each <n>` and the vars of the set for a task of `build.each`, such as `build.each 1 lang=en`, or the label of your own `TaskGroup`.
+- The pattern messages show the default markers `<`, `>`, `*` and `**`. With a `syntax` option, a message shows your markers.
 
-The Where column tells where your code gets the error, and the rows go in the order of this list:
+The Where column says how the error reaches your code, and the table sorts its rows by this column, in this order:
 
 - call throws: the call changes nothing.
-- call throws, or `run()` rejects: `build.add`, or `setTasksOfGroups` with no open step, throws and changes nothing. For the tasks that `build.each` gives, or a `setTasksOfGroups` call in an [open step](semantics.md#steps), `run()` rejects.
+- call throws, or `run()` rejects: `build.add` throws and changes nothing, and so does `setTasksOfGroups` when no step is open. For a task from `build.each`, or a `setTasksOfGroups` call in an [open step](semantics.md#steps), `run()` rejects.
 - task fails: `result.failed` holds the error.
-- `run()` rejects: the error is a fatal error.
+- `run()` rejects: the error is a [fatal error](semantics.md#fatal-errors).
 - `result.errors`: `result.errors` holds the error, and no task fails.
 
 | Message | Where | Cause | See |

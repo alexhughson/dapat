@@ -1,6 +1,6 @@
 # Guide
 
-This page defines the terms of dapat and shows how a build orders and skips tasks. Part 1 covers tasks that you add with `build.add`. Part 2, from [build.each](#buildeach) on, covers `build.each`, events and the [layout rules](#layout-rules). Read the [README example](../README.md#example) first, because this page uses its program.
+This page defines the terms of dapat and shows how a build orders and skips tasks. Part 1 covers tasks that you add with `build.add`. Part 2 starts at [build.each](#buildeach) and covers `build.each`, events and the [layout rules](#layout-rules). Read the [README example](../README.md#example) first, because this page uses its program.
 
 ## What a build does
 
@@ -13,15 +13,15 @@ A **task** has these fields:
 - `outputs`: the artifacts that the task writes.
 - `run`: your function that reads the inputs and writes the outputs.
 
-A task **declares** the artifacts in its `inputs` and `outputs`. A **build** is one run of the tasks of one `Build` object: make a new `Build`, add tasks with `build.add`, and call `run()` one time. In a build, each task **finishes** in one of four ways: executed, skipped, failed or cancelled ([Results and failure](#results-and-failure)).
+A task **declares** the artifacts in its `inputs` and `outputs`. A **build** is one run of your tasks: make a new `Build`, add tasks with `build.add`, and call `run()`. In a build, each task **finishes** in one of four ways: executed, skipped, failed or cancelled ([Results and failure](#results-and-failure)).
 
 A **producer** of an input is another task that declares the input as an output. A task runs only after each producer of its inputs finishes. In the README program, `upper` is the producer of `mid.txt`, so `wrap` waits for `upper`.
 
-The **stamp** of an artifact is a string that changes when the artifact changes, or `null` when the artifact is missing. A **store** keeps one **record** for each task id between builds: the stamps of the task's inputs and outputs from its last successful run. A task with inputs **skips** only when the current stamps of its inputs and outputs equal its record. Then the build does not call its `run` function ([the skip rule](#the-skip-rule)). After a successful run of a task, the build stamps its outputs and saves a new record.
+The **stamp** of an artifact is a string that changes when the artifact changes, or `null` when the artifact is missing. A **store** keeps one **record** for each task id between builds: the stamps of the task's inputs and outputs from its last successful run. When a task **skips**, the build does not call its `run` function. A task skips only when it has inputs and the current stamps of its inputs and outputs equal its record ([the skip rule](#the-skip-rule)). After a successful run of a task, the build stamps its outputs and saves a new record.
 
 ## Artifacts and stamps
 
-Use a `FileArtifact` from `dapat/contrib` for one file. For an S3 object, use an [`S3ObjectArtifact`](builtins.md#s3). For another value, [write an artifact type](write-an-artifact.md). The second argument of `new FileArtifact(path, { stamp })` sets the **stamp mode**: which changes to a file give a new stamp ([Hash or time](builtins.md#hash-or-time)).
+Use a `FileArtifact` from `dapat/contrib` for one file. For an S3 object, use an [`S3ObjectArtifact`](builtins.md#s3). For another value, [write an artifact type](write-an-artifact.md). The second argument of `new FileArtifact(path, { stamp })` sets the **stamp mode**. The mode decides which file changes give a new stamp ([Hash or time](builtins.md#hash-or-time)).
 
 | Mode | Stamp | After a `touch`, or a rewrite with the same bytes |
 | --- | --- | --- |
@@ -41,11 +41,11 @@ When the current folder is `/home/me/project`, `new FilesystemPrefix("chapters")
 
 ## Tasks and dependencies
 
-You make a task with `new Task({ id, inputs, outputs, run })`. `inputs` and `outputs` are optional arrays of artifacts or [prefixes](#folders-prefixes). `run` gets one argument, [`ctx`](#outputs-with-unknown-names), and returns a promise. Tasks that do not wait for each other run at the same time. Before `run()`, the order of the `build.add` calls has no effect ([the order rule](semantics.md#the-order-rule)).
+You make a task with `new Task({ id, inputs, outputs, run })`. `inputs` and `outputs` are optional arrays of artifacts or [prefixes](#folders-prefixes). `run` gets one argument, [`ctx`](#outputs-with-unknown-names), and returns a promise. Tasks that do not wait for each other run at the same time. The order of the `build.add` calls before `build.run()` has no effect ([the order rule](semantics.md#the-order-rule)).
 
-An **exact output** is an output that is an artifact, not a prefix. Only one task can declare a given exact output, so `build.add` throws for a task with another id that declares it.
+An **exact output** is an output that is an artifact, not a prefix. Only one task can declare a given exact output: when a task with another id declares it too, `build.add` throws.
 
-To **replace** a task, call `build.add` with a new task that has the same id. `build.add` gives no error, so give each task its own id. To **remove** a task, call `build.remove(id)` ([Replacement and removal](semantics.md#replacement-and-removal)).
+To **replace** a task, call `build.add` with a new task that has the same id. `build.add` gives no warning when it replaces a task, so give each task its own id. To **remove** a task, call `build.remove(id)` ([Replacement and removal](semantics.md#replacement-and-removal)).
 
 ## The skip rule
 
@@ -93,7 +93,7 @@ await runBuild("4. out.txt edited")
 4. out.txt edited   copy executed (output-changed)
 ```
 
-The **skip rule** is five checks, which the build makes after the producers of the task finish. At the first check that fails, the task runs, and `result.outcomes` gives the **reason** of that check. With no store, every task runs, with the reason `no-store`.
+The **skip rule** is five checks, which the build makes after the producers of the task finish. At the first check that fails, the task runs, and `result.outcomes` gives the **reason** that the table names for that check. With no store, every task runs, with the reason `no-store`.
 
 | # | The task skips only when | Else the reason is |
 | --- | --- | --- |
@@ -210,28 +210,15 @@ failed use-a: dependency of 'use-a' failed
 | `errors` | errors that belong to no task, from a replacement or a removal ([all cases](api.md#error-messages)) |
 
 - A failed task does not stop the other tasks. The build does not call the `run` function of `use-a`, and its error names `use-a`, not `make-a`. To find the cause, look in `result.failed` for a message that does not start with `dependency of`.
-- `run()` rejects only for a **fatal error**: an error after which no more tasks start. `build.subscribe` and `build.each` can cause one ([Fatal errors](semantics.md#fatal-errors)).
+- `run()` rejects only for a **fatal error**: an error after which no more tasks start. A subscriber or a `build.each` call can cause one ([Fatal errors](semantics.md#fatal-errors)).
 
 ---
 
-You can stop here. Part 1 is enough for a build whose tasks you add with `build.add`. Before a task writes in a folder that it reads or that another task writes, read the [layout rules](#layout-rules). Before you ship the program, read the [checklist](#before-you-ship).
+You can stop here. Part 1 is enough for a build whose tasks you add with `build.add`. Read the [layout rules](#layout-rules) before you let a task write in a folder that it reads, or in a folder that another task writes. Before you ship the program, read the [checklist](#before-you-ship).
 
 ## build.each
 
-`build.each` makes tasks from the artifacts that matchers find, so a new file gets its tasks with no code change.
-
-- A **matcher**, such as `FileMatcher`, finds artifacts and gives each one **vars**: names with string values. `new FileMatcher("content/<lang>/<slug>.md")` gives `content/en/hello.md` the vars `{ lang: "en", slug: "hello" }`.
-- A **match** is the vars and the **data**: for a `FileMatcher`, the `FileArtifact` of the file.
-- A **joined set** holds one match of each matcher. When two matches share a var name, they have the same value for it.
-
-In the **one-task form**, `build.each({ name, matchersByName, outputsByName, run })` makes one task for each joined set:
-
-- `id`: `name`, a `:`, and the var values joined by `/`, such as `page:en/hello`.
-- `inputs`: the data of each match.
-- `outputs`: each **output template** of `outputsByName`, filled in with the vars of the set, such as `new FileTemplate("site/<lang>/<slug>.html")`.
-- `run`: gets `{ vars, matched, outputs, ctx }`. `matched` and `outputs` hold each match and each output under its name.
-
-In this program, `page` and `template` share the var `lang`, so each page joins the template of its `lang`. In build 1, `de/hallo` has no template, so it gets no task:
+`build.each` makes tasks from the files that fit your patterns, so a new file gets its tasks with no code change. This program makes `site/<lang>/<slug>.html` from each page `content/<lang>/<slug>.md` and the template `templates/<lang>.html` of its language. In build 1, `de/hallo` has no template, so it gets no task:
 
 ```ts
 import { Build, MemoryStore } from "dapat"
@@ -275,23 +262,32 @@ await runBuild("2. templates/de.html added")
 2. templates/de.html added  ran [page:de/hallo] skipped [page:en/about page:en/hello]
 ```
 
+The program shows each part of `build.each`:
+
+- A **matcher** finds artifacts: `new FileMatcher("content/<lang>/<slug>.md")` finds each page file.
+- A matcher gives each artifact **vars**, which are names with string values: `content/en/hello.md` gets `{ lang: "en", slug: "hello" }`.
+- A **match** is one result of a matcher: its vars and its **data**. For a `FileMatcher`, the data is the `FileArtifact` of the file, such as `matched.page.data`.
+- A **joined set** holds one match of each matcher, and two matches in it have the same value for each var that both have. Here `page` and `template` share `lang`, so each page joins the template of its language.
+- The **one-task form**, `build.each({ name, matchersByName, outputsByName, run })`, makes one task for each joined set. The task id is `name`, a `:`, and the var values joined by `/`, such as `page:en/hello`. The task inputs are the data of each match.
+- An **output template** in `outputsByName` names an output of each task with the vars of its set: `new FileTemplate("site/<lang>/<slug>.html")` gives `page:en/hello` the output `site/en/hello.html`.
+- `run` gets `{ vars, matched, outputs, ctx }`. `matched` and `outputs` hold each match and each output under its name, such as `matched.template` and `outputs.html`.
 - To make more than one task for each set, use the **tasks form**: give `tasks(vars, matched, outputs)` in place of `name` and `run` ([the config](build-each.md#the-config)).
-- Call `build.each` before `run()`. At its start, `run()` **scans**: each matcher finds the artifacts that exist now.
-- A file that a task declares or reports gets its tasks in the same `run()` ([matches during the run](build-each.md#matches-during-the-run)).
+
+Call `build.each` before `run()`. When `run()` starts, it **scans**: each matcher finds the artifacts that exist now. A file that a task declares or reports also gets its tasks in the same `run()` ([matches during the run](build-each.md#matches-during-the-run)).
 
 ## Events
 
-An **event** is a message from the build about an output of a task. It has a `kind`, the `taskId` of its task, and an `output` or an `artifact`. A **subscriber** is a function that you give to `build.subscribe`. The build calls each subscriber with each event. Use a subscriber to log a build. A file that another program writes or deletes gets no event.
+An **event** is a message from the build about an output of a task. A **subscriber** is a function that you give to `build.subscribe`, and the build calls it with each event. Use a subscriber to log a build, for example `build.subscribe((event) => console.log(event.kind, event.taskId))`. These two kinds tell what each task declares and writes:
 
 | `kind` | The build sends it when | Field |
 | --- | --- | --- |
 | `promised` | a task declares the output: at the start of `run()`, and later for each new output of a task that is added or replaced | `output`, an artifact or a prefix |
 | `produced` | a task calls `ctx.produced`, or its `run` returns with no error: one event for each exact output that it did not report | `artifact` |
-| `deleted` | a task calls `ctx.deleted` | `artifact` |
-| `withdrawn` | `build.remove` or `build.each` removes the task, or a replacement does not declare the output | `output` |
+
+The build also sends `deleted` for each `ctx.deleted` call, and `withdrawn` when a task no longer declares an output ([Events](semantics.md#events)). A file that another program writes or deletes gets no event.
 
 - Call `build.subscribe` before `run()`, so that the subscriber gets every event.
-- A subscriber must be synchronous. A subscriber that throws or returns a promise, such as an `async` function, causes a [fatal error](#results-and-failure). [Events](semantics.md#events) gives the exact rules.
+- A subscriber must be synchronous. A subscriber that throws or returns a promise, such as an `async` function, causes a [fatal error](#results-and-failure).
 
 ## Layout rules
 
@@ -299,32 +295,32 @@ These rules say where tasks write files. The build does not check them. [Self-fe
 
 ### dapat deletes no file
 
-dapat deletes no output file, because other programs and people also write in your folders. So an **old output**, a file that a task wrote in an earlier build and no task writes now, stays on disk. For example, after you delete `content/en/about.md` in the [build.each](#buildeach) program, `site/en/about.html` stays, and a `FileMatcher` whose pattern fits it still finds it. To delete old outputs, see [the recipe](recipes.md#delete-old-outputs).
+dapat deletes no output file, because other programs and people also write in your folders. So an **old output** stays on disk: a file that a task wrote in an earlier build and that no task writes now. For example, after you delete `content/en/about.md` in the [build.each](#buildeach) program, `site/en/about.html` stays, and a `FileMatcher` whose pattern fits it still finds it. To delete old outputs, see [the recipe](recipes.md#delete-old-outputs).
 
 ### One task writes one folder
 
-Let only the task that declares a folder as its output write in that folder. If another task writes in it, the tasks that declare or read the folder can run again on the next build. With time stamps, they can run on every build. Give each task its own folder, or declare exact outputs in a folder that no task declares.
+Only the task that declares a folder as its output should write in that folder. If another task writes in it, the tasks that declare or read the folder can run again on the next build. With time stamps, they can run on every build. Give each task its own folder, or declare exact outputs in a folder that no task declares.
 
 ### A task that may write nothing declares a folder
 
-A task that may write nothing declares a folder as its output, not an exact output. An exact output that the task does not write has the stamp `null`, so the task runs on every build. A missing or empty folder has a stamp, so with a folder output the task can skip.
+When a task may write nothing, declare a folder as its output, not an exact output. An exact output that the task does not write has the stamp `null`, so the task runs on every build. A missing or empty folder has a stamp, so with a folder output the task can skip.
 
 ### Write an index next to its folder
 
-Write an index, a file that lists a folder, next to that folder, not in it. A task that writes in a folder that it reads runs again on the next build after each run that changes the folder. With time stamps, it runs on every build. For example, `count` writes `count.txt` next to `chapters/` in [Outputs with unknown names](#outputs-with-unknown-names).
+An index is a file that lists a folder. Write it next to the folder, not in it. When a task writes in a folder that it reads, each run that changes the folder makes the task run again on the next build. With time stamps, it runs on every build. For example, `count` writes `count.txt` next to `chapters/` in [Outputs with unknown names](#outputs-with-unknown-names).
 
 ### Keep the store file out of task folders
 
-Keep the `JsonStore` or `SqliteStore` file out of every folder that a task reads or writes. Each saved record changes the store file, and so the stamp of the folder. Then each task that has the folder as an input or an output runs on every build. Put the store file in a folder of its own, such as `.dapat/`.
+Keep the `JsonStore` or `SqliteStore` file out of every folder that a task reads or writes. Each saved record changes the store file, which changes the stamp of the folder, so each task that has the folder as an input or an output runs on every build. Put the store file in a folder of its own, such as `.dapat/`.
 
 ## Before you ship
 
-1. If `result.success` is false, print `result.failed` and `result.errors` ([Results](#results-and-failure)). Then exit with code 1. When `run()` rejects, also exit with code 1. Bun does this when you do not catch the error.
+1. If `result.success` is false, print `result.failed` and `result.errors` ([Results](#results-and-failure)), and exit with code 1. When `run()` rejects, also exit with code 1: Bun does this for you when you do not catch the error.
 2. Use a `JsonStore` or a `SqliteStore`, and [keep its file out of task folders](#keep-the-store-file-out-of-task-folders).
-3. Run the program two times with no change. In the second run, each task must skip, except a task with no inputs or with an `IdPrefix`. For each task that runs, `result.outcomes` gives the [reason](#the-skip-rule).
+3. Run the program two times with no change. In the second run, each task must skip, except a task with no inputs or with an `IdPrefix` input or output. For each task that runs, `result.outcomes` gives the [reason](#the-skip-rule).
 4. Sort ids and paths before you print or compare them. `result.executed` and `result.skipped` are in finish order, and the `list()` of a `FilesystemPrefix` is in file-system order.
 5. Keep the project at one path, in CI too, because file ids are absolute paths ([Files](builtins.md#files)).
 
 ## Next
 
-For a pipeline, read [build.each](build-each.md) and [Built-in artifacts and stores](builtins.md) next. To read or write a value that is not a file, read [Write an artifact type](write-an-artifact.md). [The docs index](README.md) lists every page and the core terms, and the [examples](../examples/README.md) are complete programs.
+For a pipeline, read [build.each](build-each.md) and [Built-in artifacts and stores](builtins.md) next. To read or write a value that is not a file, read [Write an artifact type](write-an-artifact.md). [The docs index](README.md) lists every page, [Terms](glossary.md) gives the meaning of the main terms, and the [examples](../examples/README.md) are complete programs.
