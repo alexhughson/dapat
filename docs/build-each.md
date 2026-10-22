@@ -1,6 +1,6 @@
 # build.each
 
-This page gives the details of `build.each`, output templates, `FileMatcher` and `FileGroupMatcher`. Use it when you write a pattern, name an output with a template, join matchers, make a matcher optional, or write a loop. Read [build.each](guide.md#buildeach) in the guide first. It defines the terms that this page uses.
+This page gives the details of `build.each`, output templates, `FileMatcher` and `FileGroupMatcher`. Read [build.each](guide.md#buildeach) in the guide first. It defines the terms that this page uses.
 
 ## How build.each works
 
@@ -9,19 +9,19 @@ build.each(config)                            throws on a bad config, or after t
 first build.run()                             a later run() on this Build does not scan
 ├─ promised for each declared output          a declared file has a match before the scan
 ├─ all the matchers scan at the same time     if a scan throws, run() rejects; no task starts after the throw
-│  └─ found event → tasks of its joined sets   a set with no value for a template var gets no task
+│  └─ found event → tasks of its joined sets
 ├─ the last scan returns                      if a scan never returns, run() waits forever
-├─ the build adds the tasks of all the sets   run() rejects on a shared id or exact output
+├─ the build adds the tasks of all the sets
 └─ the tasks start                            build.add tasks also wait for this, with one exception
 during the run
 └─ ctx.produced(file with no match) → produced → found event → its tasks → ctx.produced returns
 ```
 
-[Matches during the run](#matches-during-the-run) gives the rules of the last row, and [the order rule](semantics.md#the-order-rule) gives the exception.
+A matcher sends a **`found` event** when it adds a match or changes the data of a match. It sends a **`gone` event** when it removes a match. `build.each` and the matcher's own subscribers get these events, not the subscribers of the `Build`. `build.each` then adds, replaces or removes the tasks of each joined set that holds the match. A task that it replaces or removes before the task finishes is in `result.cancelled`. [Matches during the run](#matches-during-the-run) gives the rules of the last row of the tree, and [the order rule](semantics.md#the-order-rule) gives the exception.
 
 ## The config
 
-`build.each` takes one object. Give `tasks`, or `name` and `run`, not both: `build.each` throws for both or neither.
+`build.each` takes one object, a [`TaskMaterializerConfig`](api.md#taskmaterializerconfig). Give `tasks`, or `name` and `run`, not both: `build.each` throws for both or neither.
 
 | Field | What it holds |
 | --- | --- |
@@ -31,10 +31,10 @@ during the run
 | `name` and `run` | The [one-task form](#the-one-task-form): one task for each set. `name` is the start of each task id. `run({ vars, matched, outputs, ctx })` is the `run` function of the task |
 | `tasks(vars, matched, outputs)` | The tasks form: returns the tasks of one set as an iterable, such as a generator or an array. It can return no task. Put each output of `outputs` in the `outputs` of the task that writes it. The build does not check this. `tasks` must be synchronous. An `async` function or an `async *` generator makes `run()` reject. To act on what a file holds, read the file in `run` |
 
-- If a task of a joined set has the id or an [exact output](guide.md#tasks-and-dependencies) of another task in the `Build`, `run()` rejects, or `build.add` throws when it adds that other task later. In the tasks form, put every var of the set in each task id. Give each task of one set its own id, such as `html:en/hello` and `words:en/hello`.
+- If a task of a joined set has the id or an exact output of another task in the `Build`, `run()` rejects. If that other task comes later, `build.add` throws. In the tasks form, put every var of the set in each task id. Give each task of one set its own id, such as `html:en/hello` and `words:en/hello`.
 - `tasks()` can run more than one time for one set, for example when a file joins the list of a [FileGroupMatcher](#filegroupmatcher) match. During the scans, `tasks()` can also run for a set that a later `found` or `gone` event changes. The build drops those tasks before they start. So keep `tasks()` free of side effects, such as file writes.
-- Several `build.each` calls of one `Build` can share one matcher object, and it scans one time.
-- The build gives each joined set a label: the number of the `build.each` call, counted from 1 over the calls that did not throw, then the vars of the set in the order of `vars`, such as `build.each 1 lang=en slug=hello`. Error messages name a set by its label and call it a group ([task groups](semantics.md#subclass-build-settasksofgroups), [error messages](api.md#error-messages)).
+- Several `build.each` calls of one `Build` can share one matcher object, and it scans one time. Make a new matcher for each `Build`, because `build.each` throws for a matcher that another `Build` uses.
+- Error messages call a joined set a [task group](semantics.md#subclass-build-settasksofgroups) and name it by a label, such as `build.each 1 lang=en slug=hello` ([error messages](api.md#error-messages)).
 
 ## The one-task form
 
@@ -50,68 +50,18 @@ for each joined set
 ```
 
 - `vars` holds the vars of the matchers in `matchersByName` order, the vars of each matcher in `varNames` order (pattern order for `FileMatcher` and `FileGroupMatcher`), each var one time. So a new `matchersByName` order can change the order of the vars, and so the ids. A task with a new id has no record, so it runs again.
-- A var with no value adds no part. So an optional match that comes or goes changes the id of its set ([required](#required) shows such ids). Two sets can also give one id this way, and then `run()` rejects with `is in two groups` ([error messages](api.md#error-messages)). A var value with `/` from your own matcher can do the same. Two `build.each` calls with one `name` can also do the same. So give each call its own `name`.
-- Use the [tasks form](#the-config) for such joins. [Loops](#loops) uses it for an output that no template can name.
+- A var with no value adds no part. So an optional match that comes or goes changes the id of its set ([required](#required) shows such ids).
+- When two sets give one id, `run()` rejects with `is in two groups` ([error messages](api.md#error-messages)). A var with no value, or a var value with `/` from your own matcher, can cause this. Two `build.each` calls with one `name` can also cause it. Give each call its own `name`. For such joins, and for an input or an output that no matcher or template gives, use the [tasks form](#the-config).
 
 ## Output templates
 
 An [output template](guide.md#buildeach) names an output of each joined set with the vars of the set. `FileTemplate` gives a `FileArtifact`, and `FolderTemplate` gives a `FilesystemPrefix`. Both come from `dapat/contrib`. Give them in `outputsByName`.
 
 - `new FileTemplate(pattern, { stamp, syntax })` follows the [FileMatcher](#filematcher) rules, but the pattern has no `*` or `**`: an output names one path. For the book `owl`, `new FolderTemplate("out/<book>")` gives the folder `out/owl/`.
-- Each var of a template must be a var of a matcher, or `build.each` throws. A var that only an optional matcher has is allowed. A set with no match of that matcher has no value for the var, so it gets no task and no error.
-- The `expand` of `FileTemplate` and `FolderTemplate` throws for a var value that is empty, `.` or `..`, or holds `/`, and then `run()` rejects ([known issue 8](limits.md#known-issues-in-010)). It also throws for a bad `stamp`, because the constructor does not check it.
-- Put every var of the set in each template path. When two sets fill a `FileTemplate` with one path, `run()` rejects with `duplicate output`. When they fill a `FolderTemplate` with one path, there is no error, and two tasks write one folder ([layout rules](guide.md#layout-rules)).
-- For an output of your own artifact type, write a class that implements [`ArtifactTemplate<YourType>`](api.md#artifacttemplate), with `varNames` and `expand(vars: Vars)`, as in the program below. Then `outputs.<name>` has your type. With a plain object, give `vars` the type `Vars`, or `tsc` fails in strict mode. `build.each` does not check the var values, so check them in `expand`. A throw in `expand` makes `run()` reject.
-
-In this program, `CountTemplate` names a `Count` output for each page:
-
-```ts
-import { Artifact, Build, type ArtifactTemplate, type Vars } from "dapat"
-import { FileMatcher } from "dapat/contrib"
-
-const counts = new Map<string, string>()
-
-class Count extends Artifact<string> {
-  readonly id: string
-  constructor(readonly key: string) {
-    super()
-    this.id = `count:${key}`
-  }
-  async stamp() {
-    return counts.get(this.key) ?? null
-  }
-  async read() {
-    return counts.get(this.key) ?? ""
-  }
-}
-
-class CountTemplate implements ArtifactTemplate<Count> {
-  readonly varNames = ["slug"]
-  expand(vars: Vars) {
-    return new Count(vars.slug!)
-  }
-}
-
-await Bun.write("pages/hello.md", "Hello big world")
-const build = new Build()
-build.each({
-  name: "count",
-  matchersByName: { page: new FileMatcher("pages/<slug>.md") },
-  outputsByName: { count: new CountTemplate() },
-  async run({ matched, outputs }) {
-    const text = await Bun.file(matched.page.data.path).text()
-    const words = text.split(" ").length
-    counts.set(outputs.count.key, String(words)) // outputs.count has the type Count
-  },
-})
-await build.run()
-console.log(`hello has ${counts.get("hello")} words`)
-```
-
-<!-- output -->
-```text
-hello has 3 words
-```
+- Each var of a template must be a var of a matcher, or `build.each` throws. A var of an optional matcher is allowed: a set with no match of that matcher gets no task and no error.
+- The `expand` of `FileTemplate` and `FolderTemplate` throws for a var value that is empty, `.` or `..`, or holds `/`, and then `run()` rejects ([a matched var can make an output template reject](limits.md#a-matched-var-can-make-an-output-template-reject)). It also throws for a bad `stamp`, because the constructor does not check it.
+- Put every var of the set in each template path. When two sets fill a `FileTemplate` with one path, `run()` rejects with `duplicate output`. When they fill a `FolderTemplate` with one path, there is no error, and two tasks write one folder ([one task writes one folder](guide.md#one-task-writes-one-folder)).
+- For an output of your own artifact type, write a class that implements [`ArtifactTemplate<YourType>`](api.md#artifacttemplate), with `varNames` and `expand(vars: Vars)`. Then `outputs.<name>` has your type. Give `vars` the type `Vars`, or `tsc` fails in strict mode. `build.each` does not check the var values, so check them in `expand`.
 
 ## FileMatcher
 
@@ -133,17 +83,7 @@ The pattern:
 - A part can mix text and vars. The first var takes as much text as it can, as long as the rest of the path still fits.
 - The constructor drops `.` parts and empty parts. So `./a//<b>.md` is `a/<b>.md`, and `a/b/` matches the file `a/b`, not the files in the folder `a/b`.
 - The constructor resolves a relative pattern against the current folder. A later `process.chdir` does not change the files that the matcher finds.
-
-The constructor throws for these patterns and options ([error messages](api.md#error-messages) gives the text):
-
-| Pattern or option | Why it throws |
-| --- | --- |
-| `""`, `.` or `/` | The pattern is empty, or has only `.` and `/`. |
-| `a/<b` or `<my-var>` | A `<` or `>` is outside a var. |
-| `<a><b>` | Two vars have nothing between them. |
-| `posts/*.md` | `*` and `**` are not allowed. For one match with a list of files, use [FileGroupMatcher](#filegroupmatcher). |
-| `../a/<b>.md` | A `..` part is not allowed. For a folder above the current folder, make the pattern absolute with `path.resolve`. |
-| `{ syntax: { varStart: "{", varEnd: "{" } }` | The `syntax` option is not valid: a marker is empty or holds `/`, two markers are equal, or one holds another. `anyName` and `anyFolders` cannot be `.` or `..`. Only `anyFolders` can hold `anyName`, as `**` holds `*`. |
+- The constructor throws for a pattern that names no file, such as `""` or `.`. It also throws for a `<` or `>` outside a var, two vars with nothing between them, a `*` or `**`, a `..` part, or a bad `syntax`. [Error messages](api.md#error-messages) gives each text and its fix.
 
 The scan:
 
@@ -153,34 +93,7 @@ The scan:
 
 ### Names that hold markers
 
-`<`, `>`, `*` and `**` are markers anywhere in the pattern, also in the folder names of an absolute pattern. A folder `a<x>b` makes a var `x`. A folder `a*b` makes a glob, so the matcher throws or finds the files of other folders. For such a name, set other markers with `syntax`: `varStart`, `varEnd`, `anyName` and `anyFolders`, by default `<`, `>`, `*` and `**`. In this program, the folder `notes <old>` holds the var markers:
-
-```ts
-import { Build } from "dapat"
-import { FileMatcher } from "dapat/contrib"
-
-await Bun.write("notes <old>/en/hello.md", "Hello")
-await Bun.write("notes <old>/de/hallo.md", "Hallo")
-await Bun.write("notes 2024/en/other.md", "Other") // the plain pattern also fits this file; the {} pattern does not
-const plain = new FileMatcher("notes <old>/<lang>/<slug>.md")
-console.log(plain.varNames) // <old> is a var here
-const syntax = { varStart: "{", varEnd: "}" }
-const build = new Build()
-build.each({
-  name: "note",
-  matchersByName: { note: new FileMatcher("notes <old>/{lang}/{slug}.md", { syntax }) },
-  async run() {},
-})
-const result = await build.run()
-const ran = result.executed.map((task) => task.id).sort()
-console.log(`ran [${ran.join(" ")}]`)
-```
-
-<!-- output -->
-```text
-[ "old", "lang", "slug" ]
-ran [note:de/hallo note:en/hello]
-```
+`<`, `>`, `*` and `**` are markers anywhere in the pattern, also in the folder names of an absolute pattern. A folder `a<x>b` makes a var `x`, and a folder `a*b` makes a glob. For such a name, set other markers with the `syntax` option: `varStart`, `varEnd`, `anyName` and `anyFolders`, by default `<`, `>`, `*` and `**`. For example, `new FileMatcher("notes <old>/{lang}/{slug}.md", { syntax: { varStart: "{", varEnd: "}" } })` finds `notes <old>/en/hello.md` with the vars `{ lang: "en", slug: "hello" }`.
 
 - Each marker that you leave out keeps its default. A default marker that the syntax replaces is a plain character. But `*` is a plain character only when `anyName` changes. So when only `anyFolders` changes, a `**` part is two `*` globs, and it matches one folder level.
 - Choose markers that no name in the pattern holds. The error messages name the markers of the syntax.
@@ -215,7 +128,7 @@ sitemap:de lists hallo.md
 sitemap:en lists about.md hello.md
 ```
 
-- Write the pattern for the sources, such as `content/<lang>/*.md`, not for the outputs. A pattern such as `site/<lang>/*.html` also finds the output of a deleted source, because dapat deletes no file ([layout rules](guide.md#layout-rules)).
+- Write the pattern for the sources, such as `content/<lang>/*.md`, not for the outputs. A pattern such as `site/<lang>/*.html` also finds the output of a deleted source, because [dapat deletes no file](guide.md#dapat-deletes-no-file).
 - The pattern follows the [FileMatcher](#filematcher) rules, and it must have a `*` or `**` (the `anyName` or `anyFolders` of its syntax). Vars can come only in the parts before the first part with a `*` or `**`. The constructor throws for other patterns ([error messages](api.md#error-messages)). A `*` or `**` makes no var, so read the other names from the path of each file.
 - `*` matches any text in one part, including empty text and a leading `.`. So the match of `notes/*.md` holds `notes/.md` and `notes/.draft.md`. A pattern with no var gives one match, or none when no file fits.
 - `**` matches zero or more folders, hidden folders too. So the match of `en` for `content/<lang>/**/*.md` holds `content/en/top.md` and `content/en/blog/hello.md`. `**` must be a whole part, and not the last part: for every file below `content`, write `content/**/*`. At a `**`, the scan reads every folder below it. So start the pattern with a fixed folder, such as `content/**/*.md`, not `**/*.md`.
@@ -231,11 +144,11 @@ A [joined set](guide.md#buildeach) holds one match of each [required](#required)
 | `templates/<lang>.html`, `authors/<slug>.txt`, `pages/<lang>/<slug>.md` | template `en`; author `hello`; pages `en/hello`, `en/about`, `de/hallo` | 1: `en/hello`. `en/about` has no author, and `de/hallo` has no template and no author |
 | `content/<lang>/*.md` (a `FileGroupMatcher`), `templates/<lang>.html` | pages `en/hello`, `en/about`, `de/hallo`; template `en` | 1: `en`, with the list of the two `en` pages and the `en` template. `de` has no template |
 
-The required matchers must all connect through shared var names, or `build.each` throws ([error messages](api.md#error-messages)). A chain is enough: in row 2, the template and author matchers share no var name, but each shares one with the page matcher. A matcher that [`required`](#required) does not name is not part of the chain. A matcher with no var, such as `templates/site.html`, shares no var name. To give its match to every set, leave it out of `required`.
+The required matchers must all connect through shared var names, or `build.each` throws ([error messages](api.md#error-messages)). A chain is enough: in row 2, the template and author matchers share no var name, but each shares one with the page matcher. A matcher that `required` does not name is not part of the chain. A matcher with no var, such as `templates/site.html`, shares no var name. To give its match to every set, leave it out of `required`.
 
 ## required
 
-When you give [`required`](#the-config), each matcher that it does not name is an **optional matcher**. A joined set can have no match of an optional matcher, as in an SQL LEFT JOIN. Use one for an input that a task does not need, such as a review of a page:
+When you give `required`, each matcher that it does not name is an **optional matcher**. A joined set can have no match of an optional matcher, as in an SQL LEFT JOIN. Use one for an input that a task does not need, such as a review of a page:
 
 ```ts
 import { Build } from "dapat"
@@ -272,12 +185,11 @@ page:hello      inputs: 1
 - The set of `hello` has no `review` match, so its task has one input, and its id has no reviewer part.
 - Optional matchers join one after the other, in `matchersByName` order. The **ON vars** of an optional matcher are its var names that a required matcher or an earlier optional matcher has. For `review`, the ON var is `slug`. A match joins a set when it has the set's value for each ON var. An optional matcher with no ON vars, such as `tags/<tag>.txt`, joins each of its matches to each set.
 - The order matters only when two optional matchers share a var name that no required matcher has. Then the later matcher joins only a set where the earlier one gave that var a value. For example, with `rating: new FileMatcher("ratings/<slug>.<reviewer>.txt")` after `review`, a rating joins only the set of the review by the same reviewer.
-- With a literal `required`, as in the sample, TypeScript types `matched.review` as possibly `undefined` in `run` and in `tasks`, and each var, even `vars.slug`, as `string | undefined`. For a `string`, read the var from a required match: `matched.page.vars.slug`.
-- Do not give `required` a wider type, such as a variable of type `("page" | "review")[]`. TypeScript then treats every matcher as required, so `matched.review.data` type-checks. In the tasks form, `run()` can reject with a TypeError, even when each page has a review. During the scans, `tasks()` can run for a page before the review matcher finds its review ([the config](#the-config)).
+- With a literal `required`, as in the sample, TypeScript types `matched.review` as possibly `undefined`, and each var as `string | undefined`. For a `string`, read the var from a required match, such as `matched.page.vars.slug`. Do not give `required` a wider type, such as `("page" | "review")[]`. TypeScript then treats every matcher as required. But in the tasks form, `run()` can then reject with a TypeError: `tasks()` can run for a page before the review matcher finds its review ([the config](#the-config)).
 
 ## Matches during the run
 
-During the run, `FileMatcher` and `FileGroupMatcher` get the build's [events](guide.md#events). So a file that a task declares or reports gets its tasks in the same `run()`. In this program, `write` reports `chapters/1.txt`:
+During the run, `FileMatcher` and `FileGroupMatcher` get the [events](guide.md#events) of the `Build`. So a file that a task declares or reports gets its tasks in the same `run()`. In this program, `write` reports `chapters/1.txt`:
 
 ```ts
 import { Build, Task, type Context } from "dapat"
@@ -314,11 +226,12 @@ write ends
 summary:1 runs
 ```
 
-- `summary:1` starts only when `write` ends, because `write` declares the folder that holds the chapter.
-- A `FileMatcher` gives a file a match when the [scan](guide.md#buildeach) finds the file or a `produced` event comes for it. The matcher uses only the events of a `FileArtifact` or a subclass, not of another class with the same path. A `deleted` event ends the match. A `promised` event for a folder makes no match. So report each file that a task writes in a folder, or the file gets a match only at the next build's scan.
-- A file also has a match while a task declares it as an exact output, from the `promised` event to the `withdrawn` event. A `deleted` event does not end this match ([known issue 6](limits.md#known-issues-in-010)).
+- `summary:1` starts only when `write` finishes, because `write` declares the folder that holds the chapter.
+- A `FileMatcher` gives a file a match when the [scan](guide.md#buildeach) finds the file or a `produced` event comes for it. The file also has a match while a task declares it as an exact output, from its `promised` event to its `withdrawn` event. The matcher uses only the events of a `FileArtifact` or a subclass. A `promised` event for a folder makes no match. So report each file that a task writes in a folder, or the file gets a match only at the next build's scan.
+- A `deleted` event ends the match unless a task still declares the file. A `withdrawn` event ends it unless the scan found the file or a `produced` event came for it, with no `deleted` event since. So when a task declares a file and does not write it, `build.each` still makes the tasks that read the file, and they run ([declare a folder](guide.md#a-task-that-may-write-nothing-declares-a-folder)).
 - So a file that a task declares, or writes and reports, still gets its tasks in the next build after you delete it. The task declares the file again, or runs again and reports it.
 - `FileGroupMatcher` uses these rules for each file of a list. At each report that changes a list, `build.each` makes the tasks again for each joined set that holds the list. The new task [replaces](guide.md#tasks-and-dependencies) the old one, so `result.cancelled` can hold several tasks with one id. The build time grows with the square of the number of reports ([scale](limits.md#scale)). A declared file joins the list at its `promised` event, so its report does not make the tasks again.
+- A task looks for its producers when it starts, and again when they all finish ([the order rule](semantics.md#the-order-rule)). So a task that reads the outputs of tasks that `build.each` adds during the run can start before they exist. For example, `index` reads `summaries/`, and `build.each` adds a `summary` task for each chapter that `split` reports. Give `index` the input `chapters/` too, the folder output of `split`. Then `index` waits for `split`, and then for each `summary` task.
 
 ## Loops
 
@@ -357,7 +270,6 @@ console.log(`ran [${ran.join(" ")}]`)
 ran [turn:0 turn:1 turn:2 turn:3]
 ```
 
-- `turn:<n>` declares the folder `turns/<n+1>/`, not the file. With the file as an exact output, its `promised` event gives the file a match, so `build.each` adds the next task before any task runs. This repeats until the [send limit](semantics.md#the-send-limit) makes `run()` reject.
+- `turn:<n>` declares the folder `turns/<n+1>/`, not the file. With the file as an exact output, its `promised` event gives the file a match, so `build.each` adds the next task before any task runs. This repeats until the [send limit](semantics.md#the-send-limit) makes `run()` reject. The send limit does not stop this loop, which declares the folder. So give every loop a maximum number of turns, as `n >= 3` does here.
 - Give each turn its own folder. When every turn declares one shared folder, such as `steps/`, each task waits for the others. A build whose scan finds two or more turns then fails each task with `deadlock waiting for inputs of '<id>'`.
-- The [send limit](semantics.md#the-send-limit) does not stop this loop. So give every loop a maximum number of turns, as `n >= 3` does here.
 - The files of old turns stay, and each scan finds them. So when a loop ends at an earlier turn than in the last build, the later turns still get tasks. These tasks skip while their files do not change. To start a loop again from turn 0, delete the folders of turns 1 and up.

@@ -1,6 +1,6 @@
 # Recipes
 
-Read part 1 of the [guide](guide.md) first. Read [part 2](guide.md#events) before the recipes that use `build.each`.
+Read part 1 of the [guide](guide.md) first. Read [part 2](guide.md#buildeach) before the recipes that use `build.each`.
 
 ## Force a rerun
 
@@ -8,7 +8,7 @@ To run one task again, call `await store.delete(task.id)` before `build.run()`. 
 
 ## Rerun when your code changes
 
-The [skip checks](guide.md#the-store-and-the-skip-rule) do not look at the code of a task. To rerun it after a code change, give it one more input whose stamp is the version of its code. In this program, that input is a `Value`, an [artifact type](write-an-artifact.md) that the program defines. Change the version each time you change the code:
+The [skip rule](guide.md#the-skip-rule) does not look at the code of a task. To rerun it after a code change, give it one more input whose stamp is the version of its code. In this program, that input is a `Value`, an [artifact type](write-an-artifact.md) that the program defines. Change the version each time you change the code:
 
 ```ts
 import { Artifact, Build, MemoryStore, Task } from "dapat"
@@ -49,10 +49,10 @@ You can also add the file that holds the task code as an input: [`new FileArtifa
 
 ## Delete old outputs
 
-dapat deletes no [old output](guide.md#layout-rules), so only your code can delete it. There are two cases:
+[dapat deletes no file](guide.md#dapat-deletes-no-file), so only your code can delete an old output. There are two cases:
 
-- **A task writes fewer files in its folder output.** Its `run` function deletes each old file and reports it with `ctx.deleted`, as `split` does in build 3 of [Outputs with unknown names](guide.md#outputs-with-unknown-names).
-- **No task in the build has the file as an output.** Examples are a task that your code no longer adds, and a [`build.each`](guide.md#buildeach) task whose matched file is gone. After `build.run()`, collect the tasks in [`result.executed`](guide.md#results-and-failure), `result.skipped` and the keys of `result.failed`. In a folder that only these tasks write, delete each file that no output of these tasks names or [covers](guide.md#folders-prefixes).
+- A task writes fewer files in its folder output. Its `run` function deletes each old file and reports it with `ctx.deleted`, as `split` does in build 3 of [Outputs with unknown names](guide.md#outputs-with-unknown-names).
+- No task in the build has the file as an output. Examples are a task that your code no longer adds, and a [`build.each`](guide.md#buildeach) task whose matched file is gone. After `build.run()`, collect the tasks in [`result.executed`](guide.md#results-and-failure), `result.skipped` and the keys of `result.failed`. In a folder that only these tasks write, delete each file that no output of these tasks names or [covers](guide.md#folders-prefixes).
 
 In this program, only the `page` tasks write in `site`. The program deletes `content/about.md` before build 2:
 
@@ -84,11 +84,10 @@ async function runBuild(label: string) {
     const file = new FileArtifact(path)
     const named = outputs.some((output) => output.id === file.id)
     const covered = outputs.some((output) => isPrefix(output) && output.covers(file))
-    if (named || covered) {
-      continue
+    if (!named && !covered) {
+      await Bun.file(path).delete()
+      console.log(`${label}: deleted ${path.replace(process.cwd(), ".")}`)
     }
-    await Bun.file(path).delete()
-    console.log(`${label}: deleted ${path.replace(process.cwd(), ".")}`)
   }
 }
 
@@ -102,14 +101,11 @@ await runBuild("2")
 2: deleted ./site/about.html
 ```
 
-Each deletion changes the folder's stamp, so each task that reads the folder runs on the next build. Two kinds of old output stay one build longer, because this build's `Result` still lists their tasks:
-
-- The output of a task that `build.each` made for an old output. For example, a task that reads `site/about.html` is still in build 2, so your code deletes its output in build 3.
-- The output of a task that your code [removed](guide.md#tasks-and-dependencies) after the task ended.
+Each deletion changes the folder's stamp, so each task that reads the folder runs on the next build.
 
 ## Limit parallel work
 
-A **gate** is a function that lets at most `max` calls run at the same time. To limit a slow call in `run`, such as a video encode, pass it to a gate as a function. Here 12 tasks share `gate(4)`:
+A **gate** is a function that lets at most `max` calls run at the same time. To limit a slow call in `run`, such as a video encode, pass it to a gate as a function. Here 12 tasks share `gate(4)`, so at most 4 encodes run at the same time:
 
 ```ts
 import { Build, Task } from "dapat"
@@ -135,35 +131,19 @@ function gate(max: number) {
     }
   }
 }
-let running = 0
-let peak = 0
-async function encode() {
-  running += 1
-  peak = Math.max(peak, running)
-  await Bun.sleep(10) // the slow work
-  running -= 1
-}
+const encode = () => Bun.sleep(10) // the slow work
 const cpu = gate(4)
 const build = new Build()
 for (let i = 0; i < 12; i++) {
   build.add(new Task({ id: `encode:${i}`, run: () => cpu(encode) }))
 }
 await build.run()
-console.log(`peak: ${peak}`)
-```
-
-<!-- output -->
-```text
-peak: 4
 ```
 
 ## Run in CI
 
-A task skips in a CI job only when the job has the task's [record](guide.md#what-a-build-does) from an earlier job. Its output files must also have the stamps in that record. Use a `JsonStore` or a `SqliteStore` ([Stores](builtins.md#stores)). At the end of each job, save the store file (for example `.dapat/state.json`) and the output files in the CI cache. At the start of each job, restore them.
-
-- Check out the project at the same path in each job, because [file ids](builtins.md#files) are absolute paths.
-- Keep the default hash stamps, because a checkout changes the mtime of every file ([Hash or time](builtins.md#hash-or-time)).
+A task skips in a CI job only when the job has the task's [record](guide.md#what-a-build-does) from an earlier job. Its output files must also have the stamps in that record. Use a `JsonStore` or a `SqliteStore` ([Stores](builtins.md#stores)). At the end of each job, save the store file (for example `.dapat/state.json`) and the output files in the CI cache. At the start of each job, restore them. Check out the project at the same path in each job, because [file ids](builtins.md#files) are absolute paths. Keep the default hash stamps, because a checkout changes the mtime of every file ([Hash or time](builtins.md#hash-or-time)).
 
 ## Call a paid model
 
-Make each model call one task. Its input is the prompt file, and its output is the answer file. With a `JsonStore` or a `SqliteStore`, the task skips and makes no call while the prompt and the answer do not change. Put the model name in the prompt file, or add it as an input, like the `Value` in [Rerun when your code changes](#rerun-when-your-code-changes). To limit the calls that run at the same time, use a [gate](#limit-parallel-work). [examples/book/](../examples/book/README.md) works this way: each scene and each image is one task, and each prompt is an artifact whose stamp is a hash of its text.
+Make each model call one task. Its input is the prompt file, and its output is the answer file. With a `JsonStore` or a `SqliteStore`, the task skips and makes no call while the prompt and the answer do not change. Put the model name in the prompt file, or add it as an input, like the `Value` in [Rerun when your code changes](#rerun-when-your-code-changes). To limit the calls that run at the same time, use a [gate](#limit-parallel-work). [examples/book/](../examples/book/README.md) works this way: each scene and each image is one task. Each prompt is an artifact whose stamp is a hash of its text.
