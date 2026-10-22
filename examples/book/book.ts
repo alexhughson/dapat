@@ -92,8 +92,8 @@ class PromptArtifact extends Artifact<string> {
 let sceneCalls = 0
 let imageCalls = 0
 const build = new Build({ store: new JsonStore(".dapat/state.json") })
+// chunk and image name these files here. The scene step gets the same files from its matchers.
 const text = new FileArtifact("text.txt")
-const plan = new FileArtifact("plan.txt")
 const style = new FileArtifact("style.txt")
 const pagesFolder = new FilesystemPrefix("pages/")
 const scenePrompt = new PromptArtifact("scene", defaultScenePrompt())
@@ -137,9 +137,11 @@ build.each({
   matchersByName: {
     page: new FileMatcher("pages/<page>.txt"),
     notes: new FileMatcher("page<page>_notes.txt"),
-
+    plan: new FileMatcher("plan.txt"),
+    text: new FileMatcher("text.txt"),
+    style: new FileMatcher("style.txt"),
   },
-  required: ["page"],
+  required: ["page", "plan", "text", "style"],
   outputsByName: { scene: new FileTemplate("scenes/<page>.txt") },
   *tasks(vars, matched, outputs) {
 
@@ -149,7 +151,7 @@ build.each({
       notes = matched.notes.data
     }
     let previousScene: FileArtifact | null = null
-    const inputs: Artifact[] = [scenePrompt, plan, text, style, matched.page.data]
+    const inputs: Artifact[] = [scenePrompt, matched.plan.data, matched.text.data, matched.style.data, matched.page.data]
     if (notes !== null) {
       inputs.push(notes)
     }
