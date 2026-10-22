@@ -1,6 +1,7 @@
 // Makes a picture book from one book folder: text.txt is cut into pages, an LLM writes a scene for
-// each page from plan.txt, and an image model draws each scene in the style of style.txt.
-// page<nnn>_notes.txt steers the image of one page. Each LLM call and each image call costs money.
+// each page from plan.txt and page<nnn>_notes.txt, and an image model draws each scene in the style
+// of style.txt. Image models follow plain descriptions well and conditions badly, so the LLM does
+// all the reasoning and the image prompt is only the style and the scene. Each call costs money.
 // Run it with no arguments to see the usage.
 import * as fs from "node:fs"
 import * as fsPromises from "node:fs/promises"
@@ -21,8 +22,8 @@ Makes a picture book from the files in <book folder>:
   text.txt              the story. It is cut into pages of [lines per page] lines.
   plan.txt              the goals of the plot. An LLM uses it to write a scene for each page.
   style.txt             the look of the images.
-  page<nnn>_notes.txt   optional. Strict notes for the image of one page, for example
-                        page003_notes.txt for pages/003.txt.
+  page<nnn>_notes.txt   optional. Strict notes for the picture of one page, for example
+                        page003_notes.txt for pages/003.txt. The LLM puts them into the scene.
 
 It writes pages/, scenes/, images/ and book.html into the book folder. When the
 book folder is missing, it copies a sample book into it.
@@ -73,16 +74,28 @@ build.add(
   }),
 )
 
-// scene:<page> asks the LLM for the scene of one page. It reads the plan, its page, and the scene
-// before it, so the scenes follow on from each other. One call for each page means that a new page
-// at the end makes one call, and an edit to page n makes calls for page n and the pages after it.
+// scene:<page> asks the LLM for the scene of one page. It reads the plan, its page, the notes of
+// the page when they exist, and the scene before it, so the scenes follow on from each other.
+// One call for each page means that a new page at the end makes one call, and an edit to page n
+// makes calls for page n and the pages after it.
 build.each({
-  matchersByName: { page: new FileMatcher("pages/<page>.txt") },
+  matchersByName: {
+    page: new FileMatcher("pages/<page>.txt"),
+    notes: new FileMatcher("page<page>_notes.txt"),
+  },
+  required: ["page"],
   outputsByName: { scene: new FileTemplate("scenes/<page>.txt") },
   *tasks(vars, matched, outputs) {
     const index = Number(vars.page)
+    let notes: FileArtifact | null = null
+    if (matched.notes !== undefined) {
+      notes = matched.notes.data
+    }
     let previousScene: FileArtifact | null = null
     const inputs = [plan, matched.page.data]
+    if (notes !== null) {
+      inputs.push(notes)
+    }
     if (index > 0) {
       previousScene = new FileArtifact(`scenes/${pageName(index - 1)}.txt`)
       inputs.push(previousScene)
@@ -94,34 +107,30 @@ build.each({
       run: async () => {
         const planText = await Bun.file(plan.path).text()
         const pageText = await Bun.file(matched.page.data.path).text()
+        let notesText: string | null = null
+        if (notes !== null) {
+          notesText = await Bun.file(notes.path).text()
+        }
         let previousSceneText: string | null = null
         if (previousScene !== null) {
           previousSceneText = await Bun.file(previousScene.path).text()
         }
-        const prompt = scenePrompt(planText, pageText, previousSceneText)
+        const prompt = scenePrompt(planText, pageText, notesText, previousSceneText)
         await Bun.write(outputs.scene.path, await promptLlm(prompt))
       },
     })
   },
 })
 
-// image:<page> draws the scene of one page in the style, with the notes of that page when they
-// exist. It also reads the first 5 images and the 5 images before it, as references for the look.
-// So a change to one image draws that image and the images after it again.
+// image:<page> draws the scene of one page in the style. It also reads the first 5 images and the
+// 5 images before it, as references for the look. So a change to one image draws that image and
+// the images after it again.
 build.each({
-  matchersByName: {
-    page: new FileMatcher("pages/<page>.txt"),
-    notes: new FileMatcher("page<page>_notes.txt"),
-  },
-  required: ["page"],
+  matchersByName: { page: new FileMatcher("pages/<page>.txt") },
   outputsByName: { image: new FileTemplate("images/<page>.png") },
-  *tasks(vars, matched, outputs) {
+  *tasks(vars, _matched, outputs) {
     const index = Number(vars.page)
     const scene = new FileArtifact(`scenes/${vars.page}.txt`)
-    let notes: FileArtifact | null = null
-    if (matched.notes !== undefined) {
-      notes = matched.notes.data
-    }
     const earlierImages: FileArtifact[] = []
     for (let earlier = 0; earlier < index; earlier++) {
       const isFirst = earlier < FIRST_REFERENCES
@@ -130,26 +139,18 @@ build.each({
         earlierImages.push(new FileArtifact(`images/${pageName(earlier)}.png`))
       }
     }
-    const inputs = [scene, style, ...earlierImages]
-    if (notes !== null) {
-      inputs.push(notes)
-    }
     yield new Task({
       id: `image:${vars.page}`,
-      inputs,
+      inputs: [scene, style, ...earlierImages],
       outputs: [outputs.image],
       run: async () => {
         const styleText = await Bun.file(style.path).text()
         const sceneText = await Bun.file(scene.path).text()
-        let notesText: string | null = null
-        if (notes !== null) {
-          notesText = await Bun.file(notes.path).text()
-        }
         const earlierBytes: Uint8Array[] = []
         for (const earlier of earlierImages) {
           earlierBytes.push(await earlier.read())
         }
-        const prompt = imagePrompt(styleText, sceneText, notesText)
+        const prompt = imagePrompt(styleText, sceneText)
         await Bun.write(outputs.image.path, await generateImage(prompt, earlierBytes))
       },
     })
@@ -278,35 +279,40 @@ async function generateImage(prompt: string, earlierImages: Uint8Array[]): Promi
   return Buffer.from(image.b64_json, "base64")
 }
 
-function scenePrompt(plan: string, page: string, previousScene: string | null): string {
+function scenePrompt(plan: string, page: string, notes: string | null, previousScene: string | null): string {
   let previous = "This is the first page."
   if (previousScene !== null) {
-    previous = `The scene of the page before:\n${previousScene}`
+    previous = `The description of the picture on the page before:\n${previousScene}`
   }
-  return `You plan the illustrations of a children's picture book.
+  let notesPart = ""
+  if (notes !== null) {
+    notesPart = `\nNotes from the author for this picture. They win over the plan and the page before:\n${notes}\n`
+  }
+  return `You write the picture descriptions for a children's picture book. An image model draws each
+description. Image models follow plain descriptions well and conditions badly, so do the thinking
+here and give the image model only what it must draw.
 
 The goals of the plot:
 ${plan}
 
 ${previous}
-
+${notesPart}
 The text of this page:
 ${page}
 
-Describe the one picture for this page in 3 to 5 sentences: who is in it, what they do, where they
-are, and the mood. Keep the characters and places the same as in the scene before. Reply with only
-the description.`
+Write the description of the one picture for this page. Rules:
+- Describe only what is visible: each character with their looks and clothes, what they do, where
+  they stand, the place, the light, and the colours.
+- Describe each character in full on every page, with the same looks as on the page before.
+- Use plain statements. Do not use "if", "unless", "or", "should", "maybe", or "not".
+- Put no written words or letters in the picture.
+- Use 4 to 6 sentences. Reply with only the description.`
 }
 
-function imagePrompt(style: string, scene: string, notes: string | null): string {
-  let prompt = `An illustration for a children's picture book. Use the reference images to keep the
-characters and places the same.
+function imagePrompt(style: string, scene: string): string {
+  return `A children's picture book illustration. Draw the same characters as in the reference images.
 
 Style: ${style.trim()}
 
-Scene: ${scene.trim()}`
-  if (notes !== null) {
-    prompt += `\n\nFollow these notes exactly: ${notes.trim()}`
-  }
-  return prompt
+${scene.trim()}`
 }

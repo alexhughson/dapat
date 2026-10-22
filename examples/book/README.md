@@ -1,6 +1,6 @@
 # Children's book example
 
-[book.ts](book.ts) makes a picture book from the folder of one book. It cuts the text into pages. An LLM writes a scene for each page from the plot plan. An image model draws each scene in the style of the book. Each image also gets the first 5 images and the 5 images before it as references, so the characters look the same from page to page.
+[book.ts](book.ts) makes a picture book from the folder of one book. It cuts the text into pages. An LLM writes a plain picture description (a scene) for each page from the plot plan. An image model draws each scene in the style of the book. Image models follow plain descriptions well and conditions badly, so the LLM does all the reasoning, and the image prompt is only the style and the scene. Each image also gets the first 5 images and the 5 images before it as references, so the characters look the same from page to page.
 
 ```sh
 export OPENROUTER_API_KEY=...
@@ -18,7 +18,7 @@ When the folder is missing, the script copies the sample book [samples/hamlet](s
 | `text.txt` | yes | the story; cut into pages of n lines |
 | `plan.txt` | yes | the goals of the plot; the LLM reads it for each scene |
 | `style.txt` | yes | the look of the images |
-| `page<nnn>_notes.txt` | optional | strict notes for one image, for example `page003_notes.txt` for `pages/003.txt` |
+| `page<nnn>_notes.txt` | optional | strict notes for one picture, for example `page003_notes.txt` for `pages/003.txt`. The LLM puts them into the scene of that page |
 | `pages/`, `scenes/`, `images/`, `book.html`, `.dapat/` | no | the outputs and the store |
 
 To tune a book, edit `plan.txt` and `style.txt` first. To force one picture, add a notes file for its page.
@@ -35,10 +35,10 @@ Both calls go to OpenRouter. Each call costs money, so the script prints how man
 ```
 chunk/lines=<n>  build.add; text.txt  ->  FilesystemPrefix("pages/")
                  writes 000.txt, 001.txt, ... with n lines each, and calls ctx.produced for each page
-scene:<page>     build.each on pages/<page>.txt; plan.txt + the page + scenes/<page - 1>.txt
-                 ->  FileTemplate("scenes/<page>.txt")
-image:<page>     build.each on pages/<page>.txt, with page<page>_notes.txt not required;
-                 scenes/<page>.txt + style.txt + the notes + images 000-004 + the 5 images before <page>
+scene:<page>     build.each on pages/<page>.txt, with page<page>_notes.txt not required;
+                 plan.txt + the page + the notes + scenes/<page - 1>.txt  ->  FileTemplate("scenes/<page>.txt")
+image:<page>     build.each on pages/<page>.txt;
+                 scenes/<page>.txt + style.txt + images 000-004 + the 5 images before <page>
                  ->  FileTemplate("images/<page>.png")
 assemble         build.add; FilesystemPrefix("pages/") + FilesystemPrefix("images/")  ->  book.html
 ```
@@ -59,6 +59,6 @@ These counts start from the sample book, with 2 lines on each page. Each scene r
 | change line 4 (page 001) | 4 | 4 |
 | change `style.txt` | 0 | 5 |
 | change `plan.txt` | 5 | 5 |
-| add, change or delete `page002_notes.txt` | 0 | 3: page 002 and the pages after it |
+| add, change or delete `page002_notes.txt` | 3 | 3: page 002 and the pages after it |
 
 The default stamp is a hash of the bytes. So a file that a task writes again with the same bytes does not make the next task run.
