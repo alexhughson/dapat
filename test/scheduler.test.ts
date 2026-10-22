@@ -78,8 +78,8 @@ describe("Build scheduling", () => {
       new Task({
         id: "first",
         outputs: [first],
-        run: async (ctx) => {
-          ctx.add(
+        run: async () => {
+          build.add(
             new Task({
               id: "second",
               outputs: [second],
@@ -289,6 +289,54 @@ describe("Build scheduling", () => {
     const running = build.run()
     await new Promise<void>((resolve) => setTimeout(resolve, 5))
     // "reader" waits for "middle", which waits for "slow".
+    build.remove("middle")
+    const result = await running
+    expect(result.success).toBe(true)
+    expect(log).toEqual(["reader", "slow"])
+    expect(result.cancelled.map((task) => task.id)).toEqual(["middle"])
+  })
+
+  test("a waiting task starts when an outside remove takes out its producer, also after a report", async () => {
+    const log: string[] = []
+    const slow = gate()
+    const raw = new Mem("mem:raw", "raw")
+    const data = new Mem("mem:data")
+    const build = new Build()
+    build.add(
+      new Task({
+        id: "slow",
+        outputs: [raw],
+        run: async (ctx) => {
+          // A report, but not the one that removes "middle".
+          ctx.produced(raw)
+          await slow.opened
+          log.push("slow")
+        },
+      }),
+    )
+    build.add(
+      new Task({
+        id: "middle",
+        inputs: [raw],
+        outputs: [data],
+        run: async () => {
+          log.push("middle")
+        },
+      }),
+    )
+    build.add(
+      new Task({
+        id: "reader",
+        inputs: [data],
+        run: async () => {
+          log.push("reader")
+          slow.open()
+        },
+      }),
+    )
+    const running = build.run()
+    await new Promise<void>((resolve) => setTimeout(resolve, 5))
+    // "reader" waits for "middle", which waits for "slow". "reader" must not wait for "slow".
     build.remove("middle")
     const result = await running
     expect(result.success).toBe(true)

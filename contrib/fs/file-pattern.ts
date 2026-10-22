@@ -50,15 +50,24 @@ export class FilePattern {
   /** The syntax of the pattern, with the defaults for each character that the caller left out. */
   readonly syntax: PatternSyntax
   private readonly keyPattern: KeyPattern
+  private readonly matcherName: string
   // The parts that the scan walks one at a time, in order: the parts up to the first `**`, or all parts.
   private readonly segments: ScanSegment[]
 
-  /** `matcherName` is the class name at the start of each error message. */
-  constructor(pattern: string, matcherName: string, syntaxOption?: FilePatternSyntax) {
+  /**
+   * `matcherName` is the class name at the start of each error message. With `allowGlobs` false, as for an
+   * output template, a `*` or `**` throws, because the pattern must name one path.
+   */
+  constructor(pattern: string, matcherName: string, syntaxOption?: FilePatternSyntax, allowGlobs = true) {
     const syntax = resolveSyntax(syntaxOption, matcherName)
     const anyFolders = syntax.anyFolders
     if (pattern.length === 0) {
       throw new Error(`${matcherName}: the pattern is empty`)
+    }
+    const globMessage = `${matcherName} pattern '${pattern}': '${syntax.anyName}' and '${syntax.anyFolders}' are not allowed; an output names one path, so use a var such as ${syntax.varStart}name${syntax.varEnd} for each part that changes`
+    // Before the checks of a `**` part below, whose messages are about matchers.
+    if (!allowGlobs && pattern.includes(anyFolders)) {
+      throw new Error(globMessage)
     }
     for (const part of pattern.split("/")) {
       if (part === "..") {
@@ -84,6 +93,9 @@ export class FilePattern {
       )
     }
     const keyPattern = new KeyPattern(normalized, syntax)
+    if (!allowGlobs && keyPattern.hasGlob) {
+      throw new Error(globMessage)
+    }
     // KeyPattern decides which text is a var or a glob. A marker that is left in a literal part is stray.
     for (const literalText of keyPattern.literalTexts) {
       const holdsVarStart = literalText.includes(syntax.varStart)
@@ -99,6 +111,7 @@ export class FilePattern {
       root = "/"
     }
     this.pattern = normalized
+    this.matcherName = matcherName
     this.root = root
     this.syntax = syntax
     this.keyPattern = keyPattern
@@ -135,6 +148,25 @@ export class FilePattern {
     if (relativePath.startsWith(`..${path.sep}`)) return null
     const key = relativePath.split(path.sep).join("/")
     return this.keyPattern.match(key)
+  }
+
+  /**
+   * The absolute path that the pattern names with the vars filled in. The pattern must have no `*` or `**`.
+   * Throws for a value that `match` can never give: empty, `.`, `..`, or with a `/`. Such a value would
+   * change the folder of the path, for example `../../etc/passwd`.
+   */
+  render(vars: Vars): string {
+    for (const name of this.varNames) {
+      const value = vars[name]
+      if (value === undefined) continue
+      if (value === "" || value === "." || value === ".." || value.includes("/")) {
+        const varText = `${this.syntax.varStart}${name}${this.syntax.varEnd}`
+        throw new Error(
+          `${this.matcherName} pattern '${this.pattern}': the var ${varText} is '${value}'; a var value must be one path part, not empty, '.', '..', or a value with '/'`,
+        )
+      }
+    }
+    return path.join(this.root, this.keyPattern.render(vars))
   }
 
   /**

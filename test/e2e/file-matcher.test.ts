@@ -3,7 +3,7 @@ import * as fsPromises from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import { Build, Task, TaskGroup, type MatchedArtifactEvent } from "../../src/index"
-import { FileArtifact, FileMatcher } from "../../contrib/fs"
+import { FileArtifact, FileMatcher, FilesystemPrefix } from "../../contrib/fs"
 import { JsonStore } from "../../contrib/store"
 
 const temps: string[] = []
@@ -47,6 +47,15 @@ function varsText(vars: Readonly<Record<string, string>>): string {
     parts.push(`${name}=${value}`)
   }
   return parts.join(" ")
+}
+
+/** A promise and the function that resolves it. */
+function gate(): { opened: Promise<void>; open: () => void } {
+  let open = () => {}
+  const opened = new Promise<void>((resolve) => {
+    open = resolve
+  })
+  return { opened, open }
 }
 
 function taskIds(tasks: readonly Task[]): string[] {
@@ -473,9 +482,9 @@ describe("FileMatcher in a build", () => {
         id: "remover",
         inputs: [new FileArtifact(path.join(root, "seed.txt"))],
         outputs: [gate],
-        run: async (ctx) => {
+        run: async () => {
           await Bun.write(gate.path, "open")
-          ctx.remove("writer")
+          build.remove("writer")
         },
       }),
     )
@@ -507,6 +516,228 @@ describe("FileMatcher in a build", () => {
     expect(taskIds(result.executed)).toEqual(["remover"])
     expect(taskIds(result.cancelled)).toEqual(["publish:x", "writer"])
     expect(publishRuns).toBe(0)
+  })
+
+  test("a task that deletes a matched file and writes it again does not let a reader go on with the old output", async () => {
+    const root = await tempDir()
+    const seedPath = path.join(root, "seed.txt")
+    await writeText(seedPath, "one")
+    // The files of an earlier build. Thus "read" has an input file in the first build.
+    await writeText(path.join(root, "gen", "a.txt"), "one")
+    await writeText(path.join(root, "out", "a.txt"), "one")
+    const store = new JsonStore(path.join(root, "state.json"))
+    const seed = new FileArtifact(seedPath)
+    const generated = new FileArtifact(path.join(root, "gen", "a.txt"))
+    const copied = new FileArtifact(path.join(root, "out", "a.txt"))
+    const final = new FileArtifact(path.join(root, "final.txt"))
+
+    async function buildOnce() {
+      const build = new Build({ store })
+      // "rewrite" deletes gen/a.txt and writes it again. The matcher sends gone, and then found.
+      build.add(
+        new Task({
+          id: "rewrite",
+          inputs: [seed],
+          outputs: [new FilesystemPrefix(path.join(root, "gen"))],
+          run: async (ctx) => {
+            const text = await Bun.file(seedPath).text()
+            await fsPromises.rm(generated.path, { force: true })
+            ctx.deleted(generated)
+            await writeText(generated.path, text)
+            ctx.produced(generated)
+          },
+        }),
+      )
+      // "copy:a" copies gen/a.txt to out/a.txt. The gone event removes it, and the found event adds it again.
+      build.each({
+        matchersByName: { file: new FileMatcher(path.join(root, "gen/<name>.txt")) },
+        *tasks(vars, matched) {
+          const source = matched.file.data
+          const target = new FileArtifact(path.join(root, "out", `${vars.name}.txt`))
+          yield new Task({
+            id: `copy:${vars.name}`,
+            inputs: [source],
+            outputs: [target],
+            run: async () => {
+              const text = await Bun.file(source.path).text()
+              await writeText(target.path, text)
+            },
+          })
+        },
+      })
+      // "read" waits for "copy:a". It must not go on while "copy:a" is out of the build.
+      build.add(
+        new Task({
+          id: "read",
+          inputs: [copied],
+          outputs: [final],
+          run: async () => {
+            const text = await Bun.file(copied.path).text()
+            await writeText(final.path, text)
+          },
+        }),
+      )
+      return build.run()
+    }
+
+    const first = await buildOnce()
+    expect(first.success).toBe(true)
+    expect(await Bun.file(final.path).text()).toBe("one")
+
+    await writeText(seedPath, "two")
+    const second = await buildOnce()
+    expect(second.success).toBe(true)
+    expect(taskIds(second.executed)).toEqual(["copy:a", "read", "rewrite"])
+    expect(await Bun.file(copied.path).text()).toBe("two")
+    expect(await Bun.file(final.path).text()).toBe("two")
+  })
+
+  test("the same, when the task of the match reads a prefix input", async () => {
+    const root = await tempDir()
+    const seedPath = path.join(root, "seed.txt")
+    await writeText(seedPath, "one")
+    // The files of an earlier build. Thus "read" has an input file in the first build.
+    await writeText(path.join(root, "gen", "a", "x.txt"), "one")
+    await writeText(path.join(root, "out", "a.txt"), "one")
+    const store = new JsonStore(path.join(root, "state.json"))
+    const seed = new FileArtifact(seedPath)
+    const generated = new FileArtifact(path.join(root, "gen", "a", "x.txt"))
+    const copied = new FileArtifact(path.join(root, "out", "a.txt"))
+    const final = new FileArtifact(path.join(root, "final.txt"))
+
+    async function buildOnce() {
+      const build = new Build({ store })
+      // "rewrite" deletes gen/a/x.txt and writes it again. The matcher sends gone, and then found.
+      build.add(
+        new Task({
+          id: "rewrite",
+          inputs: [seed],
+          outputs: [new FilesystemPrefix(path.join(root, "gen"))],
+          run: async (ctx) => {
+            const text = await Bun.file(seedPath).text()
+            await fsPromises.rm(generated.path, { force: true })
+            ctx.deleted(generated)
+            await writeText(generated.path, text)
+            ctx.produced(generated)
+          },
+        }),
+      )
+      // "copy:a" reads the folder gen/a/, not the matched file.
+      build.each({
+        matchersByName: { file: new FileMatcher(path.join(root, "gen/<name>/x.txt")) },
+        *tasks(vars) {
+          const folder = new FilesystemPrefix(path.join(root, "gen", vars.name!))
+          const source = path.join(root, "gen", vars.name!, "x.txt")
+          const target = new FileArtifact(path.join(root, "out", `${vars.name}.txt`))
+          yield new Task({
+            id: `copy:${vars.name}`,
+            inputs: [folder],
+            outputs: [target],
+            run: async () => {
+              const text = await Bun.file(source).text()
+              await writeText(target.path, text)
+            },
+          })
+        },
+      })
+      build.add(
+        new Task({
+          id: "read",
+          inputs: [copied],
+          outputs: [final],
+          run: async () => {
+            const text = await Bun.file(copied.path).text()
+            await writeText(final.path, text)
+          },
+        }),
+      )
+      return build.run()
+    }
+
+    const first = await buildOnce()
+    expect(first.success).toBe(true)
+    expect(await Bun.file(final.path).text()).toBe("one")
+
+    await writeText(seedPath, "two")
+    const second = await buildOnce()
+    expect(second.success).toBe(true)
+    expect(taskIds(second.executed)).toEqual(["copy:a", "read", "rewrite"])
+    expect(await Bun.file(copied.path).text()).toBe("two")
+    expect(await Bun.file(final.path).text()).toBe("two")
+  })
+})
+
+describe("FileMatcher in a build: a task that comes and goes during a report", () => {
+  test("a reader waits for the reporter also when the task of the match came after the reader looked", async () => {
+    const root = await tempDir()
+    // The output of an earlier build. No task writes gen/a.txt before the run.
+    await writeText(path.join(root, "out", "a.txt"), "stale")
+    const generated = new FileArtifact(path.join(root, "gen", "a.txt"))
+    const final = new FileArtifact(path.join(root, "final.txt"))
+    const otherDone = gate()
+    const build = new Build()
+    build.add(
+      new Task({
+        id: "rewrite",
+        outputs: [new FilesystemPrefix(path.join(root, "gen"))],
+        run: async (ctx) => {
+          // "copy:a" comes into the build after "read" looked for its producers.
+          await writeText(generated.path, "first")
+          ctx.produced(generated)
+          await new Promise<void>((resolve) => setTimeout(resolve, 5))
+          // The build removes "copy:a".
+          await fsPromises.rm(generated.path)
+          ctx.deleted(generated)
+          // "other" ends while "copy:a" is out of the build.
+          otherDone.open()
+          await new Promise<void>((resolve) => setTimeout(resolve, 20))
+          // The build adds "copy:a" again.
+          await writeText(generated.path, "second")
+          ctx.produced(generated)
+        },
+      }),
+    )
+    build.each({
+      matchersByName: { file: new FileMatcher(path.join(root, "gen/<name>.txt")) },
+      *tasks(vars, matched) {
+        const source = matched.file.data
+        const target = new FileArtifact(path.join(root, "out", `${vars.name}.txt`))
+        yield new Task({
+          id: `copy:${vars.name}`,
+          inputs: [source],
+          outputs: [target],
+          run: async () => {
+            const text = await Bun.file(source.path).text()
+            await writeText(target.path, text)
+          },
+        })
+      },
+    })
+    // "read" waits for "other" only, when it first looks.
+    build.add(
+      new Task({
+        id: "other",
+        outputs: [new FileArtifact(path.join(root, "out", "other.txt"))],
+        run: async () => {
+          await otherDone.opened
+          await writeText(path.join(root, "out", "other.txt"), "other")
+        },
+      }),
+    )
+    build.add(
+      new Task({
+        id: "read",
+        inputs: [new FilesystemPrefix(path.join(root, "out"))],
+        outputs: [final],
+        run: async () => {
+          const text = await Bun.file(path.join(root, "out", "a.txt")).text()
+          await writeText(final.path, text)
+        },
+      }),
+    )
+    const result = await build.run()
+    expect(result.success).toBe(true)
+    expect(await Bun.file(final.path).text()).toBe("second")
   })
 })
 

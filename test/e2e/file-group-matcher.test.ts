@@ -282,6 +282,75 @@ describe("FileGroupMatcher in a build", () => {
     expect(taskIds(result.cancelled)).toEqual(["sitemap:en"])
     expect(sitemapRuns).toEqual(["fr"])
   })
+
+  test("a reader waits when one report replaces the group task and the next report removes it", async () => {
+    const root = await tempDir()
+    await writeText(path.join(root, "seed.txt"), "new")
+    await writeText(path.join(root, "gen", "a.txt"), "old")
+    await writeText(path.join(root, "gen", "b.txt"), "old")
+    // The output of an earlier build.
+    await writeText(path.join(root, "out", "all.txt"), "old|old")
+    const fileA = new FileArtifact(path.join(root, "gen", "a.txt"))
+    const fileB = new FileArtifact(path.join(root, "gen", "b.txt"))
+    const all = new FileArtifact(path.join(root, "out", "all.txt"))
+    const final = new FileArtifact(path.join(root, "final.txt"))
+    const build = new Build()
+    build.add(
+      new Task({
+        id: "rewrite",
+        inputs: [new FileArtifact(path.join(root, "seed.txt"))],
+        outputs: [new FilesystemPrefix(path.join(root, "gen"))],
+        run: async (ctx) => {
+          const text = await Bun.file(path.join(root, "seed.txt")).text()
+          // "read" waits for "join" first.
+          await new Promise<void>((resolve) => setTimeout(resolve, 5))
+          await fsPromises.rm(fileB.path)
+          await fsPromises.rm(fileA.path)
+          // In one synchronous step: the group is now [a.txt], so the build replaces "join".
+          // Then the group is empty, so the build removes the new "join".
+          ctx.deleted(fileB)
+          ctx.deleted(fileA)
+          await new Promise<void>((resolve) => setTimeout(resolve, 10))
+          // The group is [a.txt] again: the build adds "join" again.
+          await writeText(fileA.path, text)
+          ctx.produced(fileA)
+        },
+      }),
+    )
+    build.each({
+      matchersByName: { files: new FileGroupMatcher(path.join(root, "gen/*.txt")) },
+      *tasks(_vars, matched) {
+        const files = matched.files.data
+        yield new Task({
+          id: "join",
+          inputs: [...files],
+          outputs: [all],
+          run: async () => {
+            const texts: string[] = []
+            for (const file of files) {
+              texts.push(await Bun.file(file.path).text())
+            }
+            await writeText(all.path, texts.join("|"))
+          },
+        })
+      },
+    })
+    build.add(
+      new Task({
+        id: "read",
+        inputs: [all],
+        outputs: [final],
+        run: async () => {
+          const text = await Bun.file(all.path).text()
+          await writeText(final.path, text)
+        },
+      }),
+    )
+    const result = await build.run()
+    expect(result.success).toBe(true)
+    expect(await Bun.file(all.path).text()).toBe("new")
+    expect(await Bun.file(final.path).text()).toBe("new")
+  })
 })
 
 describe("examples", () => {
