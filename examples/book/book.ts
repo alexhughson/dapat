@@ -1,27 +1,58 @@
-// Makes a picture book from each books/<book>/text.txt: a page for each group of lines, one image
-// for each page, and out/<book>/book.html. drawImage calls the OpenRouter image API, and each call
-// costs money. Each image also gets every image before it as a reference, so the look stays the same
-// from page to page.
-//
-// Set OPENROUTER_API_KEY, and run it from an empty folder two times: the second run draws no image.
-// The argument is the number of text lines on each page: `bun run book.ts 3`. The default is 2.
+// Makes a picture book from each <folder>/books/<book>/text.txt: a page for each group of lines,
+// one image for each page, and <folder>/out/<book>/book.html. drawImage calls the OpenRouter image
+// API, and each call costs money. Each image also gets every image before it as a reference, so the
+// look stays the same from page to page. Run it with no arguments to see the usage.
 import * as fs from "node:fs"
 import * as fsPromises from "node:fs/promises"
 import path from "node:path"
 import { Build, Task, type Ref } from "dapat"
 import { FileArtifact, FileMatcher, FilesystemPrefix, JsonStore } from "dapat/contrib"
 
+let scriptPath = path.relative(process.cwd(), import.meta.path)
+if (scriptPath.startsWith("..")) {
+  scriptPath = import.meta.path
+}
+const USAGE = `usage: bun ${scriptPath} <folder> [lines per page]
+
+Makes a picture book for each <folder>/books/<book>/text.txt, with the style
+in <folder>/books/<book>/style.txt. It writes <folder>/out/<book>/book.html.
+When <folder>/books/ is missing, it copies two sample books into it.
+
+  <folder>          the work folder. It can be anywhere. It is made if missing.
+  [lines per page]  how many lines of text go on each page. The default is 2.
+
+Set OPENROUTER_API_KEY first. Each image is a paid call to the OpenRouter
+image API. A second run with no edits draws no image.`
+
+function exitWithUsage(problem: string): never {
+  console.error(`${problem}\n\n${USAGE}`)
+  process.exit(2)
+}
+
+const [folderArgument, linesArgument, ...extraArguments] = process.argv.slice(2)
+if (folderArgument === "-h" || folderArgument === "--help") {
+  console.log(USAGE)
+  process.exit(0)
+}
+if (folderArgument === undefined) {
+  exitWithUsage("give the work folder")
+}
+if (extraArguments.length > 0) {
+  exitWithUsage(`too many arguments: ${extraArguments.join(" ")}`)
+}
+const linesPerPage = Number(linesArgument ?? "2")
+if (!Number.isInteger(linesPerPage) || linesPerPage < 1) {
+  exitWithUsage(`lines per page must be a whole number of 1 or more, not '${linesArgument}'`)
+}
 const IMAGE_MODEL = "google/gemini-2.5-flash-image"
 const apiKey = process.env.OPENROUTER_API_KEY
 if (apiKey === undefined || apiKey.length === 0) {
-  throw new Error("set OPENROUTER_API_KEY to an OpenRouter API key")
+  exitWithUsage("set OPENROUTER_API_KEY to an OpenRouter API key")
 }
 
-const linesPerPage = Number(process.argv[2] ?? "2")
-if (!Number.isInteger(linesPerPage) || linesPerPage < 1) {
-  throw new Error(`lines per page must be a whole number of 1 or more, not '${process.argv[2]}'`)
-}
-
+// Every path below is relative to the work folder.
+await fsPromises.mkdir(folderArgument, { recursive: true })
+process.chdir(folderArgument)
 if (!fs.existsSync("books")) {
   await fsPromises.cp(path.join(import.meta.dir, "books"), "books", { recursive: true })
 }

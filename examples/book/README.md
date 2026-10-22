@@ -6,12 +6,12 @@ The images come from the [OpenRouter image API](https://openrouter.ai/docs/guide
 
 ```sh
 export OPENROUTER_API_KEY=...
-mkdir /tmp/book && cd /tmp/book
-bun run <path to dapat>/examples/book/book.ts      # 2 lines on each page
-bun run <path to dapat>/examples/book/book.ts 3    # 3 lines on each page
+bun examples/book/book.ts ~/my-book       # 2 lines on each page
+bun examples/book/book.ts ~/my-book 3     # 3 lines on each page
+bun examples/book/book.ts                 # prints the usage
 ```
 
-The first run copies the sample books (`hamlet`, 9 lines, and `owl`, 4 lines) into `books/`. With 2 lines on each page, that is 5 + 2 pages, so it draws 7 images.
+The first argument is the work folder. It can be anywhere, and the script makes it if it is missing. The script reads `books/` and writes `out/` and `.dapat/` in that folder. The first run copies the sample books (`hamlet`, 9 lines, and `owl`, 4 lines) into `books/`. With 2 lines on each page, that is 5 + 2 pages, so it draws 7 images.
 
 The number of references that a model accepts varies by provider. A long book sends many references with its last pages.
 
@@ -41,6 +41,6 @@ These counts start from the sample books, with 2 lines on each page.
 | `touch` every file | 0 |
 | change `books/owl/style.txt` | 2, every `owl` image |
 | change line 4 of `hamlet` | 4: page 001 and each page after it, because each image reads every image before it |
-| run with `3` | 5: every page changes |
+| run with `3` as the second argument | 5: every page changes |
 
 `chunk` writes every page again on each run. The default stamp is a hash of the bytes, so only the pages with new bytes make their images run again. With `{ stamp: "time" }`, adding one line would draw all 5 `hamlet` images again.
