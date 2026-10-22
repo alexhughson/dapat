@@ -7,10 +7,10 @@ content/<lang>/<section>/<slug>.md   the pages
 templates/<lang>.html                one template for each lang, with {{body}}
 ```
 
-It makes two kinds of tasks:
+It has two `build.each` calls. Each one uses the one-task form (`name` and `run`) and names its output with a `FileTemplate`:
 
 - `page:<lang>/<section>/<slug>` joins each page to the template of its lang on the shared var `lang`, and writes `site/<lang>/<section>/<slug>.html`.
-- `sitemap:<lang>` reads the folder `content/<lang>/` and writes `site/<lang>/sitemap.txt`.
+- `sitemap:<lang>` gets the list of page files of its lang from `FileGroupMatcher("content/<lang>/*/*.md")`, and writes `site/<lang>/sitemap.txt`.
 
 Run it two times from any folder:
 
