@@ -162,9 +162,9 @@ build.each({
       inputs,
       outputs: [outputs.scene],
       run: async () => {
-        const planText = await Bun.file(matched.plan.data.path).text()
-        const textText = await Bun.file(matched.text.data.path).text()
-        const styleText = await Bun.file(matched.style.data.path).text()
+        const planText = await Bun.file(plan.path).text()
+        const textText = await Bun.file(text.path).text()
+        const styleText = await Bun.file(style.path).text()
         const pageText = await Bun.file(matched.page.data.path).text()
         let notesText = "None."
         if (notes !== null) {
@@ -252,11 +252,13 @@ build.add(
 )
 
 // pdf puts every page image into one PDF, in name order. One image fills one page.
+// It also reads pages/, so it waits for chunk. On the first run, the image tasks exist only after
+// chunk reports the pages, so images/ alone has no producer to wait for, and pdf would run at once.
 const bookPdf = new FileArtifact("book.pdf")
 build.add(
   new Task({
     id: "pdf",
-    inputs: [imagesFolder],
+    inputs: [pagesFolder, imagesFolder],
     outputs: [bookPdf],
     run: async () => {
       const imageFiles = (await imagesFolder.list()).filter((file) => file.endsWith(".png"))
