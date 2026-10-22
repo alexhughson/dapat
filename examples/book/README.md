@@ -42,8 +42,12 @@ A `{{name}}` that the step has no value for fails the task, with the list of the
 
 Both calls go to OpenRouter. Each call costs money, so the script prints how many calls each run made.
 
-- Scenes: the [chat completions API](https://openrouter.ai/docs/api/reference/overview) with `anthropic/claude-sonnet-5.5` (`TEXT_MODEL`).
-- Images: the [image API](https://openrouter.ai/docs/guides/overview/multimodal/image-generation) with `google/gemini-nano-banana-2.1` (`IMAGE_MODEL`). It accepts up to 14 reference images. Each page sends at most 10.
+- Scenes: the [chat completions API](https://openrouter.ai/docs/api/reference/overview) with `anthropic/claude-opus-5.5` (`TEXT_MODEL`).
+- Images: the [image API](https://openrouter.ai/docs/guides/overview/multimodal/image-generation) with `openai/gpt-image-2.5-flare` (`IMAGE_MODEL`). It accepts up to 16 reference images. Each page sends at most 10.
+
+The model returns PNGs of about 3 MB. The script shrinks each reference to 384 px on its longest side (`REFERENCE_SIZE`) and sends it as a JPEG. The model bills a reference by its size in pixels, so a full-size reference costs about 1500 input tokens and a 384 px reference about 400. With 10 full-size references, the request was 40 MB and the references were 90% of the cost of the image.
+
+A dropped connection, a 429 or a 5xx is sent again after 5, 15 and 45 seconds (`RETRY_WAIT_SECONDS`). OpenRouter does not bill an image that fails. Any other status fails the task at once, with the reply in the error.
 
 ## The tasks
 

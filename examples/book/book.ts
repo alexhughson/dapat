@@ -16,6 +16,10 @@ const TEXT_MODEL = "anthropic/claude-opus-5.5"
 const DEFAULT_LINES_PER_PAGE = 2
 const FIRST_REFERENCES = 5
 const RECENT_REFERENCES = 5
+// The model returns PNGs of about 3 MB, and each reference costs input tokens by its size in pixels.
+// At full size, 10 references made a 40 MB request and 90% of the cost of the image.
+const REFERENCE_SIZE = 384
+const RETRY_WAIT_SECONDS = [5, 15, 45]
 
 const USAGE = `usage: bun ${scriptPath()} <book folder> [lines per page]
 
@@ -219,12 +223,13 @@ build.each({
         const styleText = await Bun.file(style.path).text()
         const sceneText = await Bun.file(scene.path).text()
         const pageTextContent = await Bun.file(pageText.path).text()
-        const earlierBytes: Uint8Array[] = []
+        const references: string[] = []
         for (const earlier of earlierImages) {
-          earlierBytes.push(await earlier.read())
+          const small = new Bun.Image(await earlier.read()).resize(REFERENCE_SIZE, REFERENCE_SIZE, { fit: "inside" })
+          references.push(await small.jpeg().dataurl())
         }
         const prompt = await imagePrompt.fill({ style: styleText.trim(), scene: sceneText.trim(), page: pageTextContent.trim() })
-        await Bun.write(outputs.image.path, await generateImage(prompt, earlierBytes))
+        await Bun.write(outputs.image.path, await generateImage(prompt, references))
       },
     })
   },
@@ -345,40 +350,78 @@ function pageName(index: number): string {
 
 async function promptLlm(prompt: string): Promise<string> {
   sceneCalls += 1
-  const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-    method: "POST",
-    headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
-    body: JSON.stringify({ model: TEXT_MODEL, messages: [{ role: "user", content: prompt }] }),
-  })
-  if (!response.ok) {
-    throw new Error(`chat API: ${response.status} ${await response.text()}`)
+  const body = (await postToOpenRouter("chat/completions", {
+    model: TEXT_MODEL,
+    messages: [{ role: "user", content: prompt }],
+  })) as { choices?: { message: { content: string } }[] }
+  if (body.choices === undefined || body.choices.length === 0) {
+    throw new Error(`chat API: the reply has no message: ${JSON.stringify(body).slice(0, 500)}`)
   }
-  const body = (await response.json()) as { choices: { message: { content: string } }[] }
   return body.choices[0]!.message.content
 }
 
-async function generateImage(prompt: string, earlierImages: Uint8Array[]): Promise<Uint8Array> {
+/** referenceUrls are data URLs of earlier images. */
+async function generateImage(prompt: string, referenceUrls: string[]): Promise<Uint8Array> {
   imageCalls += 1
   const inputReferences = []
-  for (const earlier of earlierImages) {
-    const url = `data:image/png;base64,${Buffer.from(earlier).toString("base64")}`
+  for (const url of referenceUrls) {
     inputReferences.push({ type: "image_url", image_url: { url } })
   }
-  const response = await fetch("https://openrouter.ai/api/v1/images", {
-
-    method: "POST",
-    headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
-    body: JSON.stringify({ model: IMAGE_MODEL, prompt, input_references: inputReferences }),
-  })
-  if (!response.ok) {
-    throw new Error(`image API: ${response.status} ${await response.text()}`)
+  const body = (await postToOpenRouter("images", {
+    model: IMAGE_MODEL,
+    prompt,
+    input_references: inputReferences,
+  })) as { data?: { b64_json: string; media_type?: string }[] }
+  if (body.data === undefined || body.data.length === 0) {
+    throw new Error(`image API: the reply has no image: ${JSON.stringify(body).slice(0, 500)}`)
   }
-  const body = (await response.json()) as { data: { b64_json: string; media_type?: string }[] }
   const image = body.data[0]!
   if (image.media_type !== "image/png") {
     throw new Error(`image API: expected image/png, got ${image.media_type}`)
   }
   return Buffer.from(image.b64_json, "base64")
+}
+
+/**
+ * Sends one request to the OpenRouter API and returns the JSON reply. A dropped connection, a 429
+ * and a 5xx are sent again after each wait in RETRY_WAIT_SECONDS. OpenRouter does not bill a failed
+ * image, and a 502 is how it reports one. Other statuses throw at once.
+ */
+async function postToOpenRouter(endpoint: string, request: object): Promise<unknown> {
+  for (let attempt = 0; ; attempt++) {
+    let status = 0
+    let text = ""
+    try {
+      const response = await fetch(`https://openrouter.ai/api/v1/${endpoint}`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+        body: JSON.stringify(request),
+      })
+      text = await response.text()
+      status = response.status
+    } catch (error) {
+      text = String(error)
+    }
+    if (status === 200) {
+      try {
+        return JSON.parse(text)
+      } catch {
+        throw new Error(`${endpoint}: 200, but the reply is not JSON: ${text.slice(0, 500)}`)
+      }
+    }
+    let statusText = String(status)
+    if (status === 0) {
+      statusText = "no reply"
+    }
+    const problem = `${endpoint}: ${statusText}: ${text.slice(0, 500)}`
+    const canRetry = status === 0 || status === 429 || status >= 500
+    if (!canRetry || attempt === RETRY_WAIT_SECONDS.length) {
+      throw new Error(problem)
+    }
+    const waitSeconds = RETRY_WAIT_SECONDS[attempt]!
+    console.error(`${problem}\nsend again in ${waitSeconds} s`)
+    await Bun.sleep(waitSeconds * 1000)
+  }
 }
 
 function defaultScenePrompt(): string {
