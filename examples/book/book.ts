@@ -6,7 +6,7 @@
 import * as fs from "node:fs"
 import * as fsPromises from "node:fs/promises"
 import path from "node:path"
-import { Build, Task } from "dapat"
+import { Artifact, Build, Task } from "dapat"
 import { FileArtifact, FileMatcher, FileTemplate, FilesystemPrefix, JsonStore } from "dapat/contrib"
 
 const IMAGE_MODEL = "google/gemini-nano-banana-2.1"
@@ -24,6 +24,11 @@ Makes a picture book from the files in <book folder>:
   style.txt             the look of the images.
   page<nnn>_notes.txt   optional. Strict notes for the picture of one page, for example
                         page003_notes.txt for pages/003.txt. The LLM puts them into the scene.
+  scene_prompt.txt      optional. Replaces the default prompt of the scene step. It can use
+                        {{plan}}, {{page}}, {{notes}} and {{previous_scene}}.
+  image_prompt.txt      optional. Replaces the default prompt of the image step. It can use
+                        {{style}} and {{scene}}.
+  Run with --prompts to print the default prompts.
 
 It writes pages/, scenes/, images/ and book.html into the book folder. When the
 book folder is missing, it copies a sample book into it.
@@ -36,6 +41,52 @@ OpenRouter. A second run with no edits makes no call.`
 
 const { bookFolder, linesPerPage, apiKey } = await validateArgs()
 
+/**
+ * The prompt of one step. The text is <name>_prompt.txt in the book folder when that file exists,
+ * and the default text in this script when it does not. The stamp is a hash of the text, so an edit
+ * to either one makes the tasks that read the prompt run again.
+ */
+class PromptArtifact extends Artifact<string> {
+  readonly id: string
+  readonly overrideFile: FileArtifact
+
+  constructor(
+    readonly name: string,
+    readonly defaultText: string,
+  ) {
+    super()
+    this.id = `prompt:${name}`
+    this.overrideFile = new FileArtifact(`${name}_prompt.txt`)
+  }
+
+  async stamp(): Promise<string> {
+    const hasher = new Bun.CryptoHasher("sha256")
+    hasher.update(await this.read())
+    return hasher.digest("hex")
+  }
+
+  async read(): Promise<string> {
+    let text = this.defaultText
+    if (await Bun.file(this.overrideFile.path).exists()) {
+      text = await Bun.file(this.overrideFile.path).text()
+    }
+    return text.trim()
+  }
+
+  /** The text with each {{name}} replaced. Throws on a {{name}} that has no value. */
+  async fill(values: Record<string, string>): Promise<string> {
+    let filled = await this.read()
+    for (const [key, value] of Object.entries(values)) {
+      filled = filled.replaceAll(`{{${key}}}`, () => value)
+    }
+    const unknown = filled.match(/\{\{\w+\}\}/)
+    if (unknown !== null) {
+      throw new Error(`${this.name} prompt: ${unknown[0]} has no value; the names are ${Object.keys(values).join(", ")}`)
+    }
+    return filled
+  }
+}
+
 let sceneCalls = 0
 let imageCalls = 0
 const build = new Build({ store: new JsonStore(".dapat/state.json") })
@@ -43,6 +94,8 @@ const text = new FileArtifact("text.txt")
 const plan = new FileArtifact("plan.txt")
 const style = new FileArtifact("style.txt")
 const pagesFolder = new FilesystemPrefix("pages/")
+const scenePrompt = new PromptArtifact("scene", defaultScenePrompt())
+const imagePrompt = new PromptArtifact("image", defaultImagePrompt())
 
 // chunk writes one file for each page. It does not know the page count before it runs, so it
 // declares the folder and reports each page. Each report makes the scene and image tasks of that page.
@@ -92,7 +145,7 @@ build.each({
       notes = matched.notes.data
     }
     let previousScene: FileArtifact | null = null
-    const inputs = [plan, matched.page.data]
+    const inputs: Artifact[] = [scenePrompt, plan, matched.page.data]
     if (notes !== null) {
       inputs.push(notes)
     }
@@ -107,15 +160,20 @@ build.each({
       run: async () => {
         const planText = await Bun.file(plan.path).text()
         const pageText = await Bun.file(matched.page.data.path).text()
-        let notesText: string | null = null
+        let notesText = "None."
         if (notes !== null) {
           notesText = await Bun.file(notes.path).text()
         }
-        let previousSceneText: string | null = null
+        let previousSceneText = "None. This is the first page."
         if (previousScene !== null) {
           previousSceneText = await Bun.file(previousScene.path).text()
         }
-        const prompt = scenePrompt(planText, pageText, notesText, previousSceneText)
+        const prompt = await scenePrompt.fill({
+          plan: planText,
+          page: pageText,
+          notes: notesText,
+          previous_scene: previousSceneText,
+        })
         await Bun.write(outputs.scene.path, await promptLlm(prompt))
       },
     })
@@ -141,7 +199,7 @@ build.each({
     }
     yield new Task({
       id: `image:${vars.page}`,
-      inputs: [scene, style, ...earlierImages],
+      inputs: [imagePrompt, scene, style, ...earlierImages],
       outputs: [outputs.image],
       run: async () => {
         const styleText = await Bun.file(style.path).text()
@@ -150,7 +208,7 @@ build.each({
         for (const earlier of earlierImages) {
           earlierBytes.push(await earlier.read())
         }
-        const prompt = imagePrompt(styleText, sceneText)
+        const prompt = await imagePrompt.fill({ style: styleText.trim(), scene: sceneText.trim() })
         await Bun.write(outputs.image.path, await generateImage(prompt, earlierBytes))
       },
     })
@@ -195,6 +253,10 @@ async function validateArgs(): Promise<{ bookFolder: string; linesPerPage: numbe
   const [bookArgument, linesArgument, ...extraArguments] = process.argv.slice(2)
   if (bookArgument === "-h" || bookArgument === "--help") {
     console.log(USAGE)
+    process.exit(0)
+  }
+  if (bookArgument === "--prompts") {
+    console.log(`== scene_prompt.txt\n${defaultScenePrompt()}\n\n== image_prompt.txt\n${defaultImagePrompt()}`)
     process.exit(0)
   }
   if (bookArgument === undefined) {
@@ -279,26 +341,22 @@ async function generateImage(prompt: string, earlierImages: Uint8Array[]): Promi
   return Buffer.from(image.b64_json, "base64")
 }
 
-function scenePrompt(plan: string, page: string, notes: string | null, previousScene: string | null): string {
-  let previous = "This is the first page."
-  if (previousScene !== null) {
-    previous = `The description of the picture on the page before:\n${previousScene}`
-  }
-  let notesPart = ""
-  if (notes !== null) {
-    notesPart = `\nNotes from the author for this picture. They win over the plan and the page before:\n${notes}\n`
-  }
+function defaultScenePrompt(): string {
   return `You write the picture descriptions for a children's picture book. An image model draws each
 description. Image models follow plain descriptions well and conditions badly, so do the thinking
 here and give the image model only what it must draw.
 
 The goals of the plot:
-${plan}
+{{plan}}
 
-${previous}
-${notesPart}
+The description of the picture on the page before:
+{{previous_scene}}
+
+Notes from the author for this picture. They win over the plan and the page before:
+{{notes}}
+
 The text of this page:
-${page}
+{{page}}
 
 Write the description of the one picture for this page. Rules:
 - Describe only what is visible: each character with their looks and clothes, what they do, where
@@ -309,10 +367,10 @@ Write the description of the one picture for this page. Rules:
 - Use 4 to 6 sentences. Reply with only the description.`
 }
 
-function imagePrompt(style: string, scene: string): string {
+function defaultImagePrompt(): string {
   return `A children's picture book illustration. Draw the same characters as in the reference images.
 
-Style: ${style.trim()}
+Style: {{style}}
 
-${scene.trim()}`
+{{scene}}`
 }

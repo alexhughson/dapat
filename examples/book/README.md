@@ -19,9 +19,24 @@ When the folder is missing, the script copies the sample book [samples/hamlet](s
 | `plan.txt` | yes | the goals of the plot; the LLM reads it for each scene |
 | `style.txt` | yes | the look of the images |
 | `page<nnn>_notes.txt` | optional | strict notes for one picture, for example `page003_notes.txt` for `pages/003.txt`. The LLM puts them into the scene of that page |
+| `scene_prompt.txt` | optional | replaces the default prompt of the scene step; it can use `{{plan}}`, `{{page}}`, `{{notes}}` and `{{previous_scene}}` |
+| `image_prompt.txt` | optional | replaces the default prompt of the image step; it can use `{{style}}` and `{{scene}}` |
 | `pages/`, `scenes/`, `images/`, `book.html`, `.dapat/` | no | the outputs and the store |
 
-To tune a book, edit `plan.txt` and `style.txt` first. To force one picture, add a notes file for its page.
+To tune a book, edit `plan.txt` and `style.txt` first. To force one picture, add a notes file for its page. To change how the models are asked, copy a default prompt into a prompt file and edit it. `bun examples/book/book.ts --prompts` prints the defaults.
+
+## Prompts as artifacts
+
+Each prompt is a `PromptArtifact`, a small subclass of `Artifact` in `book.ts`. Its text is the prompt file when the file exists, and the default string in the code when it does not. Its stamp is a hash of that text, and the scene or image tasks list it as an input. So a task runs again only when the text that it sends changes:
+
+| Change | Tasks that run again |
+| --- | --- |
+| the default in the code, with no prompt file | every task of that step |
+| the default in the code, with a prompt file | none |
+| add a prompt file with new text, change it, or delete it | every task of that step |
+| add a prompt file with the same text as the default | none |
+
+A `{{name}}` that the step has no value for fails the task, with the list of the names.
 
 ## The models
 
