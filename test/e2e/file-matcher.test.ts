@@ -3,7 +3,7 @@ import * as fsPromises from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import { Build, Task, TaskGroup, type MatchedArtifactEvent } from "../../src/index"
-import { FileArtifact, FileMatcher } from "../../contrib/fs"
+import { FileArtifact, FileMatcher, FilesystemPrefix } from "../../contrib/fs"
 import { JsonStore } from "../../contrib/store"
 
 const temps: string[] = []
@@ -49,6 +49,15 @@ function varsText(vars: Readonly<Record<string, string>>): string {
   return parts.join(" ")
 }
 
+/** A promise and the function that resolves it. */
+function gate(): { opened: Promise<void>; open: () => void } {
+  let open = () => {}
+  const opened = new Promise<void>((resolve) => {
+    open = resolve
+  })
+  return { opened, open }
+}
+
 function taskIds(tasks: readonly Task[]): string[] {
   const ids: string[] = []
   for (const task of tasks) {
@@ -66,9 +75,9 @@ describe("FileMatcher pattern", () => {
   })
 
   test("throws for a pattern with * or **", () => {
-    expect(() => new FileMatcher("content/*.md")).toThrow("'*' and '**' are not supported yet")
-    expect(() => new FileMatcher("content/**/<slug>.md")).toThrow("'*' and '**' are not supported yet")
-    expect(() => new FileMatcher("content/<lang>/*")).toThrow("'*' and '**' are not supported yet")
+    expect(() => new FileMatcher("content/*.md")).toThrow("'*' and '**' are not allowed")
+    expect(() => new FileMatcher("content/**/<slug>.md")).toThrow("'*' and '**' are not allowed")
+    expect(() => new FileMatcher("content/<lang>/*")).toThrow("'*' and '**' are not allowed")
   })
 
   test("throws for two vars with nothing between them, and for an empty pattern", () => {
@@ -247,9 +256,9 @@ describe("FileMatcher artifact events", () => {
     matcher.receiveArtifactEvent({ kind: "promised", output: kept, taskId: "write" })
     expect(events).toEqual(["found slug=kept posts/kept.md"])
     // The record map is private. Bracket access reads it here only to show that it does not grow.
-    expect(matcher["knownFiles"].size).toBe(1)
+    expect(matcher["fileStates"]["knownFiles"].size).toBe(1)
     matcher.receiveArtifactEvent({ kind: "withdrawn", output: kept, taskId: "write" })
-    expect(matcher["knownFiles"].size).toBe(0)
+    expect(matcher["fileStates"]["knownFiles"].size).toBe(0)
   })
 
   test("an output that moves from one task to another gives gone and then found", async () => {
@@ -473,9 +482,9 @@ describe("FileMatcher in a build", () => {
         id: "remover",
         inputs: [new FileArtifact(path.join(root, "seed.txt"))],
         outputs: [gate],
-        run: async (ctx) => {
+        run: async () => {
           await Bun.write(gate.path, "open")
-          ctx.remove("writer")
+          build.remove("writer")
         },
       }),
     )
@@ -508,6 +517,228 @@ describe("FileMatcher in a build", () => {
     expect(taskIds(result.cancelled)).toEqual(["publish:x", "writer"])
     expect(publishRuns).toBe(0)
   })
+
+  test("a task that deletes a matched file and writes it again does not let a reader go on with the old output", async () => {
+    const root = await tempDir()
+    const seedPath = path.join(root, "seed.txt")
+    await writeText(seedPath, "one")
+    // The files of an earlier build. Thus "read" has an input file in the first build.
+    await writeText(path.join(root, "gen", "a.txt"), "one")
+    await writeText(path.join(root, "out", "a.txt"), "one")
+    const store = new JsonStore(path.join(root, "state.json"))
+    const seed = new FileArtifact(seedPath)
+    const generated = new FileArtifact(path.join(root, "gen", "a.txt"))
+    const copied = new FileArtifact(path.join(root, "out", "a.txt"))
+    const final = new FileArtifact(path.join(root, "final.txt"))
+
+    async function buildOnce() {
+      const build = new Build({ store })
+      // "rewrite" deletes gen/a.txt and writes it again. The matcher sends gone, and then found.
+      build.add(
+        new Task({
+          id: "rewrite",
+          inputs: [seed],
+          outputs: [new FilesystemPrefix(path.join(root, "gen"))],
+          run: async (ctx) => {
+            const text = await Bun.file(seedPath).text()
+            await fsPromises.rm(generated.path, { force: true })
+            ctx.deleted(generated)
+            await writeText(generated.path, text)
+            ctx.produced(generated)
+          },
+        }),
+      )
+      // "copy:a" copies gen/a.txt to out/a.txt. The gone event removes it, and the found event adds it again.
+      build.each({
+        matchersByName: { file: new FileMatcher(path.join(root, "gen/<name>.txt")) },
+        *tasks(vars, matched) {
+          const source = matched.file.data
+          const target = new FileArtifact(path.join(root, "out", `${vars.name}.txt`))
+          yield new Task({
+            id: `copy:${vars.name}`,
+            inputs: [source],
+            outputs: [target],
+            run: async () => {
+              const text = await Bun.file(source.path).text()
+              await writeText(target.path, text)
+            },
+          })
+        },
+      })
+      // "read" waits for "copy:a". It must not go on while "copy:a" is out of the build.
+      build.add(
+        new Task({
+          id: "read",
+          inputs: [copied],
+          outputs: [final],
+          run: async () => {
+            const text = await Bun.file(copied.path).text()
+            await writeText(final.path, text)
+          },
+        }),
+      )
+      return build.run()
+    }
+
+    const first = await buildOnce()
+    expect(first.success).toBe(true)
+    expect(await Bun.file(final.path).text()).toBe("one")
+
+    await writeText(seedPath, "two")
+    const second = await buildOnce()
+    expect(second.success).toBe(true)
+    expect(taskIds(second.executed)).toEqual(["copy:a", "read", "rewrite"])
+    expect(await Bun.file(copied.path).text()).toBe("two")
+    expect(await Bun.file(final.path).text()).toBe("two")
+  })
+
+  test("the same, when the task of the match reads a prefix input", async () => {
+    const root = await tempDir()
+    const seedPath = path.join(root, "seed.txt")
+    await writeText(seedPath, "one")
+    // The files of an earlier build. Thus "read" has an input file in the first build.
+    await writeText(path.join(root, "gen", "a", "x.txt"), "one")
+    await writeText(path.join(root, "out", "a.txt"), "one")
+    const store = new JsonStore(path.join(root, "state.json"))
+    const seed = new FileArtifact(seedPath)
+    const generated = new FileArtifact(path.join(root, "gen", "a", "x.txt"))
+    const copied = new FileArtifact(path.join(root, "out", "a.txt"))
+    const final = new FileArtifact(path.join(root, "final.txt"))
+
+    async function buildOnce() {
+      const build = new Build({ store })
+      // "rewrite" deletes gen/a/x.txt and writes it again. The matcher sends gone, and then found.
+      build.add(
+        new Task({
+          id: "rewrite",
+          inputs: [seed],
+          outputs: [new FilesystemPrefix(path.join(root, "gen"))],
+          run: async (ctx) => {
+            const text = await Bun.file(seedPath).text()
+            await fsPromises.rm(generated.path, { force: true })
+            ctx.deleted(generated)
+            await writeText(generated.path, text)
+            ctx.produced(generated)
+          },
+        }),
+      )
+      // "copy:a" reads the folder gen/a/, not the matched file.
+      build.each({
+        matchersByName: { file: new FileMatcher(path.join(root, "gen/<name>/x.txt")) },
+        *tasks(vars) {
+          const folder = new FilesystemPrefix(path.join(root, "gen", vars.name!))
+          const source = path.join(root, "gen", vars.name!, "x.txt")
+          const target = new FileArtifact(path.join(root, "out", `${vars.name}.txt`))
+          yield new Task({
+            id: `copy:${vars.name}`,
+            inputs: [folder],
+            outputs: [target],
+            run: async () => {
+              const text = await Bun.file(source).text()
+              await writeText(target.path, text)
+            },
+          })
+        },
+      })
+      build.add(
+        new Task({
+          id: "read",
+          inputs: [copied],
+          outputs: [final],
+          run: async () => {
+            const text = await Bun.file(copied.path).text()
+            await writeText(final.path, text)
+          },
+        }),
+      )
+      return build.run()
+    }
+
+    const first = await buildOnce()
+    expect(first.success).toBe(true)
+    expect(await Bun.file(final.path).text()).toBe("one")
+
+    await writeText(seedPath, "two")
+    const second = await buildOnce()
+    expect(second.success).toBe(true)
+    expect(taskIds(second.executed)).toEqual(["copy:a", "read", "rewrite"])
+    expect(await Bun.file(copied.path).text()).toBe("two")
+    expect(await Bun.file(final.path).text()).toBe("two")
+  })
+})
+
+describe("FileMatcher in a build: a task that comes and goes during a report", () => {
+  test("a reader waits for the reporter also when the task of the match came after the reader looked", async () => {
+    const root = await tempDir()
+    // The output of an earlier build. No task writes gen/a.txt before the run.
+    await writeText(path.join(root, "out", "a.txt"), "stale")
+    const generated = new FileArtifact(path.join(root, "gen", "a.txt"))
+    const final = new FileArtifact(path.join(root, "final.txt"))
+    const otherDone = gate()
+    const build = new Build()
+    build.add(
+      new Task({
+        id: "rewrite",
+        outputs: [new FilesystemPrefix(path.join(root, "gen"))],
+        run: async (ctx) => {
+          // "copy:a" comes into the build after "read" looked for its producers.
+          await writeText(generated.path, "first")
+          ctx.produced(generated)
+          await new Promise<void>((resolve) => setTimeout(resolve, 5))
+          // The build removes "copy:a".
+          await fsPromises.rm(generated.path)
+          ctx.deleted(generated)
+          // "other" ends while "copy:a" is out of the build.
+          otherDone.open()
+          await new Promise<void>((resolve) => setTimeout(resolve, 20))
+          // The build adds "copy:a" again.
+          await writeText(generated.path, "second")
+          ctx.produced(generated)
+        },
+      }),
+    )
+    build.each({
+      matchersByName: { file: new FileMatcher(path.join(root, "gen/<name>.txt")) },
+      *tasks(vars, matched) {
+        const source = matched.file.data
+        const target = new FileArtifact(path.join(root, "out", `${vars.name}.txt`))
+        yield new Task({
+          id: `copy:${vars.name}`,
+          inputs: [source],
+          outputs: [target],
+          run: async () => {
+            const text = await Bun.file(source.path).text()
+            await writeText(target.path, text)
+          },
+        })
+      },
+    })
+    // "read" waits for "other" only, when it first looks.
+    build.add(
+      new Task({
+        id: "other",
+        outputs: [new FileArtifact(path.join(root, "out", "other.txt"))],
+        run: async () => {
+          await otherDone.opened
+          await writeText(path.join(root, "out", "other.txt"), "other")
+        },
+      }),
+    )
+    build.add(
+      new Task({
+        id: "read",
+        inputs: [new FilesystemPrefix(path.join(root, "out"))],
+        outputs: [final],
+        run: async () => {
+          const text = await Bun.file(path.join(root, "out", "a.txt")).text()
+          await writeText(final.path, text)
+        },
+      }),
+    )
+    const result = await build.run()
+    expect(result.success).toBe(true)
+    expect(await Bun.file(final.path).text()).toBe("second")
+  })
 })
 
 /** A build that sets the tasks of one group in one step, as build.each does. */
@@ -516,3 +747,103 @@ class MovingBuild extends Build {
     this.setTasksOfGroups([{ group, tasks }])
   }
 }
+
+describe("FileMatcher syntax option", () => {
+  test("the default syntax is '<' '>' '*' '**'", () => {
+    const matcher = new FileMatcher("content/<lang>/<slug>.md")
+    expect(matcher.varNames).toEqual(["lang", "slug"])
+    const sameMatcher = new FileMatcher("content/<lang>/<slug>.md", { syntax: {} })
+    expect(sameMatcher.varNames).toEqual(["lang", "slug"])
+    expect(() => new FileMatcher("content/<lang>/*.md", { syntax: {} })).toThrow("'*' and '**' are not allowed")
+  })
+
+  test("finds the files under a root folder whose real name holds '<x>' and '*'", async () => {
+    const root = await tempDir()
+    const strangeFolder = path.join(root, "a<x>*b")
+    await writeText(path.join(strangeFolder, "en", "hello.md"), "")
+    await writeText(path.join(strangeFolder, "fr", "salut.md"), "")
+    await writeText(path.join(root, "aXb", "en", "other.md"), "")
+    const syntax = { varStart: "{", varEnd: "}", anyName: "%", anyFolders: "%%" }
+    const matcher = new FileMatcher(path.join(strangeFolder, "{lang}/{slug}.md"), { syntax })
+    expect(matcher.varNames).toEqual(["lang", "slug"])
+    const events = recordEvents(matcher, root)
+    await matcher.scan(new AbortController().signal)
+    expect(events).toEqual([
+      "found lang=en slug=hello a<x>*b/en/hello.md",
+      "found lang=fr slug=salut a<x>*b/fr/salut.md",
+    ])
+  })
+
+  test("with a custom varStart and varEnd, '<' and '>' are literals in each part", async () => {
+    const root = await tempDir()
+    await writeText(path.join(root, "<old>", "a<1>.md"), "")
+    await writeText(path.join(root, "<old>", "b.md"), "")
+    const matcher = new FileMatcher(path.join(root, "<old>/{slug}<1>.md"), { syntax: { varStart: "{", varEnd: "}" } })
+    expect(matcher.varNames).toEqual(["slug"])
+    const events = recordEvents(matcher, root)
+    await matcher.scan(new AbortController().signal)
+    expect(events).toEqual(["found slug=a <old>/a<1>.md"])
+  })
+
+  test("with a custom anyName, '*' is a literal and the custom glob throws", async () => {
+    const root = await tempDir()
+    await writeText(path.join(root, "notes*", "a.md"), "")
+    const syntax = { anyName: "%", anyFolders: "%%" }
+    const matcher = new FileMatcher(path.join(root, "notes*/<slug>.md"), { syntax })
+    const events = recordEvents(matcher, root)
+    await matcher.scan(new AbortController().signal)
+    expect(events).toEqual(["found slug=a notes*/a.md"])
+    expect(() => new FileMatcher("notes/%.md", { syntax })).toThrow("'%' and '%%' are not allowed")
+    expect(() => new FileMatcher("notes/%%/<slug>.md", { syntax })).toThrow("'%' and '%%' are not allowed")
+  })
+
+  test("a stray custom var marker throws, and the message names the custom markers", () => {
+    const syntax = { varStart: "{", varEnd: "}" }
+    expect(() => new FileMatcher("content/{slug.md", { syntax })).toThrow("each '{' and '}' must enclose a var name")
+    expect(() => new FileMatcher("content/{a}{b}.md", { syntax })).toThrow("the vars {a} and {b} have nothing between them")
+  })
+
+  test("the parse of KeyPattern decides each var: '{{{x}}{.md' has the var x between two literal '{'", async () => {
+    const root = await tempDir()
+    await writeText(path.join(root, "{a{.md"), "")
+    await writeText(path.join(root, "b.md"), "")
+    const syntax = { varStart: "{{", varEnd: "}}" }
+    const matcher = new FileMatcher(path.join(root, "{{{x}}{.md"), { syntax })
+    expect(matcher.varNames).toEqual(["x"])
+    const events = recordEvents(matcher, root)
+    await matcher.scan(new AbortController().signal)
+    expect(events).toEqual(["found x=a {a{.md"])
+  })
+
+  test("the glob message names a var with the custom markers", () => {
+    const syntax = { varStart: "a{", varEnd: "}" }
+    expect(() => new FileMatcher("content/*.md", { syntax })).toThrow("use a var such as a{name} for each part that changes")
+  })
+
+  test("a change to anyFolders alone keeps '*' as the glob, so '**' still throws", () => {
+    const syntax = { anyFolders: "%%" }
+    expect(() => new FileMatcher("content/**/<slug>.md", { syntax })).toThrow("'*' and '%%' are not allowed")
+  })
+
+  test("throws for a syntax that has no single parse", () => {
+    expect(() => new FileMatcher("a/<x>.md", { syntax: { varStart: "" } })).toThrow("FileMatcher syntax: varStart is empty")
+    expect(() => new FileMatcher("a/<x>.md", { syntax: { anyName: "" } })).toThrow("FileMatcher syntax: anyName is empty")
+    expect(() => new FileMatcher("a/{x}.md", { syntax: { varStart: "{", varEnd: "{" } })).toThrow(
+      "varStart and varEnd are both '{'",
+    )
+    expect(() => new FileMatcher("a/<x>.md", { syntax: { varEnd: "/" } })).toThrow("varEnd '/' holds '/'")
+    expect(() => new FileMatcher("a/<x>.md", { syntax: { anyFolders: "a/b" } })).toThrow("anyFolders 'a/b' holds '/'")
+    expect(() => new FileMatcher("a/<x>.md", { syntax: { anyName: "%", anyFolders: "%" } })).toThrow(
+      "anyName and anyFolders are both '%'",
+    )
+    expect(() => new FileMatcher("a/<x>.md", { syntax: { anyName: "%%", anyFolders: "%" } })).toThrow(
+      "anyName '%%' holds anyFolders '%'",
+    )
+    expect(() => new FileMatcher("a/<x>.md", { syntax: { varStart: "*" } })).toThrow("varStart and anyName are both '*'")
+    expect(() => new FileMatcher("a/{{x}.md", { syntax: { varStart: "{{", varEnd: "}", anyName: "{" } })).toThrow(
+      "varStart '{{' holds anyName '{'",
+    )
+    expect(() => new FileMatcher("a/<x>.md", { syntax: { anyFolders: "." } })).toThrow("anyFolders cannot be '.'")
+    expect(() => new FileMatcher("a/<x>.md", { syntax: { anyName: ".." } })).toThrow("anyName cannot be '..'")
+  })
+})

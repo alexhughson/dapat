@@ -23,7 +23,7 @@ When you run a **build**, dapat does these steps for each task:
 2. It compares the current stamps of the inputs and outputs with the stamps from the last successful run. The **store** keeps the last stamps.
 3. It skips the task when every stamp is equal to the stamp from the last run. Otherwise, it runs the task.
 
-dapat does not know about disks or SQL. It only reads artifact ids and stamps. The adapters in `dapat/contrib` supply files, a matcher of files, S3, and stores in JSON and SQLite.
+dapat does not know about disks or SQL. It only reads artifact ids and stamps. The adapters in `dapat/contrib` supply files, two matchers of files, S3, and stores in JSON and SQLite.
 
 You declare tasks with `Build` and `Task`. You can know each task in advance, or your code can decide which tasks to add. Sections 3 to 9 describe this. `build.each` makes tasks for you from the things that matchers find, and joins them on shared var names ([section 10](#10-buildeach-tasks-for-each-matched-artifact)).
 
@@ -43,7 +43,7 @@ The package has two entry points:
 | Import | Contents |
 | --- | --- |
 | `dapat` | `Build`, `TaskGroup`, `Task`, `Artifact`, `Prefix`, `IdPrefix`, `Matcher`, `MemoryStore`, `Result`, and their types |
-| `dapat/contrib` | `FileArtifact`, `FilesystemPrefix`, `FileMatcher` (and the types `FileStampMode` and `FileStampOptions`), `S3ObjectArtifact`, `S3Prefix`, `MemoryS3` (and the types `S3Client`, `S3Head`, and `S3ListEntry`), `JsonStore`, and `SqliteStore` |
+| `dapat/contrib` | `FileArtifact`, `FilesystemPrefix`, `FileMatcher`, `FileGroupMatcher` (and the types `FileStampMode`, `FileStampOptions`, `FilePatternOptions`, and `FilePatternSyntax`), `S3ObjectArtifact`, `S3Prefix`, `MemoryS3` (and the types `S3Client`, `S3Head`, and `S3ListEntry`), `JsonStore`, and `SqliteStore` |
 
 ## 3. First build
 
@@ -121,6 +121,20 @@ The repo has this build in `examples/first-build.ts`. Run it from a folder that 
 - `failed` is a `Map<Task, Error>`.
 - `cancelled` lists the tasks that were replaced or removed before they finished ([section 8](#8-failure-cancellation-and-replacement)).
 - `errors` lists the errors that no task owns: a non-abort error that a task throws after it was replaced or removed ([section 8](#replacement)), and a store delete that rejects ([section 8](#removal)).
+- `outcomes` maps each task to its `Outcome`. An executed outcome has a `reason`: the first difference that the skip check found ([`RunReason`](#type-runreason)).
+
+For example, you edit `in.txt` and run the build again. `upper` runs, and its outcome says why:
+
+```ts
+for (const task of result.executed) {
+  console.log(task.id, result.outcomes.get(task))
+}
+// upper { type: "executed", reason: { kind: "input-changed", id: "file:/abs/path/in.txt" } }
+```
+
+If `upper` writes other text to `mid.txt`, `wrap` runs too, with `input-changed` and the id of `mid.txt`.
+
+dapat sees only the inputs that a task declares. A change to a file that the task reads but does not declare does not make it run.
 
 A failed task does not stop the build. The other tasks continue. `build.run()` does not throw when a task fails, so always check `result.success`. `build.run()` rejects in three cases only: a subscriber throws, a subscriber returns a promise, or subscribers reach the send limit ([section 9](#subscriber-errors)).
 
@@ -352,12 +366,12 @@ An input that no task writes is a **source**, for example `in.txt` in section 3.
 
 Only one task can declare a given artifact as an output. `build.add()` throws `duplicate output '<id>'` when a second task declares the same output id. One task also cannot declare the same output two times. Two tasks can still write into one folder, and a task can write into a folder that it reads. Those tasks can run again with no edits ([Prefix layouts](#prefix-layouts)).
 
-A waiting task finds its producers again each time a task is added, removed, or completed. When a producer finishes, the waiting task continues in this way:
+A waiting task looks for its producers again only when each producer that it waits for has ended, or was replaced or removed. It continues at once when one of them fails. The waiting task continues in this way:
 
 - If the producer executed or skipped, the waiting task goes on to the skip check.
 - If the producer failed, the waiting task fails with `dependency of '<id>' failed`.
 - If the producer was replaced, the waiting task waits for the new task with the same id.
-- If the producer was removed, the waiting task goes on to the skip check. It does not fail.
+- If the producer was removed, the waiting task does not fail. If a running task caused the removal during a call of `ctx.produced` or `ctx.deleted`, each task that reads an output of the removed task first waits for that running task to end. For example, a task deletes a file that a `FileMatcher` matched, and then writes it again: the matcher sends `gone` and then `found`, so the producer comes back. Then the waiting task goes on to the skip check. If that running task fails, the waiting task fails with `dependency of '<id>' failed`.
 
 After `build.run()` starts, a new task looks for its producers when the current synchronous code ends: at the next `await` or `return` of the code that added it. The subscriber calls that the add causes are part of that synchronous code ([The event queue](#the-event-queue)). A producer that you add after an `await` can come too late. Then the consumer waits for it only if the consumer is still waiting for other inputs. A consumer that has already started does not stop.
 
@@ -440,12 +454,10 @@ A task that reads `map:pages/1` now waits for `split`. `ctx.produced()` throws w
 The `ctx` argument of `run` has these members:
 
 - `ctx.signal` is an `AbortSignal`. It aborts when the task is replaced or removed. Pass it to `fetch` and other APIs that accept a signal.
-- `ctx.add(task)` adds a task to the build. The task starts when its inputs are ready.
-- `ctx.remove(id)` removes a task from the build.
 - `ctx.produced(artifact)` tells dapat that the task wrote `artifact`.
 - `ctx.deleted(artifact)` tells dapat that the task deleted `artifact`. dapat does not delete it. An output of the task must cover `artifact`, as for `ctx.produced`.
 
-You can also call `build.add()` and `build.remove()` from outside a task while `build.run()` is running. `build.run()` returns when every task that it started has finished. Subscribers ([section 9](#9-subscribe-to-artifact-events)) run synchronously, so the build does not wait for them separately.
+You can also call `build.add()` and `build.remove()` from inside or outside a task while `build.run()` is running. To call them inside a task, the task keeps a reference to the build, for example by closing over it, as the examples do. `build.run()` returns when every task that it started has finished. Subscribers ([section 9](#9-subscribe-to-artifact-events)) run synchronously, so the build does not wait for them separately.
 
 ## 6. When a task skips
 
@@ -481,6 +493,8 @@ Some more results of the rule:
 - The task has an `IdPrefix` input or output. Its stamp is `null`, so the task runs on each build.
 - A task deletes one of its declared artifact outputs and calls `ctx.deleted`. That output is then missing, so the task runs on each build. To delete an artifact and still skip, declare its folder as a prefix output with a stamp, for example a `FilesystemPrefix`. The task must also have an input. An `IdPrefix` output makes the task run on each build. Call `ctx.deleted` on each run, also when the artifact is already gone. If you do not, dapat sends a `produced` event for the missing output after the task returns.
 
+A task reads a file that it does not declare: dapat does not see it ([Read the result](#read-the-result)).
+
 dapat does not ask which modification time is newer. Older versions of dapat skipped a task when its outputs were newer than its inputs, as `make` does. That check is gone. A file stamp can hold a modification time, but dapat compares it for equality only. Without a store record, a task runs.
 
 dapat stamps the inputs, artifacts and prefixes, before the task runs. It stamps a prefix input after the tasks that write under the prefix have finished. After the task runs with no error, dapat stamps the outputs, artifacts and prefixes. Then it writes the input stamps from before the run and the output stamps from after the run to the store. If an input changes while the task runs, the record keeps the old stamp, so the next build runs the task again. dapat does not write stamps for a failed task, so a failed task runs again on the next build.
@@ -488,14 +502,6 @@ dapat stamps the inputs, artifacts and prefixes, before the task runs. It stamps
 The `stamp()` methods do real I/O. For example, `FileArtifact.stamp()` reads and hashes the full bytes of the file, and `FilesystemPrefix.stamp()` walks the folder and does the same for each file. With `{ stamp: "time" }`, they read only the modification time and the size. dapat calls `stamp()` only when the build has a store. Before a task runs, it always stamps the inputs. It stamps the outputs only when the store has a record for the task.
 
 If `store.get()` or a `stamp()` method throws during this check, the task fails with that error. It does not run. The tasks that read its outputs fail too, as for any failed task.
-
-### 6.1 Why did a task run or skip?
-
-`Result` tells you which tasks ran and which skipped. It does not tell you the reason. To find the reason, do these steps:
-
-1. Read the task's record with `await store.get(taskId)`. If it is `null`, the task has never succeeded with this store, so it runs.
-2. Call `await ref.stamp()` on each input and output. Compare the values with `inputStamps` and `outputStamps` in the record. The key of an artifact is `artifact <id>`, and the key of a prefix is `prefix <id>`. A missing key, an extra key, a different stamp, a `null` output stamp, or a `null` prefix stamp makes the task run.
-3. Make sure that the task declares every file that it reads. dapat does not see an input that the task does not declare. A change to that file does not make the task run.
 
 ## 7. Stores
 
@@ -534,7 +540,8 @@ Add the store file to `.gitignore`. To make tasks run again, see [section 12.1](
 - A task that throws goes into `result.failed` with its error.
 - A task that waits for a failed task also fails, with the error `dependency of '<its own id>' failed`.
 - A task can read a source that does not exist. Then `read()` throws, and the task fails with that error, for example `ENOENT`.
-- A dependency cycle does not stop the build. When no task is running and no task can start, each waiting task fails with `deadlock waiting for inputs of '<id>'`.
+- A dependency cycle does not stop the build. When no task runs, and each task that has not ended waits for a producer, no task can make progress. Then each waiting task looks at its producers one more time. If one of them failed, the task fails with `dependency of '<id>' failed`. Else it fails with `deadlock waiting for inputs of '<id>'`. The tasks look one after the other, so a task can look before a producer in the deadlock fails. That task gets the deadlock message.
+- A task whose producer failed before the deadlock gets `dependency of '<id>' failed`, also when a cycle elsewhere in the build cannot make progress. For example, `C` reads the output of `P`, `P` reads the outputs of `F` and of `G`, `F` throws, and `G` and `H` read each other's output. Then `F` fails with its error, `P` and `C` fail with `dependency of '<id>' failed`, and `G` and `H` fail with `deadlock waiting for inputs of '<id>'`.
 
 ```ts
 const result = await build.run()
@@ -602,7 +609,7 @@ build.subscribe((event) => { ... })
 dapat sends a `promised` event for each declared output, an artifact or a prefix:
 
 - at the start of the first `build.run()`, for each task that you added before it. dapat sends these events before any task starts. Thus a subscriber that you add after `build.add` and before `build.run()` gets them.
-- when you add a task after `build.run()` started, with `build.add`, `ctx.add`, or from a subscriber. dapat sends the events before the outermost call returns ([The event queue](#the-event-queue)).
+- when you add a task after `build.run()` started, with `build.add` or from a subscriber. dapat sends the events before the outermost call returns ([The event queue](#the-event-queue)).
 
 A `promised` event means that the output will exist when the task finishes, unless the task reports it with `ctx.deleted`. Thus a subscriber knows about an output before any task runs.
 
@@ -664,7 +671,7 @@ When a subscriber throws, dapat does these steps:
 3. dapat aborts `ctx.signal` of each running task. It starts no more tasks, sends no more events, and writes no more store records.
 4. `build.run()` rejects with the error, after each running task returned.
 
-The call that caused the send does not throw. This applies to `build.add`, `build.remove`, `ctx.add`, `ctx.remove`, `ctx.produced`, and `ctx.deleted`. dapat changes its own state before it sends, so the call still adds, removes, or replaces the task.
+The call that caused the send does not throw. This applies to `build.add`, `build.remove`, `ctx.produced`, and `ctx.deleted`. dapat changes its own state before it sends, so the call still adds, removes, or replaces the task.
 
 dapat keeps only the first error. It clears the queue and sends no more events, so no later subscriber error can occur.
 
@@ -736,7 +743,7 @@ Inside the build, a `TaskMaterializer` does this work. It acts like a materializ
 
 A matcher also gets each output that a task declares or writes. So a task can make new things while the build runs, and `build.each` makes their tasks in the same run.
 
-For files, use `FileMatcher` from `dapat/contrib` ([`FileMatcher`](#filematcher-one-match-for-each-file)). For other things, write a small subclass of `Matcher` ([Write your own matcher](#write-your-own-matcher)).
+For files, use `FileMatcher` from `dapat/contrib` for one match for each file ([`FileMatcher`](#filematcher-one-match-for-each-file)), or `FileGroupMatcher` for one match with a list of files ([`FileGroupMatcher`](#filegroupmatcher-one-match-with-a-list-of-files)). For other things, write a small subclass of `Matcher` ([Write your own matcher](#write-your-own-matcher)).
 
 ### Example: pages joined to a template
 
@@ -837,7 +844,7 @@ One matcher alone is always valid. Each of its matches is a joined set with one 
 
 `build.each` keeps **indexes** for each matcher. An index maps the values of some var names to the matches that have them. A matcher has one index for each set of var names that the join looks it up by. In the example, `page` has an index by `lang`. When one match changes, `build.each` looks up its partners in these indexes. It does not scan all the matches again. So the join costs one index lookup for each other matcher, and the work for each partner that it finds.
 
-The build itself has a cost that grows with all its tasks. After each change of tasks, it checks every task to see which one can start. `build.each` gives all the changes of one step (the scans, or one pass of a drain) as one change ([Steps of task changes](#steps-of-task-changes)), so one changed template among many pages is one check. Each `build.add` is one change, so many `build.add` calls during a run cost more. `bun bench/join.ts` measures both.
+The build keeps an index of the outputs of all tasks, by id. A task that waits for its inputs finds its producers in this index. It does not check every task. A waiting task looks for its producers again only when each producer that it waits for has ended, or was replaced or removed. When one of these producers fails, the task fails at once. A change of tasks starts only its new tasks. So the scheduling cost of a task grows with the number of its producers, not with the number of all tasks. Two cases still cost more ([Limits](#13-limits)): a prefix class with its own `covers()` (or, for an input, its own `overlaps()`), and producers of one prefix input that come one at a time. `bun bench/scheduler.ts`, `bun bench/book.ts`, and `bun bench/join.ts` measure the cost.
 
 A matcher event that comes while `build.each` handles another one waits. It comes from `tasks`, or from a subscriber of the events of the change. `build.each` handles the waiting events in order, after the current one. Each `build.each` call thus sees each event alone. The tasks still exist before the outermost `send` of the matcher returns.
 
@@ -1009,7 +1016,7 @@ const pages = new FileMatcher("content/<lang>/<section>/<slug>.md")
 const templates = new FileMatcher("templates/<lang>.html")
 ```
 
-[examples/file-pipeline.ts](examples/file-pipeline.ts) is a program that you can run. It joins pages to templates and writes HTML. Run it two times: the second run skips each page.
+[examples/file-pipeline.ts](examples/file-pipeline.ts) is a program that you can run. It joins pages to templates, writes HTML, and makes one sitemap for each lang. Run it two times: the second run skips each task.
 
 #### The pattern
 
@@ -1022,9 +1029,15 @@ const templates = new FileMatcher("templates/<lang>.html")
 - A var also matches a name that starts with `.`. `content/<slug>.md` finds `content/._a.md` with `slug` `"._a"`.
 - A var can come two times. `docs/<lang>/<lang>.md` matches `docs/en/en.md`, and it does not match `docs/en/fr.md`.
 - A pattern with no var names one file. Its `varNames` is `[]`, and it has one match or none.
-- `*` and `**` are not supported yet. The constructor throws for a pattern with `*` or `**`. Use one var for each part that changes. A later version adds them.
+- A `FileMatcher` pattern cannot have `*` or `**`. The constructor throws, and the message names `FileGroupMatcher`. Use one var for each part that changes, or use `FileGroupMatcher` for one match with a list of files ([`FileGroupMatcher`](#filegroupmatcher-one-match-with-a-list-of-files)).
 - An empty pattern throws.
 - A var never takes the value `..`. A file outside the root of the pattern never fits.
+
+The `<`, `>`, `*`, and `**` markers have their meaning in the whole pattern, also in the root folder. When a folder or file name holds one of them, use the `syntax` option to set other markers: `varStart` and `varEnd` for a var, `anyName` for `*`, and `anyFolders` for `**`. Each marker that you leave out keeps its default. A default marker that the syntax replaces is a literal character. The constructor throws for an empty marker, a marker with `/`, an `anyName` or `anyFolders` that is `.` or `..`, two equal markers, and a marker that holds another marker. Only `anyFolders` can hold `anyName`, as `**` holds `*`. Use markers that no folder or file name in the pattern holds.
+
+```ts
+new FileMatcher("/data/a<b>/{lang}/{slug}.md", { syntax: { varStart: "{", varEnd: "}" } })
+```
 
 #### Paths
 
@@ -1065,6 +1078,91 @@ A `promised` event of a `FilesystemPrefix` gives no file name, so it makes no ma
 #### Between runs
 
 dapat does not delete old outputs. When you delete a source file, the next scan does not find it, so its task is not in the build. But the outputs of that task from the last run stay on disk. A `FileMatcher` whose pattern fits those outputs finds them in its scan. For example, a task makes `upper/<slug>.txt` from `content/<slug>.md`, and a second `build.each` uses `new FileMatcher("upper/<slug>.txt")`. When you delete `content/b.md`, the task `upper:b` goes away, but `upper/b.txt` stays, and the task of the second `build.each` for `b` stays too. Delete the old outputs yourself when this is a problem. dapat cannot do it for you, because it is not the only owner of the files in a folder: other tools and people can put files next to the outputs.
+
+### `FileGroupMatcher`: one match with a list of files
+
+`FileGroupMatcher` is in `dapat/contrib`. Its pattern has a `*` or a `**`. It sends one matched artifact for each value of its vars, and the data of the match is the list of the files that fit, sorted by path. So `FileGroupMatcher` is a `Matcher<readonly FileArtifact[]>`.
+
+```ts
+import { FileGroupMatcher } from "dapat/contrib"
+
+const pages = new FileGroupMatcher("site/<lang>/**/*.html")
+```
+
+With the files `site/en/index.html`, `site/en/blog/hello.html`, and `site/fr/index.html`, the scan sends two matches:
+
+```text
+{ vars: { lang: "en" }, data: [<site/en/blog/hello.html>, <site/en/index.html>] }
+{ vars: { lang: "fr" }, data: [<site/fr/index.html>] }
+```
+
+#### The group pattern
+
+- The rules of the [`FileMatcher` pattern](#the-pattern) apply, and the pattern must have a `*` or a `**`. A pattern with no glob throws: use `FileMatcher`.
+- `*` matches any text in one part, but not `/`. Thus `*` never crosses a folder. In a part such as `*.html`, it matches the text before `.html`. It also matches a name that starts with `.`.
+- `**` matches zero or more folders. It must be a whole part, as in `site/**/*.html`. `site/**/*.html` finds `site/a.html` and `site/x/y/b.html`.
+- The last part must name files. A pattern that ends with `**` throws. Use `**/*` for every file under a folder.
+- A var must be in a part before the first part with a `*` or `**`. `site/<lang>/**/*.html` is correct. `site/**/<slug>.html` and `site/<lang>-*/index.html` throw. The names that a glob matches are not vars. To use them, read them from the path of each file, for example with `path.relative`.
+- `varNames` holds only the vars before the first glob. A pattern with no var, for example `notes/*.md`, has `varNames` `[]` and one match or none.
+
+#### The group scan
+
+For the parts before a `**`, the scan works as the scan of `FileMatcher`: it joins a part with no var and no `*` to the path with no read, and reads a folder only for a part with a var or a `*`. At a `**`, it takes every file under the folder, at any depth, as `FilesystemPrefix.list()` does. It follows symlinks, and it does not walk a link back to a folder above it again. Then it keeps the files that fit the whole pattern.
+
+The scan sends one `found` for each group after it has read all the files, not one `found` for each file. The groups come in the order of their first file.
+
+#### Group events during the run
+
+A file is in the list of its group while the file has a match by the rules of `FileMatcher` ([Events during the run](#events-during-the-run)): the file is on disk, as far as the matcher knows, or a task declares it as an output. When a file gets or loses its match, the matcher sends the new list of its group:
+
+| Change of the list | `FileGroupMatcher` sends |
+| --- | --- |
+| The first file of a group | `found` with a list of one file. `build.each` adds the tasks of the group. |
+| A file is added to the list or removed from it | `found` with the new list. `build.each` replaces the tasks of the group in the same task group ([Matched artifact events](#matched-artifact-events-found-and-gone)). |
+| The last file leaves the list | `gone`. `build.each` removes the tasks of the group. |
+
+An event that does not change a list sends nothing. For example, the `produced` event of a file that a task declared sends nothing.
+
+Each `ctx.produced` call is one step ([Steps of task changes](#steps-of-task-changes)). So a task that reports 1,000 files one at a time makes 1,000 lists, and the build replaces the task of the group 1,000 times. Give the task of the group the writer's `FilesystemPrefix` as an input too. Then each replaced task waits for the writer and does not run, so only the last task runs. A task that declares its files as outputs puts them all in one step, so the group gets one list. See [Limits](#13-limits) for the cost.
+
+#### Example: one sitemap for each lang
+
+```ts
+import path from "node:path"
+import { Task } from "dapat"
+import { FileArtifact, FileGroupMatcher } from "dapat/contrib"
+
+build.each({
+  matchersByName: { source: new FileGroupMatcher("content/<lang>/*.md") },
+  *tasks(vars, matched) {
+    const sources = matched.source.data // readonly FileArtifact[], sorted by path
+    const sitemap = new FileArtifact(`sitemaps/${vars.lang}.txt`)
+    yield new Task({
+      id: `sitemap:${vars.lang}`,
+      inputs: sources,
+      outputs: [sitemap],
+      run: async () => {
+        const lines: string[] = []
+        for (const source of sources) {
+          const slug = path.basename(source.path, ".md")
+          lines.push(`${slug}.html`) // for example hello.html
+        }
+        await Bun.write(sitemap.path, `${lines.join("\n")}\n`)
+      },
+    })
+  },
+})
+```
+
+- The group reads the sources in `content/<lang>/`, not the HTML in `site/<lang>/`. dapat does not delete old outputs, so when you delete `content/en/about.md`, `site/en/about.html` stays on disk. A group of `site/<lang>/**/*.html` would still list it, and the sitemap would keep the deleted page ([Between runs](#between-runs)).
+- The sitemap runs again when a source is added, edited, or deleted. A new list makes a new task with new inputs. An edit changes the stamp of a source.
+- When you delete the last source of a lang, the list is empty. The matcher sends `gone`, and the sitemap task of that lang is not in the build. `sitemaps/<lang>.txt` stays on disk with the old pages. Delete it yourself when this is a problem. dapat cannot do it for you, because it is not the only owner of the files in a folder ([Between runs](#between-runs)).
+
+[examples/file-pipeline.ts](examples/file-pipeline.ts) has this rule after the rule of the pages. Run it two times: the second run skips each task.
+
+#### Groups in your own matcher
+
+A matcher that does not read files can also send groups. It groups the things in its own code: its vars hold only the names of the group, and its data is a list of artifacts. It sends `found` with the new list each time the list changes, and `gone` when the list is empty.
 
 ### Matchers
 
@@ -1188,7 +1286,9 @@ build.each({
 
 - `matchersByName` names the matchers. The names are yours. `tasks` gets each matched artifact under the name of its matcher, as `matched.post`. With two or more matchers, they join on their shared var names ([Joins on shared var names](#joins-on-shared-var-names)).
 - `required` (optional) names the matchers that each joined set must have a match of. If you leave it out, every matcher is required ([`required`](#required-matchers-that-a-set-can-do-without)).
+- `outputsByName` (optional) names output templates. `tasks` gets each one filled in with the vars of the set ([`outputsByName`](#outputsbyname-output-templates)).
 - `tasks` gets the vars and the matched artifacts by name of one joined set. It returns the tasks for that set. Write it as a generator (`*tasks`), so it can yield no task, one task, or many tasks.
+- `name` and `run` take the place of `tasks` when each set needs exactly one task ([The one-task form](#the-one-task-form-name-and-run)). Give `tasks`, or `name` and `run`, not both.
 
 `tasks` can yield more than one task for a match:
 
@@ -1203,6 +1303,74 @@ build.each({
 Each joined set has one task group ([Task groups](#task-groups)). With one matcher, each match is a joined set. The label of the group is `build.each <number> <var name>=<var value> ...`, for example `build.each 1 slug=hello`. dapat counts the `build.each` calls from 1, in order. The vars are in the order of `vars` ([Joins on shared var names](#joins-on-shared-var-names)). A task id must be unique in the build. If two joined sets give one task id, or a match gives the id of a task that you added with `build.add`, `build.run()` rejects ([Errors in `build.each`](#errors-in-buildeach)). So put the vars in the task id, as `page:${vars.slug}` does.
 
 Call `build.each` before the first `build.run()`. After that, it throws.
+
+### `outputsByName`: output templates
+
+An output template names the output of a task with the same vars as the matchers. For each joined set, the build fills in each template and gives the results to `tasks` as its third argument:
+
+```ts
+build.each({
+  matchersByName: {
+    page: new FileMatcher("content/<lang>/<section>/<slug>.md"),
+    template: new FileMatcher("templates/<lang>.html"),
+  },
+  outputsByName: { html: new FileTemplate("site/<lang>/<section>/<slug>.html") },
+  *tasks(vars, matched, outputs) {
+    yield new Task({
+      id: `page:${vars.lang}/${vars.section}/${vars.slug}`,
+      inputs: [matched.page.data, matched.template.data],
+      outputs: [outputs.html],
+      run: async () => {
+        const text = await Bun.file(matched.page.data.path).text()
+        const layout = await Bun.file(matched.template.data.path).text()
+        await Bun.write(outputs.html.path, layout.replace("{{body}}", () => text))
+      },
+    })
+  },
+})
+```
+
+`outputs.html` is a `FileArtifact`, typed from the template. A template only names a path: the task must still list it in `outputs`. `FolderTemplate("out/<book>/pages/")` gives a `FilesystemPrefix`. Both take the options of `FileMatcher` (`stamp` and `syntax`). A `*` or `**` makes the constructor throw, because an output names one path.
+
+- Each var of a template must be a var of some matcher. Else `build.each` throws.
+- A set with no value for a var of a template gets no tasks: the build does not call `tasks` for it. This happens when the var comes only from a matcher that is not in `required` and has no match in the set.
+- A var value that is empty, holds `/`, or is `.` or `..` makes the build fail.
+
+### The one-task form: `name` and `run`
+
+When each joined set needs one task whose inputs are the matched artifacts, give `name` and `run` in place of `tasks`. The example above becomes:
+
+```ts
+build.each({
+  name: "page",
+  matchersByName: {
+    page: new FileMatcher("content/<lang>/<section>/<slug>.md"),
+    template: new FileMatcher("templates/<lang>.html"),
+  },
+  outputsByName: { html: new FileTemplate("site/<lang>/<section>/<slug>.html") },
+  async run({ matched, outputs }) {
+    const text = await Bun.file(matched.page.data.path).text()
+    const layout = await Bun.file(matched.template.data.path).text()
+    await Bun.write(outputs.html.path, layout.replace("{{body}}", () => text))
+  },
+})
+```
+
+The build makes one task for each joined set:
+
+```
+for each joined set:
+├── outputs = each template of outputsByName, filled in, in its order -> outputs.html = site/en/docs/install.html
+│   (a template that the set has no value for: no task)
+├── id      = name + ":" + the values of vars joined by "/"           -> "page:en/docs/install"
+├── inputs  = the data of each matched artifact, in matchersByName order
+│   (a group adds each of its files; a matcher with no match adds nothing)
+└── run     = (ctx) => run({ vars, matched, outputs, ctx })
+```
+
+The values are in the order of `vars` ([Joins on shared var names](#joins-on-shared-var-names)). A var with no value in the set, from a matcher that is not required, adds no part. A set with no vars gets the id `name`. The id follows the order of `matchersByName`. If you change that order, each id changes, so each task runs again. An optional match that comes or goes also changes the id of its set ([Limits](#13-limits)).
+
+Two sets can give one id when a var has no value in one set and another var has a value in the other set. For example, with `A: a/<a>/<lang>.txt` before the required `P: p/<lang>.txt`, and `B: b/<lang>/<b>.txt`, the sets `{ a: "en", lang: "x" }` and `{ lang: "en", b: "x" }` both give `page:en/x`. Then `build.run()` rejects with the duplicate-id error ([Errors in `build.each`](#errors-in-buildeach)). Use `tasks` for such a join. Use `tasks` also when a task needs an input that no matcher gives, an output that no template can name, or more than one task for each set.
 
 ### Scans finish before tasks start
 
@@ -1248,6 +1416,8 @@ build.each({
 
 When `split` returns, `summary:0`, `summary:1`, and `summary:2` exist. They run in the same `build.run()`. On the next build, the scan finds the chapters of the last run. Each summary task then waits for `split`, because the output `chapters` of `split` covers its input.
 
+[examples/book-chapters.ts](examples/book-chapters.ts) is a program that you can run. It splits each `books/<book>.md` into `chapters/<book>/<n>.md`, and makes `summaries/<book>/<n>.txt` from each chapter. It prints a line when each summary task appears, between the lines of its split task. Run it two times: the second run skips each task.
+
 ### Errors in `build.each`
 
 The `tasks` function and a matcher are part of your program, like a subscriber. A mistake in them makes `build.run()` reject ([Subscriber errors](#subscriber-errors)).
@@ -1263,7 +1433,8 @@ An error in `build.each` is fatal for the build, as a subscriber error is. The `
 | `build.each` | one matcher object is under two names | `build.each` throws |
 | `build.each` | you call it after `build.run()` | `build.each` throws |
 | `build.each` | one of its matchers is used by another `Build` | `build.each` throws, and names the matcher |
-| `new FileMatcher` | the pattern has `*`, `**`, a `..` part, a `<` or `>` that does not enclose a valid var name, two vars with nothing between them, or no text | the constructor throws |
+| `new FileMatcher` | the `syntax` option is invalid, or the pattern has `*`, `**`, a `..` part, a `<` or `>` that does not enclose a valid var name, two vars with nothing between them, or no text | the constructor throws |
+| `new FileGroupMatcher` | the pattern has no `*` or `**`, a var in or after the first part with a glob, a `**` at the end or inside a name, or one of the errors of `FileMatcher` other than the glob | the constructor throws |
 | a scan | it throws, for example your own matcher reads a folder that does not exist | `build.run()` rejects at once, and no task runs. The other scans get an aborted `signal`. `build.run()` does not wait for them. |
 | a matched artifact or a `gone` | its vars are not the `varNames` of its matcher | `build.run()` rejects |
 | `tasks` | two matches give one task id | `build.run()` rejects with `task 'x' is in two groups: 'build.each 1 slug=a' and 'build.each 1 slug=b'` |
@@ -1282,7 +1453,7 @@ The [API reference](#api-reference) gives the full details of each class.
 
 A relative path resolves against the current working directory when you create the object.
 
-To make tasks for each file that fits a pattern, use `FileMatcher` ([`FileMatcher`](#filematcher-one-match-for-each-file)).
+To make tasks for each file that fits a pattern, use `FileMatcher` ([`FileMatcher`](#filematcher-one-match-for-each-file)). To make tasks for each list of files, use `FileGroupMatcher` ([`FileGroupMatcher`](#filegroupmatcher-one-match-with-a-list-of-files)). To name the output file or folder of each joined set, use `FileTemplate` or `FolderTemplate` in `outputsByName` ([`outputsByName`](#outputsbyname-output-templates)).
 
 | Class | Stamp | Value |
 | --- | --- | --- |
@@ -1451,12 +1622,22 @@ A new checkout changes the modification time of each file. The default `stamp: "
 - **Only a missing path counts as missing.** `FileArtifact` returns a `null` stamp, and `FilesystemPrefix` returns the stamp of an empty list and lists no files, only for `ENOENT`. Every other error makes `stamp()` throw, so the task fails with that error, for example a permission error, or a file where a folder must be. In `"time"` mode, dapat reads only the metadata of a file. A file that the task cannot read still gets a stamp, and `read()` fails later.
 - **The skip rule ignores the order and the repeats of the inputs.** The record keeps the stamps by id. So a task that ran with the inputs `[a, b]` skips with `[b, a]`, and a task that ran with `[a]` skips with `[a, a]`. If the result of a task depends on the order of its inputs, put the order in the task id, or force the task to run ([section 12.1](#121-force-tasks-to-run-again)).
 - **A `FileMatcher` pattern needs text between two vars.** `FileMatcher` throws when two vars have nothing between them, for example `v/<lang><slug>.md`. A key such as `v/enintro.md` has more than one split. The error names the pattern and the two vars. Put text between the vars, for example `v/<lang>-<slug>.md`.
-- **A `FileMatcher` pattern cannot have `*` or `**` yet.** Use one var for each part that changes.
+- **A `FileMatcher` pattern cannot have `*` or `**`.** Use one var for each part that changes, or `FileGroupMatcher` for a list of files.
+- **A `FileGroupMatcher` pattern has vars only before the first glob.** The names that a glob matches are not vars. Read them from the path of each file.
+- **A task that reports many files of one group one at a time replaces the task of the group one time for each file.** Each `ctx.produced` call is one step, and each step makes a new list and a new task with one input for each file. The cost thus grows as the square of the number of files. For example, one task that reports 2,000 files of `site/<lang>/**/*.html` takes about 1.0 s in all, about 0.4 s more than with no group rule, and 4,000 files take about 2.7 s. 2,000 tasks that each declare one file put all of them in one step, and make one sitemap task. Declare the files as outputs when you know their names.
 - **A `FileMatcher` pattern cannot hold a `<` or `>` as text, or a `..` part.** A file name with `<` or `>` cannot fit a pattern.
 - **A `FileMatcher` finds the old outputs of a task that is gone.** dapat does not delete old outputs, so the scan finds them on the next build ([Between runs](#between-runs)). Other tools and people can own files in the same folders, so dapat does not guess which files to delete.
-- **A `FileMatcher` does not see a change on disk during the run that no task reports.** It looks at the disk only in its scan. A file that another program writes during the run gets its match on the next build.
+- **A `FileMatcher` or a `FileGroupMatcher` does not see a change on disk during the run that no task reports.** It looks at the disk only in its scan. A file that another program writes during the run gets its match on the next build.
 - **A var that comes twice in one segment can be slow on long names.** For example, `<a>-<b>-<c>-<a>` tries each split of the segment. A 255-character file name that almost matches takes about 10 ms. A 1000-character key can take seconds. Each segment without such a repeated var keeps its first split, so it stays fast.
+- **A part with many `*` can be slow on long names.** Each `*` matches any text in the part, so a part such as `*a*a*a*a*b` tries many splits, and a long name that almost fits can take seconds. A part such as `*-*-*.jpg` stays fast.
 - **Matches that come in separate steps after the scans can pass through a state in between.** For example, a file watcher sends one file at a time, or two tasks that write a page and its review end at different times. Then `build.each` can make a set with `matched.review === undefined` for a while, and later replace it. This is correct if each set gives its own task ids and outputs. It is not safe when the id or an output depends on a matcher that is not required being `undefined`, and other sets can give the same id. For example, the drafts rule gives `draft:${vars.lang}` for the page of a lang with no review. In the state in between, two pages of one lang have no review, so two sets give `draft:en`, and `build.run()` rejects. Or the id moves between sets in two steps, and its store record is deleted, so the task runs again on the next build. Two passes of one drain are separate steps too. For example, rule 1 promises the pages, and rule 1b promises the reviews only when it gets those page events. Then the drafts rule gets the pages in pass 1 and the reviews in pass 2, and it passes through the same state in between. The safe pattern: put every var of the required matchers in each task id and each output, for example `draft:${vars.lang}/${vars.slug}`.
+- **A prefix class with its own `covers()` or `overlaps()` makes the build check outputs one by one.** The build finds producers in an index of the output ids. The index works only for the default rule: one id starts with the other. A class with its own rule can match any id, so the build checks it one by one:
+  - As an input, a prefix whose class overrides `covers()` or `overlaps()` makes each look for producers check every output of the build.
+  - As an output, a prefix whose class overrides `covers()` is checked by each look of each artifact input of the build. An override of `overlaps()` alone does not do this.
+
+  So n such tasks cost about n². The build counts a class as custom when it overrides the method, also with the same rule. For example, with `bun bench/scheduler.ts custom-prefix`, n tasks that each read one prefix take 0.7 s for 4,000 tasks and 9.9 s for 16,000. The same tasks with `IdPrefix` take 0.14 s and 0.40 s (`shared-prefix`). `IdPrefix`, `FilesystemPrefix`, and `S3Prefix` use the default rule. Override `covers()` and `overlaps()` only when the region is not an id prefix.
+- **A prefix input whose producers come one at a time costs about n².** For example, a task reads `out/`, and task k writes `out/k` and adds task k + 1 with `build.add` while it runs. The reader waits for task k. When task k ends, the reader looks for its producers again, finds task k + 1, and lists the k outputs under `out/` to do so. With `bun bench/scheduler.ts one-at-a-time`, 4,000 tasks take 0.9 s and 16,000 take 25 s. Without the reader, 16,000 tasks take 0.3 s. Add the producers in one step when you can, for example all of them before they end.
+- **A task that removes a producer with a report, and then waits for a task that reads an output of the removed task, waits forever.** After `ctx.produced` or `ctx.deleted` removes a task, each task that reads an output of the removed task waits for the reporting task to end ([How dapat finds dependencies](#how-dapat-finds-dependencies)). If the reporting task then waits for something that such a reader gives, neither task can go on. dapat does not see a deadlock, because the reporting task still runs. Do not make the reporting task wait for such a task.
 - **No timeout and no concurrency limit.** All ready tasks start at the same time. Add limits and timeouts in your task code ([section 12.2](#122-limit-parallel-work)), and use `ctx.signal` to stop work.
 - **Bun only.** The adapters use Bun APIs.
 
@@ -1513,8 +1694,8 @@ The constructor copies `inputs` and `outputs`. Later changes to your arrays do n
 ```ts
 interface TaskInit {
   id: string
-  inputs?: Ref[]
-  outputs?: Ref[]
+  inputs?: readonly Ref[]
+  outputs?: readonly Ref[]
   run: (ctx: Context) => Promise<void>
 }
 ```
@@ -1526,8 +1707,6 @@ The object that the build passes to `task.run`.
 | Member | Description |
 | --- | --- |
 | `signal: AbortSignal` | Aborted when the task is replaced or removed. |
-| `add(task: Task): void` | Same as `build.add`. |
-| `remove(id: string): void` | Same as `build.remove`. |
 | `produced(artifact: Artifact): void` | Sends a `produced` event to each subscriber before it returns. Throws if no output of the task covers it. Does not throw when a subscriber throws: `build.run()` rejects instead ([section 9](#subscriber-errors)). Does nothing if the task was replaced or removed. |
 | `deleted(artifact: Artifact): void` | Call it after the task deleted `artifact`. Sends a `deleted` event to each subscriber before it returns. A declared output that the task last reported as deleted gets no `produced` event after the task returns. Throws and does nothing in the same cases as `produced`. |
 
@@ -1555,8 +1734,8 @@ Type guards. They use `instanceof`.
 | --- | --- |
 | `abstract readonly id: string` | The region. End it with a delimiter. |
 | `stamp(): Promise<string \| null>` | A string that changes when anything under the prefix changes. An empty region has a real stamp. `null` when the prefix cannot tell what is under it; then each task that uses it runs. Default: `null`. A throw fails the task that dapat stamps the prefix for. See [Prefix stamps](#prefix-stamps). |
-| `covers(artifact: Artifact): boolean` | Default: `artifact.id` equals or starts with `this.id`. |
-| `overlaps(other: Prefix): boolean` | Default: one id equals or starts with the other. |
+| `covers(artifact: Artifact): boolean` | Default: `artifact.id` equals or starts with `this.id`. An override costs more ([Limits](#13-limits)): as an input, the build checks every output; as an output, each artifact input checks this prefix. |
+| `overlaps(other: Prefix): boolean` | Default: one id equals or starts with the other. An override costs more as an input only: the build checks every output ([Limits](#13-limits)). |
 
 ### `class IdPrefix extends Prefix`
 
@@ -1605,18 +1784,35 @@ Keeps records in a `Map`. The records are lost when the process ends. `MemorySto
 | `skipped` | `readonly Task[]` | Tasks that the skip rule skipped. |
 | `failed` | `ReadonlyMap<Task, Error>` | Tasks that threw, whose producer failed, or that were in a deadlock. |
 | `cancelled` | `readonly Task[]` | Tasks that were replaced or removed before they completed. |
+| `outcomes` | `ReadonlyMap<Task, Outcome>` | The same tasks as `executed`, `skipped`, `failed` and `cancelled`, with the `Outcome` of each. An executed outcome has the `RunReason` that the task ran for. |
 | `errors` | `readonly Error[]` | Errors that no task owns: a non-abort error that a task throws after it was replaced or removed, and a store delete that rejects. It keeps the errors of earlier runs of the same build. A subscriber error is not here: `run()` rejects with it. |
-
-`Result` does not say why a task ran. The build keeps an `Outcome` for each task, but no public member returns it. See [section 6.1](#61-why-did-a-task-run-or-skip).
 
 ### `type Outcome`
 
 ```ts
 type Outcome =
-  | { type: "executed" }
+  | { type: "executed"; reason: RunReason }
   | { type: "skipped" }
   | { type: "failed"; error: Error }
   | { type: "cancelled"; reason: "replaced" | "removed" }
+```
+
+### `type RunReason`
+
+The first difference that the skip check found ([section 6](#6-when-a-task-skips)). `id` is the id of the input or output. Only an executed outcome has a reason.
+
+```ts
+type RunReason =
+  | { kind: "no-store" } // the build has no store
+  | { kind: "no-inputs" } // the task has no input
+  | { kind: "no-record" } // the store has no record for the task, or a record that this version of dapat cannot read
+  | { kind: "input-unstamped"; id: string } // this prefix input has a null stamp, for example an IdPrefix
+  | { kind: "output-unstamped"; id: string } // this prefix output has a null stamp, for example an IdPrefix
+  | { kind: "input-ids-changed" } // the input ids differ from the record
+  | { kind: "input-changed"; id: string } // this input's stamp differs from the record
+  | { kind: "output-missing"; id: string } // this artifact output's stamp is null
+  | { kind: "output-ids-changed" } // the output ids differ from the record
+  | { kind: "output-changed"; id: string } // this output's stamp differs from the record
 ```
 
 ### `class Emitter<E>`
@@ -1684,14 +1880,23 @@ type MatchedArtifactEvent<D extends MatchedData = MatchedData> =
 
 The vars of a matched artifact are its key. A `found` with known vars and new data replaces the match, a `found` with the same artifact ids in the same order does nothing, and a `gone` removes it. One artifact and a list of one artifact are different data. A `gone` with wrong var names makes `build.run()` reject. See [Matched artifacts](#matched-artifacts).
 
-### `type TaskMaterializerConfig<M, R>`, `type MatchedByName<M, R>`, and `type JoinedVars<M, R>`
+### `type TaskMaterializerConfig<M, R, O>`, `type MatchedByName<M, R>`, and `type JoinedVars<M, R>`
 
 ```ts
-type TaskMaterializerConfig<M extends Record<string, AnyMatcher>, R extends keyof M & string = keyof M & string> = {
+type TaskMaterializerConfig<
+  M extends Record<string, AnyMatcher>,
+  R extends keyof M & string = keyof M & string,
+  O extends Record<string, ArtifactTemplate> = {},
+> = {
   matchersByName: M
   required?: readonly R[]
-  tasks: (vars: JoinedVars<M, R>, matched: MatchedByName<M, R>) => Iterable<Task>
-}
+  outputsByName?: O
+} & (
+  | { tasks: (vars: JoinedVars<M, R>, matched: MatchedByName<M, R>, outputs: OutputsByName<O>) => Iterable<Task>; name?: never; run?: never }
+  | { name: string; run: (args: RunArgs<M, R, O>) => Promise<void>; tasks?: never }
+)
+
+type RunArgs<M, R, O> = { vars: JoinedVars<M, R>; matched: MatchedByName<M, R>; outputs: OutputsByName<O>; ctx: Context }
 
 type JoinedVars<M extends Record<string, AnyMatcher>, R extends keyof M & string = keyof M & string> =
   [Exclude<keyof M, R>] extends [never] ? Vars : Readonly<Record<string, string | undefined>>
@@ -1704,6 +1909,20 @@ type MatchedByName<M extends Record<string, AnyMatcher>, R extends keyof M & str
 `R` is the names in `required`. If you leave `required` out, `R` is every name, so no matched artifact is `undefined`. A matcher that is not in `R` can be `undefined` in `matched`. It left-joins onto the matchers in `R`, after the earlier matchers that are not in `R`, in name order, on its ON vars. Each of its matches that agrees makes its own joined set. `JoinedVars` is `Vars` when every name is in `R`, else `Readonly<Record<string, string | undefined>>`. `required` must name at least one matcher. See [`required`](#required-matchers-that-a-set-can-do-without).
 
 `AnyMatcher` is `Matcher<any>`: a matcher of any data type. Each matched artifact has the data type of its own matcher: `DataOf` reads `D` from the matcher type. `matchersByName` must have at least one entry, and its required matchers must form one connected group by shared var names. `tasks` gets the vars of one joined set, which hold the vars of all its matches (a var of a matcher with no match in the set is `undefined`), and each matched artifact under its matcher's name. See [The `build.each` config](#the-buildeach-config).
+
+The config has `tasks`, or `name` and `run`. The exported types `TasksConfig<M, R, O>` and `RunConfig<M, R, O>` are the two forms. Each one sets the fields of the other to `never`, so a config with both is a type error, and `build.each` also throws for it at run time. `run` needs a `name`. See [The one-task form](#the-one-task-form-name-and-run).
+
+### `interface ArtifactTemplate<R>` and `type OutputsByName<O>`
+
+```ts
+interface ArtifactTemplate<R extends Ref = Ref> {
+  readonly varNames: readonly string[]
+  expand(vars: Vars): R
+}
+type OutputsByName<O extends Record<string, ArtifactTemplate>> = { readonly [K in keyof O]: O[K] extends ArtifactTemplate<infer R> ? R : never }
+```
+
+A template makes one artifact or prefix from the vars of a joined set. `build.each` calls `expand` only with vars that hold each name of `varNames`. Each entry of `OutputsByName` has the ref type of its template, so `outputs.html` of a `FileTemplate` is a `FileArtifact`. `FileTemplate` and `FolderTemplate` are in `dapat/contrib`. See [`outputsByName`](#outputsbyname-output-templates).
 
 ## Filesystem (`dapat/contrib`)
 
@@ -1740,7 +1959,7 @@ new FilesystemPrefix(path: string, opts?: { stamp?: "hash" | "time" })
 ### `class FileMatcher extends Matcher<FileArtifact>`
 
 ```ts
-new FileMatcher(pattern: string, opts?: { stamp?: "hash" | "time" })
+new FileMatcher(pattern: string, opts?: { stamp?: "hash" | "time"; syntax?: FilePatternSyntax })
 ```
 
 | Member | Value |
@@ -1751,7 +1970,38 @@ new FileMatcher(pattern: string, opts?: { stamp?: "hash" | "time" })
 | `scan(signal)` | Sends `found` for each file on disk that fits, in name order. Reads a folder only for a part with a var, and stats only symlinks and entries of unknown type. A link loop adds no file. A missing folder has no files. Follows symlinks. Throws for every other error. |
 | `receiveArtifactEvent(event)` | `promised` and `produced` of a `FileArtifact` that fits send `found`. `deleted` sends `gone` unless a task still declares the file. `withdrawn` sends `gone` unless the file is on disk. |
 
-The `stamp` option sets the stamp mode of each `FileArtifact` that the matcher sends. Default `"hash"`. The constructor throws for an empty pattern, a pattern with `*` or `**`, a `..` part, a `<` or `>` that does not enclose a valid var name, and two vars with nothing between them. Each match is `{ vars, data: FileArtifact }`. See [`FileMatcher`](#filematcher-one-match-for-each-file).
+The `stamp` option sets the stamp mode of each `FileArtifact` that the matcher sends. Default `"hash"`. The `syntax` option is `{ varStart?, varEnd?, anyName?, anyFolders? }`, with the defaults `<`, `>`, `*`, and `**`. It sets the markers of the pattern, and the error messages name these markers. A `*` is a literal and does not throw only when `anyName` changes. With a change to `anyFolders` alone, `*` is still the glob, and a `**` part is two `*` globs in one name. See [The pattern](#the-pattern). The constructor throws for an invalid `syntax`, an empty pattern, a pattern with `*` or `**` (the message names `FileGroupMatcher`), a `..` part, a `<` or `>` that does not enclose a valid var name, and two vars with nothing between them. Each match is `{ vars, data: FileArtifact }`. See [`FileMatcher`](#filematcher-one-match-for-each-file).
+
+### `class FileGroupMatcher extends Matcher<readonly FileArtifact[]>`
+
+```ts
+new FileGroupMatcher(pattern: string, opts?: { stamp?: "hash" | "time"; syntax?: FilePatternSyntax })
+```
+
+| Member | Value |
+| --- | --- |
+| `pattern` | The pattern without `./`, for example `site/<lang>/**/*.html`. |
+| `root` | As for `FileMatcher`. |
+| `varNames` | The vars of the pattern, in order. They are all in the parts before the first glob. `site/<lang>/**/*.html` gives `["lang"]`. |
+| `scan(signal)` | Reads the files as `FileMatcher` does. At a `**`, takes every file under the folder, as `FilesystemPrefix.list()` does. After the whole scan, sends one `found` for each group, with its files sorted by path. Throws for every error other than a missing path. |
+| `receiveArtifactEvent(event)` | A file gets and loses its match as in `FileMatcher`. Each change sends `found` with the new list of the group of the file, or `gone` when the list becomes empty. |
+
+The `stamp` option sets the stamp mode of each `FileArtifact` that the matcher sends. Default `"hash"`. The `syntax` option sets the markers of the pattern, as for `FileMatcher`. The constructor throws for a pattern with no `anyName` or `anyFolders` (by default `*` or `**`), a var in or after the first part with a glob, a `**` at the end, a `**` inside a name, and each other error of `FileMatcher`. Each match is `{ vars, data: readonly FileArtifact[] }`. See [`FileGroupMatcher`](#filegroupmatcher-one-match-with-a-list-of-files).
+
+### `class FileTemplate implements ArtifactTemplate<FileArtifact>` and `class FolderTemplate implements ArtifactTemplate<FilesystemPrefix>`
+
+```ts
+new FileTemplate(pattern: string, opts?: { stamp?: "hash" | "time"; syntax?: FilePatternSyntax })
+new FolderTemplate(pattern: string, opts?: { stamp?: "hash" | "time"; syntax?: FilePatternSyntax })
+```
+
+| Member | Value |
+| --- | --- |
+| `pattern` | The pattern without `./`, for example `site/<lang>/<slug>.html`. |
+| `varNames` | The vars of the pattern, in order. |
+| `expand(vars)` | `FileTemplate`: the `FileArtifact` of the path with each var filled in. `FolderTemplate`: the `FilesystemPrefix` of that path. A relative pattern resolves against the working directory when you create the template. Throws for a var value that is empty, holds `/`, or is `.` or `..`. |
+
+The pattern and the options are those of `FileMatcher`, also `syntax`. The constructor throws for a `*` or `**` (or the `anyName` and `anyFolders` of `syntax`), because an output names one path, and for each other error of `FileMatcher`. See [`outputsByName`](#outputsbyname-output-templates).
 
 ## S3 (`dapat/contrib`)
 

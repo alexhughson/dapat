@@ -13,16 +13,14 @@ export function isArtifact(ref: Ref): ref is Artifact {
 
 export interface Context {
   readonly signal: AbortSignal
-  add(task: Task): void
-  remove(id: string): void
   produced(artifact: Artifact): void
   deleted(artifact: Artifact): void
 }
 
 export interface TaskInit {
   id: string
-  inputs?: Ref[]
-  outputs?: Ref[]
+  inputs?: readonly Ref[]
+  outputs?: readonly Ref[]
   run: (ctx: Context) => Promise<void>
 }
 

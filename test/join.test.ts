@@ -1373,8 +1373,8 @@ describe("MatchTable", () => {
     const table = new MatchTable("page", ["lang", "slug"], 1)
     table.addIndex(["lang"])
     table.addIndex(["lang", "slug"])
-    const a: StoredMatch = { matched: { vars: { lang: "en", slug: "a" }, data: new Mem("page:en/a") }, artifactIds: "", sets: new Set() }
-    const b: StoredMatch = { matched: { vars: { lang: "en", slug: "b" }, data: new Mem("page:en/b") }, artifactIds: "", sets: new Set() }
+    const a: StoredMatch = { matched: { vars: { lang: "en", slug: "a" }, data: new Mem("page:en/a") }, artifactIds: { kind: "one", id: "" }, sets: new Set() }
+    const b: StoredMatch = { matched: { vars: { lang: "en", slug: "b" }, data: new Mem("page:en/b") }, artifactIds: { kind: "one", id: "" }, sets: new Set() }
     table.put(a)
     table.put(b)
     // lang: en; lang+slug: en/a and en/b.
