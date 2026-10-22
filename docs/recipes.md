@@ -1,10 +1,10 @@
 # Recipes
 
-Each section answers one how-to question about a build. Read part 1 of the [guide](guide.md) first.
+Each section answers one how-to question about a build. Read part 1 of the [guide](guide.md) first. Read [part 2](guide.md#events) before the recipes that use `build.each`.
 
 ## Find out why a task ran
 
-The build does not say which [skip check](guide.md#the-store-and-the-skip-rule) failed. The function `whyRun` below makes the [skip checks](semantics.md#the-skip-check) in the order of the build and returns the reason for the first check that fails.
+The build does not say which [skip check](guide.md#the-store-and-the-skip-rule) failed. The function `whyRun` below makes the checks in the same order as the build ([The skip check](semantics.md#the-skip-check)) and returns the reason for the first check that fails.
 
 ```ts
 import { Build, MemoryStore, Task, isPrefix, type Store, type TaskState } from "dapat"
@@ -17,6 +17,7 @@ async function check(kind: string, refs: Task["inputs"], recorded: TaskState["in
     keys.add(key)
     const stamp = await ref.stamp()
     if (stamp === null && kind === "output") return `output ${ref.id} has the stamp null`
+    if (!Object.hasOwn(recorded, key)) return `${kind} ${ref.id} is new`
     if (recorded[key] !== stamp) return `${kind} ${ref.id} changed`
   }
   if (Object.keys(recorded).length > keys.size) return `an ${kind} was removed`
@@ -26,7 +27,9 @@ async function check(kind: string, refs: Task["inputs"], recorded: TaskState["in
 async function whyRun(task: Task, store: Store) {
   if (task.inputs.length === 0) return "no inputs"
   for (const ref of task.inputs) {
-    if (isPrefix(ref) && (await ref.stamp()) === null) return `input ${ref.id} has the stamp null`
+    if (!isPrefix(ref)) continue
+    const stamp = await ref.stamp()
+    if (stamp === null) return `input ${ref.id} has the stamp null`
   }
   const record = await store.get(task.id)
   if (record === null) return "no record"
@@ -53,7 +56,7 @@ input file:./in.txt changed
 ```
 
 - Call `whyRun` before `build.run()`. After the run, the store holds the new [record](guide.md#what-a-build-does).
-- When another task writes an input of this task, call `whyRun` first in the `run` function of this task. At that point the [producer](guide.md#what-a-build-does) has finished, and the record is still the old one.
+- A `build.each` task does not exist before `run()`. For such a task, or a task whose input another task writes, call `whyRun` first in its `run` function. Then its [producers](guide.md#what-a-build-does) have finished, and the record is still the old one. For example, make `console.log(await whyRun(task, store))` the first line of `run`. Here `task` is the constant that holds the new `Task`.
 
 ## Force a rerun
 
@@ -73,13 +76,14 @@ class Value extends Artifact<string> {
 }
 
 const store = new MemoryStore()
-// Each pass is one build. Before the third build, the code of the task changes to v2.
+// Three builds. The code of the task changes to v2 before the third build.
 for (const version of ["v1", "v1", "v2"]) {
   const build = new Build({ store })
-  build.add(new Task({ id: "step", inputs: [new Value("code:step", version)], run: async () => {} }))
+  const code = new Value("code:step", version)
+  build.add(new Task({ id: "step", inputs: [code], run: async () => {} }))
   const result = await build.run()
-  const ran = result.executed.map((task) => task.id)
-  const skipped = result.skipped.map((task) => task.id)
+  const ran = result.executed.map((task) => task.id).sort()
+  const skipped = result.skipped.map((task) => task.id).sort()
   console.log(`${version}: ran [${ran.join(" ")}] skipped [${skipped.join(" ")}]`)
 }
 ```
@@ -95,12 +99,64 @@ You can also add the file that holds the task code as an input: [`new FileArtifa
 
 ## Delete old outputs
 
-An old output is a file that a task wrote in an earlier build and no task writes now. dapat deletes no file ([layout rules](guide.md#layout-rules)), so only your code can delete it. There are two cases:
+An **old output** is a file that a task wrote in an earlier build and no task writes now. dapat deletes no file ([layout rules](guide.md#layout-rules)), so only your code can delete it. There are two cases:
 
 - **A task writes fewer files in its folder output.** Its `run` function deletes each old file and reports it with `ctx.deleted`, as `split` does in build 3 of [Outputs with unknown names](guide.md#outputs-with-unknown-names).
 - **No task in the build has the file as an output.** Examples are a task that your code no longer adds, and a [`build.each`](guide.md#buildeach) task whose matched file is gone. After `build.run()`, collect the tasks in [`result.executed`](guide.md#results-and-failure), `result.skipped` and the keys of `result.failed`. In a folder that only these tasks write, delete each file that no output of these tasks names or [covers](guide.md#folders-prefixes).
 
-In the second case, a task that has the folder as an input runs again on the next build, because the folder stamp changed. Your code deletes some old outputs one build later. These are the outputs of a task that `build.each` made for an old output, or of a task that was [removed](guide.md#tasks-and-dependencies) after it ended.
+In this program, only the `page` tasks write in `site`. The program deletes `content/about.md` before build 2, so build 2 deletes `site/about.html`:
+
+```ts
+import { Build, MemoryStore, Task, isPrefix } from "dapat"
+import { FileArtifact, FileMatcher, FilesystemPrefix } from "dapat/contrib"
+
+await Bun.write("content/hello.md", "Hello")
+await Bun.write("content/about.md", "About")
+const site = new FilesystemPrefix("site")
+const store = new MemoryStore()
+
+async function runBuild(label: string) {
+  const build = new Build({ store })
+  build.each({
+    matchersByName: { page: new FileMatcher("content/<slug>.md") },
+    *tasks(vars, matched) {
+      const page = matched.page.data
+      const html = new FileArtifact(`site/${vars.slug}.html`)
+      async function run() {
+        await Bun.write(html.path, Bun.file(page.path))
+      }
+      yield new Task({ id: `page:${vars.slug}`, inputs: [page], outputs: [html], run })
+    },
+  })
+  const result = await build.run()
+  const tasks = [...result.executed, ...result.skipped, ...result.failed.keys()]
+  const outputs = tasks.flatMap((task) => task.outputs)
+  const paths = await site.list()
+  paths.sort()
+  for (const path of paths) {
+    const file = new FileArtifact(path)
+    const named = outputs.some((output) => output.id === file.id)
+    const covered = outputs.some((output) => isPrefix(output) && output.covers(file))
+    if (named || covered) continue
+    await Bun.file(path).delete()
+    console.log(`${label}: deleted ${path.replace(process.cwd(), ".")}`)
+  }
+}
+
+await runBuild("1")
+await Bun.file("content/about.md").delete()
+await runBuild("2")
+```
+
+<!-- output -->
+```text
+2: deleted ./site/about.html
+```
+
+In the second case, a task that has the folder as an input runs again on the next build, because the folder stamp changed. Your code deletes two kinds of old outputs one build late, because the `Result` still lists their tasks:
+
+- The output of a task that `build.each` made for an old output. For example, a task that reads `site/about.html` is still in build 2, so your code deletes its output in build 3.
+- The output of a task that your code [removed](guide.md#tasks-and-dependencies) after the task ended.
 
 ## Limit parallel work
 
@@ -113,14 +169,20 @@ function gate(max: number) {
   let free = max
   const waiting: Array<() => void> = []
   return async function <T>(work: () => Promise<T>) {
-    if (free > 0) free -= 1
-    else await new Promise<void>((resolve) => waiting.push(resolve))
+    if (free > 0) {
+      free -= 1
+    } else {
+      await new Promise<void>((resolve) => waiting.push(resolve))
+    }
     try {
       return await work()
     } finally {
       const next = waiting.shift()
-      if (next) next()
-      else free += 1
+      if (next) {
+        next()
+      } else {
+        free += 1
+      }
     }
   }
 }

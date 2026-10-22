@@ -8,7 +8,7 @@ This page lists the docs pages by goal. It also lists symptoms that give no erro
 | --- | --- | --- |
 | Write a first build | [Guide](guide.md), part 1 | you start: it defines the terms that the other pages use |
 | Write a pipeline | [Guide](guide.md#events), part 2 | you use `build.each` or `build.subscribe`, or a task writes in a folder that it reads or that another task writes |
-| | [build.each](build-each.md) | you need the pattern rules, a task with files from two or more matchers, an input that a task can run without, or a loop |
+| | [build.each](build-each.md) | you need the pattern rules, a task with files from two or more matchers, an input that a task can run without, or a [loop](build-each.md#loops), where each task writes the file from which `build.each` makes the next task |
 | | [Built-in artifacts and stores](builtins.md) | you choose between hash and time stamps, choose a store, or use folders or S3 |
 | Do a common job | [Recipes](recipes.md) | you want to find why a task ran, force a rerun, rerun after a code change, delete old outputs, limit parallel work, run in CI, or call a paid model |
 | Check the limits | [Limits](limits.md) | you design a large build, or you want the known issues |
@@ -19,16 +19,17 @@ This page lists the docs pages by goal. It also lists symptoms that give no erro
 
 ## Symptoms with no error message
 
-For an error message, find its text in the [error index](api.md#error-messages). The causes use the terms of the [guide](guide.md).
+For an error message, find its text in [Error messages](api.md#error-messages). The causes use the terms of the [guide](guide.md).
 
 | Symptom | Cause | See |
 | --- | --- | --- |
-| A task runs on every build | The `Build` has no store. Or each process, or each `Build`, makes a new `MemoryStore`.<br>The task has no inputs, a prefix with the stamp `null` (such as an `IdPrefix`), or an exact output that is missing after its run. | [The skip rule](guide.md#the-store-and-the-skip-rule) |
+| A task runs on every build | The `Build` has no store. Or each process, or each `Build`, makes a new `MemoryStore`.<br>The task has no inputs, a prefix with the stamp `null` (such as an `IdPrefix`), or an [exact output](guide.md#tasks-and-dependencies) that is missing after its run.<br>With time stamps, the task writes a file that it reads. | [The skip rule](guide.md#the-store-and-the-skip-rule), [Layout rules](guide.md#layout-rules) |
+| A task never runs, and `result.cancelled` lists it | Another `build.add` or `ctx.add` used the same id and replaced the task. Or `build.remove`, `ctx.remove` or `build.each` removed the task before it started. | [Tasks and dependencies](guide.md#tasks-and-dependencies) |
 | A task skips after you change its code | The skip rule does not look at the `run` function. | [Rerun when your code changes](recipes.md#rerun-when-your-code-changes) |
 | A task that reads or writes a folder runs on every build, or on one or two extra builds | Another task writes in a folder that the task declares as its output.<br>The task writes in a folder that it reads.<br>The store file is in a folder that the task reads or writes. | [Layout rules](guide.md#layout-rules) |
 | Every task with a file input or output runs after you move the project, or in CI | After a move: file ids are absolute paths, so they no longer match the records.<br>In CI: the job does not restore the store file or the outputs.<br>In CI with time stamps: the checkout changes every time stamp. | [Files](builtins.md#files), [Run in CI](recipes.md#run-in-ci) |
 | An old output stays on disk, and `build.each` makes a task for it | dapat deletes no file. The next scan finds the old output when a pattern fits it. | [Layout rules](guide.md#layout-rules), [Delete old outputs](recipes.md#delete-old-outputs) |
-| Task `b` runs before task `a`, which writes its input | The output of `a` is a plain object, not an `Artifact` or a `Prefix`.<br>After `run()` starts the tasks, your code adds `b`, awaits, and then adds `a`. | [What you write](write-an-artifact.md#what-you-write), [The order rule](semantics.md#the-order-rule) |
+| Task `b` runs before task `a`, which writes its input | `a` does not declare the file as an exact output, and no prefix output of `a` covers the file.<br>The output of `a` is a plain object, not an `Artifact` or a `Prefix`.<br>After `run()` starts the tasks, your code adds `b`, awaits, and then adds `a`. | [Tasks and dependencies](guide.md#tasks-and-dependencies), [What you write](write-an-artifact.md#what-you-write), [The order rule](semantics.md#the-order-rule) |
 | `run()` never resolves | A matcher's scan does not return.<br>A task awaits the `run()` of its own build. | [How build.each works](build-each.md#how-buildeach-works), [build.run()](semantics.md#buildrun) |
-| A second `run()` on one `Build` does not run a finished task again or make tasks for new files. Its `Result` lists earlier tasks. | A `Build` starts each task once and scans only in its first `run()`. Its `Result` keeps the tasks of every `run()`. | [Results and failure](guide.md#results-and-failure), [How build.each works](build-each.md#how-buildeach-works) |
-| A `build.each` task is missing | No match of a required matcher has the same values as the other matches for the vars that they share.<br>A task writes a file in the folder that it declares as its output, and does not report the file with `ctx.produced`. | [Joins](build-each.md#joins), [Matches during the run](build-each.md#matches-during-the-run) |
+| A second `run()` on one `Build` runs no finished task, makes no task for a new file, and lists earlier tasks in its `Result` | A `Build` starts each task one time and scans only in its first `run()`. | [Results and failure](guide.md#results-and-failure), [How build.each works](build-each.md#how-buildeach-works) |
+| A `build.each` task is missing | No match of a required matcher has the same values as the other matches for the vars that they share.<br>A task writes a file in the folder that it declares as its output, and does not report the file with `ctx.produced`. The file gets its task only at the next build's scan. | [Joins](build-each.md#joins), [Matches during the run](build-each.md#matches-during-the-run) |

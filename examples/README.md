@@ -15,9 +15,7 @@ mkdir try && cd try
 bun path/to/dapat/examples/file-pipeline.ts
 ```
 
-- `file-pipeline.ts` and `book-chapters.ts` write their own sample input when `content/` or `books/` is missing. `first-build.ts` writes none, so write `in.txt` first, for example with `printf hello > in.txt`.
-- The `executed` and `skipped` lists are in [finish order](../docs/guide.md#results-and-failure), so their order can change between runs.
+- `file-pipeline.ts` and `book-chapters.ts` write their own sample input when `content/` or `books/` is missing. `first-build.ts` writes none, so write `in.txt` first, for example with `printf hello > in.txt`. Without it, both tasks fail, but the example prints only two empty lists and no error.
+- Each example prints the `executed` and `skipped` lists in [finish order](../docs/guide.md#results-and-failure), so their order can change between runs.
 - Run it again: every task skips. `book-chapters.ts` still prints its `new task` lines, because the new build adds each summary task again and sends its `promised` event ([events](../docs/guide.md#events)).
 - tsc rejects `inputs: sources` in `file-pipeline.ts` ([known issue 7](../docs/limits.md#known-issues-in-010)).
-
-When you add an example, add its row to this table, not to the root README.
