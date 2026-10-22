@@ -1,10 +1,10 @@
 # Recipes
 
-Each section answers one how-to question about a build. Read part 1 of the [guide](guide.md) first. Read [part 2](guide.md#events) before the recipes that use `build.each`.
+Read part 1 of the [guide](guide.md) first. Read [part 2](guide.md#events) before the recipes that use `build.each`.
 
 ## Find out why a task ran
 
-The build does not say which [skip check](guide.md#the-store-and-the-skip-rule) failed. The function `whyRun` below makes the checks in the same order as the build ([The skip check](semantics.md#the-skip-check)) and returns the reason for the first check that fails.
+The build does not say which [skip check](guide.md#the-store-and-the-skip-rule) failed. `whyRun` below makes the checks in the build's order ([The skip check](semantics.md#the-skip-check)) and returns the reason for the first one that fails.
 
 ```ts
 import { Build, MemoryStore, Task, isPrefix, type Store, type TaskState } from "dapat"
@@ -56,15 +56,15 @@ input file:./in.txt changed
 ```
 
 - Call `whyRun` before `build.run()`. After the run, the store holds the new [record](guide.md#what-a-build-does).
-- A `build.each` task does not exist before `run()`. For such a task, or a task whose input another task writes, call `whyRun` first in its `run` function. Then its [producers](guide.md#what-a-build-does) have finished, and the record is still the old one. For example, make `console.log(await whyRun(task, store))` the first line of `run`. Here `task` is the constant that holds the new `Task`.
+- A `build.each` task does not exist before `run()`. For such a task, or a task whose input another task writes, make `console.log(await whyRun(task, store))` the first line of its `run` function. Then its [producers](guide.md#what-a-build-does) have finished, and the record is still the old one. Here `task` is the constant that holds the new `Task`.
 
 ## Force a rerun
 
-To run one task again, call `await store.delete(task.id)` before `build.run()`. The tasks that read its outputs run again only when the stamps of those outputs change. To run every task again, call `await store.clear()`. It also deletes the records of tasks that are no longer in the build. For a [`JsonStore` or `SqliteStore`](builtins.md#stores), you can instead delete the store file before the program starts.
+To run one task again, call `await store.delete(task.id)` before `build.run()`. The tasks that read its outputs run again only when the stamps of those outputs change. To run every task again, call `await store.clear()`. For a [`JsonStore` or `SqliteStore`](builtins.md#stores), you can instead delete the store file before the program starts.
 
 ## Rerun when your code changes
 
-The [skip checks](guide.md#the-store-and-the-skip-rule) look only at the inputs and outputs of a task. So a task skips after you change its code. To make it run, give it one more input whose stamp is the version of its code. In this program, that input is a `Value`, an [artifact type](write-an-artifact.md) that the program defines. Change the version each time you change the code:
+The [skip checks](guide.md#the-store-and-the-skip-rule) do not look at the code of a task. To rerun it after a code change, give it one more input whose stamp is the version of its code. In this program, that input is a `Value`, an [artifact type](write-an-artifact.md) that the program defines. Change the version each time you change the code:
 
 ```ts
 import { Artifact, Build, MemoryStore, Task } from "dapat"
@@ -95,7 +95,7 @@ v1: ran [] skipped [step]
 v2: ran [step] skipped []
 ```
 
-You can also add the file that holds the task code as an input: [`new FileArtifact(import.meta.path)`](builtins.md#files). Then the task runs on the next build after each change to that file. This includes a change to another task in the file. A change to a module that the file imports does not change the stamp of the file.
+You can also add the file that holds the task code as an input: [`new FileArtifact(import.meta.path)`](builtins.md#files). Then the task runs again after each change to that file, even a change to another task in it. A change to a module that the file imports does not make the task run.
 
 ## Delete old outputs
 
@@ -104,7 +104,7 @@ An **old output** is a file that a task wrote in an earlier build and no task wr
 - **A task writes fewer files in its folder output.** Its `run` function deletes each old file and reports it with `ctx.deleted`, as `split` does in build 3 of [Outputs with unknown names](guide.md#outputs-with-unknown-names).
 - **No task in the build has the file as an output.** Examples are a task that your code no longer adds, and a [`build.each`](guide.md#buildeach) task whose matched file is gone. After `build.run()`, collect the tasks in [`result.executed`](guide.md#results-and-failure), `result.skipped` and the keys of `result.failed`. In a folder that only these tasks write, delete each file that no output of these tasks names or [covers](guide.md#folders-prefixes).
 
-In this program, only the `page` tasks write in `site`. The program deletes `content/about.md` before build 2, so build 2 deletes `site/about.html`:
+In this program, only the `page` tasks write in `site`. The program deletes `content/about.md` before build 2:
 
 ```ts
 import { Build, MemoryStore, Task, isPrefix } from "dapat"
@@ -153,7 +153,7 @@ await runBuild("2")
 2: deleted ./site/about.html
 ```
 
-In the second case, a task that has the folder as an input runs again on the next build, because the folder stamp changed. Your code deletes two kinds of old outputs one build late, because the `Result` still lists their tasks:
+In the second case, a task that has the folder as an input runs again on the next build. Your code deletes two kinds of old outputs one build late, because the `Result` still lists their tasks:
 
 - The output of a task that `build.each` made for an old output. For example, a task that reads `site/about.html` is still in build 2, so your code deletes its output in build 3.
 - The output of a task that your code [removed](guide.md#tasks-and-dependencies) after the task ended.
@@ -210,11 +210,11 @@ peak: 4
 
 ## Run in CI
 
-A task skips in a CI job only when the job has the task's [record](guide.md#what-a-build-does) from an earlier job. Its output files must also have the stamps in that record. Use a `JsonStore` or a `SqliteStore` ([Stores](builtins.md#stores)). At the end of each job, save the store file (for example `.dapat/state.json`) and the output files in the CI cache. At the start of each job, restore them. When the cache is empty, every task runs.
+A task skips in a CI job only when the job has the task's [record](guide.md#what-a-build-does) from an earlier job. Its output files must also have the stamps in that record. Use a `JsonStore` or a `SqliteStore` ([Stores](builtins.md#stores)). At the end of each job, save the store file (for example `.dapat/state.json`) and the output files in the CI cache. At the start of each job, restore them.
 
 - Check out the project at the same path in each job, because [file ids](builtins.md#files) are absolute paths.
 - Keep the default hash stamps, because a checkout changes the mtime of every file ([Hash or time](builtins.md#hash-or-time)).
 
 ## Call a paid model
 
-Make each model call one task. Its input is the prompt file, and its output is the answer file. With a `JsonStore` or a `SqliteStore`, the task skips and makes no call while the prompt and the answer do not change. The model name is not an input, so put it in the prompt file. Or add it as an input, like the `Value` in [Rerun when your code changes](#rerun-when-your-code-changes). To limit the calls that run at the same time, use a [gate](#limit-parallel-work).
+Make each model call one task. Its input is the prompt file, and its output is the answer file. With a `JsonStore` or a `SqliteStore`, the task skips and makes no call while the prompt and the answer do not change. Put the model name in the prompt file, or add it as an input, like the `Value` in [Rerun when your code changes](#rerun-when-your-code-changes). To limit the calls that run at the same time, use a [gate](#limit-parallel-work).

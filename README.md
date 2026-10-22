@@ -1,6 +1,6 @@
 # dapat
 
-dapat is a build library for TypeScript, on Bun only, with ideas from [doit](https://github.com/pydoit/doit). You declare tasks, and each task declares its inputs and its outputs. Inputs and outputs can be files, folders, S3 objects, or any other value that you wrap in an [`Artifact` subclass](docs/write-an-artifact.md). Use dapat for data pipelines, generated sites and agent loops, where a task is slow or costs money. When a build runs, dapat does these three things:
+dapat is a build library for TypeScript, on Bun only, with ideas from [doit](https://github.com/pydoit/doit). You declare tasks and their inputs and outputs: files, folders, S3 objects, or any other value that you wrap in an [`Artifact` subclass](docs/write-an-artifact.md). Use dapat for data pipelines, generated sites and agent loops, where a task is slow or costs money. When a build runs, dapat does three things:
 
 - Order: when an output of task A is an input of task B, B starts after A finishes.
 - Skip: a task with inputs [skips](docs/guide.md#the-store-and-the-skip-rule) only when each input and output has the same [stamp](docs/guide.md#what-a-build-does) as after its last successful run. A [store](docs/guide.md#what-a-build-does) keeps these stamps between builds. By default, the stamp of a file is a hash of its bytes ([hash or time](docs/builtins.md#hash-or-time)).
@@ -12,7 +12,7 @@ dapat 0.1.0 is not on npm, and its API can change. Clone the repository with `gi
 
 ## Example
 
-This program makes `out.txt` from `in.txt` in two tasks. Save it as `pipeline.ts` in a project that links dapat. Then run `bun pipeline.ts`.
+This program makes `out.txt` from `in.txt` in two tasks. Save it as `pipeline.ts` in your project. Then run `bun pipeline.ts`.
 
 ```ts
 import { Build, Task } from "dapat"
@@ -53,12 +53,12 @@ ran [upper wrap] skipped []
 
 The program adds `wrap` first, but `wrap` waits for `upper`, because `mid.txt` is an output of `upper` and an input of `wrap`. `build.run()` does not reject when a task fails, so check `result.success`.
 
-Make each change in the table, in order. After each change, run the program again.
+Make each change in the table, in order. Run the program after each one.
 
 | Change | Ran | Skipped | Why |
 | --- | --- | --- | --- |
 | no change | – | `upper` `wrap` | no stamp changed |
-| `touch in.txt` | – | `upper` `wrap` | the bytes of `in.txt` did not change, so its hash did not change |
+| `touch in.txt` | – | `upper` `wrap` | `in.txt` has the same bytes and so the same hash |
 | `printf HELLO > in.txt` | `upper` | `wrap` | `upper` writes the same bytes to `mid.txt` |
 | `printf bye > in.txt` | `upper` `wrap` | – | `upper` writes new bytes to `mid.txt` |
 | `rm out.txt` | `wrap` | `upper` | an output of `wrap` is missing |
@@ -67,13 +67,13 @@ Make each change in the table, in order. After each change, run the program agai
 
 - It deletes no files. Old outputs stay on disk ([layout rules](docs/guide.md#layout-rules)).
 - It does not watch files, and it has no command-line tool.
-- It does not see changes to the code of a task ([recipe](docs/recipes.md#rerun-when-your-code-changes)).
+- It does not see changes to a task's code ([recipe](docs/recipes.md#rerun-when-your-code-changes)).
 - It does not limit how many tasks run at the same time ([recipe](docs/recipes.md#limit-parallel-work)).
 - It does not copy outputs or stamps between machines.
 
 ## Documentation
 
-Next, read part 1 of the [guide](docs/guide.md). [docs/README.md](docs/README.md) lists every page by goal, and the symptoms that give no error message. [examples/README.md](examples/README.md) lists the examples.
+Next, read part 1 of the [guide](docs/guide.md). [docs/README.md](docs/README.md) lists every page by goal, and symptoms with no error message. [examples/README.md](examples/README.md) lists the examples.
 
 ## Development
 

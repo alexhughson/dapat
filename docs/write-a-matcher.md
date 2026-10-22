@@ -1,10 +1,10 @@
 # Write a matcher
 
-Write a [matcher](guide.md#buildeach) when `FileMatcher` and `FileGroupMatcher` cannot find your artifacts, such as JSON keys, S3 objects or database rows. In [step 1](#step-1-find-the-keys-in-a-scan), the matcher `PageKeys` finds the page keys of a JSON file in its scan. In [step 2](#step-2-get-the-builds-events), it also sends a found or a gone when a task declares a key, or reports that it added or deleted one. First read [build.each](build-each.md), and [step 1 of Write an artifact type](write-an-artifact.md#step-1-one-key-of-a-json-file) for the `JsonKey` class that this page uses.
+Write a [matcher](guide.md#buildeach) when `FileMatcher` and `FileGroupMatcher` cannot find your artifacts, such as JSON keys, S3 objects or database rows. In [step 1](#step-1-find-the-keys-in-a-scan), the matcher `PageKeys` finds the page keys of a JSON file in its scan. In [step 2](#step-2-get-the-builds-events), it also sends a found or a gone when a task declares or reports a key. First read [build.each](build-each.md), and [step 1 of Write an artifact type](write-an-artifact.md#step-1-one-key-of-a-json-file) for the `JsonKey` class that this page uses.
 
 ## What you write
 
-Extend `Matcher` from `"dapat"`. `D` is the type of the data of each match: one artifact, or a [list](#lists) of artifacts. `build.each` gives `matched.<name>.data` this type.
+Extend `Matcher` from `"dapat"`. `D` is the type of the data of each match: one artifact, or a [list](#lists) of artifacts.
 
 <!-- no-run -->
 ```ts
@@ -21,21 +21,20 @@ abstract class Matcher<D extends MatchedData = MatchedData> extends Emitter<Matc
 }
 ```
 
-- `varNames` holds the var names of each match. Set it in the class or the constructor. `build.each` reads it when you call `build.each`, to plan the [joins](build-each.md#joins). Each found and gone must have exactly these names, or `run()` rejects.
+- `varNames` holds the var names of each match. Set it in the class or the constructor: `build.each` reads it when you call `build.each`. Each found and gone must have exactly these names, or `run()` rejects.
 - `scan(signal)` finds the artifacts that exist now, and sends a found for each match. The first `run()` calls each scan one time, before any task starts ([how build.each works](build-each.md#how-buildeach-works)). If your scan can hang, make it throw after a timeout, or `run()` waits forever ([limits](limits.md#stamps-and-matchers)).
-  - `signal` aborts only on a [fatal error](guide.md#results-and-failure), such as a throw from another scan. If your scan throws, that is a fatal error too: `run()` rejects, and no task runs.
-- `receiveArtifactEvent(event)` gets each [event](guide.md#events) of the build, in the order that the build sends them. Override it to send found or gone at a `promised`, `produced`, `deleted` or `withdrawn` event ([step 2](#step-2-get-the-builds-events)). The default does nothing, so an artifact that a task makes during the run gets its tasks only in the next build.
+  - `signal` aborts only on a [fatal error](guide.md#results-and-failure), such as a throw from another scan. If your scan throws, `run()` rejects, and no task runs.
+- `receiveArtifactEvent(event)` gets each [event](guide.md#events) of the build. Override it to send found or gone at an event ([step 2](#step-2-get-the-builds-events)). The default does nothing, so an artifact that a task makes during the run gets its tasks only in the next build.
   - The build calls it as a [subscriber](guide.md#events), inside the call that sends the event, such as `ctx.produced`. So keep it synchronous, with no I/O and no throw. A throw, or a returned promise such as from an `async` override, is a [fatal error](semantics.md#fatal-errors): `run()` rejects.
   - The first `run()` sends the `promised` events of the tasks already in the build before it calls `scan`. So set up the state of your matcher in its fields or its constructor, not in `scan`.
 - `send(event)` gives one found or gone to each `build.each` that uses the matcher. `build.each` calls `tasks()` for each new or changed set before `send` returns.
-  - A found with the vars and artifact ids of a current match changes nothing. A gone for vars with no match changes nothing ([each case](semantics.md#buildeach-internals)).
-  - To log each found and gone, call `matcher.subscribe(listener)`.
+  - A found with the vars and artifact ids of a current match, or a gone for vars with no match, changes nothing ([each case](semantics.md#buildeach-internals)).
 
 ## Step 1: find the keys in a scan
 
-`PageKeys` finds each key `pages/<page>` of a JSON file. Its scan loads the file and sends a found for each such key, with the var `page` and a `JsonKey` as data. Check `signal.aborted` after each I/O call. After a [fatal error](semantics.md#fatal-errors), the build ignores each found, so the check only stops work that has no effect.
+The scan of `PageKeys` sends a found for each key `pages/<page>` of a JSON file, with the var `page` and a `JsonKey` as data. Check `signal.aborted` after each I/O call. This only saves work: after a [fatal error](semantics.md#fatal-errors), the build ignores each found.
 
-The program repeats `load` and `JsonKey` from [step 1 of Write an artifact type](write-an-artifact.md#step-1-one-key-of-a-json-file), without the `calls` log. Before build 2, the program removes `pages/usage` from `data.json` and adds `pages/faq`.
+The program repeats `load` and `JsonKey` from [step 1 of Write an artifact type](write-an-artifact.md#step-1-one-key-of-a-json-file), without the `calls` log.
 
 ```ts
 import path from "node:path"
@@ -117,14 +116,14 @@ build 1: ran [html:intro html:usage] skipped []
 build 2: ran [html:faq] skipped [html:intro]
 ```
 
-Each `Build` starts with no matches. So a scan sends only founds, and `pages/usage` needs no gone. Build 2 has no task `html:usage`, but its output file and its record stay ([layout rules](guide.md#layout-rules)).
+Each `Build` starts with no matches. So a scan sends only founds, and `pages/usage` needs no gone. The output file and record of `html:usage` stay ([layout rules](guide.md#layout-rules)).
 
 ## Step 2: get the build's events
 
-`PageKeys` now overrides `receiveArtifactEvent`. So `build.each` makes and removes tasks for the page keys that tasks declare, report and delete during the run. The program repeats `load` and `JsonKey` from [step 1](#step-1-find-the-keys-in-a-scan).
+`PageKeys` now overrides `receiveArtifactEvent`. So `build.each` makes and removes tasks for the page keys that tasks declare or report during the run. The program repeats `load` and `JsonKey` from [step 1](#step-1-find-the-keys-in-a-scan).
 
-- A key has a match from the scan or a `produced` event until a `deleted` event. It also has a match from a `promised` event until a `withdrawn` or `deleted` event. So do not send a gone for each `withdrawn` event, because the key can still be in the file. This is the rule of `FileMatcher` ([matches during the run](build-each.md#matches-during-the-run)), but `FileMatcher` keeps the match of a declared file after a `deleted` event. Then the tasks that read the file run while it is missing ([known issue 8](limits.md#known-issues-in-010)).
-- `curate` declares an [`IdPrefix`](builtins.md#idprefix) that covers each page key, so it can [report](guide.md#outputs-with-unknown-names) them. It changes `pages/intro`, adds `pages/faq` and deletes `pages/old`, and it reports each change.
+- A key has a match from the scan or a `produced` event until a `deleted` event. It also has a match from a `promised` event until a `withdrawn` or `deleted` event. So do not send a gone for each `withdrawn` event, because the key can still be in the file. This is the rule of `FileMatcher` ([matches during the run](build-each.md#matches-during-the-run)), but `FileMatcher` keeps the match of a declared file after a `deleted` event ([known issue 8](limits.md#known-issues-in-010)).
+- `curate` declares an [`IdPrefix`](builtins.md#idprefix) that covers each page key, so it can [report](guide.md#outputs-with-unknown-names) them.
 
 ```ts
 import path from "node:path"
@@ -247,13 +246,13 @@ The second `found intro` comes from the report of `pages/intro`. It has the same
 
 ## Send from a watcher
 
-`send` is protected, so other code, such as a file watcher, cannot call it. Give your matcher a public method that changes `inFile` and calls `update`, as `receiveArtifactEvent` does in [step 2](#step-2-get-the-builds-events). A found sent before the first `run()`, or during its scans, also works. Its tasks start when the first `run()` starts its tasks. After the scans of the first `run()`, `build.each` adds the tasks of each found immediately. They start with no new `run()` call, even after `run()` resolves ([the order rule](semantics.md#the-order-rule)). Call `run()` again to wait for them. Its `Result` also holds the tasks of earlier runs ([results](guide.md#results-and-failure)).
+`send` is protected, so other code, such as a file watcher, cannot call it. Give your matcher a public method that changes `inFile` and calls `update`, as in [step 2](#step-2-get-the-builds-events). The tasks of a found sent before the first `run()`, or during its scans, start when the first `run()` starts its tasks. After the scans, `build.each` adds the tasks of each found immediately. They start with no new `run()` call, even after `run()` resolves ([the order rule](semantics.md#the-order-rule)). Call `run()` again to wait for them. Its `Result` also holds the tasks of earlier runs ([results](guide.md#results-and-failure)).
 
-When a found or gone causes a [fatal error](semantics.md#fatal-errors), such as wrong var names, `send` does not throw. The build then ignores each later found and gone. The `run()` in progress, or the next `run()`, rejects with the error.
+When a found or gone causes a [fatal error](semantics.md#fatal-errors), such as wrong var names, `send` does not throw. The `run()` in progress, or the next `run()`, rejects with the error.
 
 ## Lists
 
-Use a list when one task reads many artifacts, as with [FileGroupMatcher](build-each.md#filegroupmatcher). Then `D` is a list, such as `readonly JsonKey[]`, and each found carries the whole list.
+Use a list when one task reads many artifacts, as with [FileGroupMatcher](build-each.md#filegroupmatcher). Then `D` is a list, such as `readonly JsonKey[]`.
 
 - Put the artifacts with the same var values into one list. In `scan`, send one found for each list.
 - When an artifact gets or loses its match ([step 2](#step-2-get-the-builds-events)), send a found with the new list.
@@ -264,14 +263,14 @@ Use a list when one task reads many artifacts, as with [FileGroupMatcher](build-
 ## Checklist
 
 - Send vars with exactly the names in `varNames`, or `run()` rejects. Give each var a string value. dapat does not check it, and a number `1` does not [join](build-each.md#joins) with a string `"1"`.
-- Send data whose id stays the same for the same key, file or row ([artifact checklist](write-an-artifact.md#checklist)). A new id makes the task run again in the next build. A found with the same vars and a new id also runs it again in the same run.
+- Send data whose id stays the same for the same key, file or row ([artifact checklist](write-an-artifact.md#checklist)). A new id makes the task run again, in the same run and in the next build.
 - Send a gone only when an artifact loses its match, not for each `withdrawn` event ([step 2](#step-2-get-the-builds-events)).
 - Keep `receiveArtifactEvent` synchronous, with no I/O and no throw.
 - Make the matcher find the inputs of its tasks, not their outputs, unless you want a [loop](build-each.md#loops). The matcher also gets the events of the tasks that its `build.each` makes.
-- Make `scan` return after it sends the current matches. To save work, check `signal.aborted` after each I/O call.
+- Make `scan` return after it sends the current matches.
 - A task that reports artifacts that your matcher finds declares an output that covers them ([outputs with unknown names](guide.md#outputs-with-unknown-names)).
 - Parse keys or object names with your own code, for example a `RegExp`. dapat exports no pattern parser ([imports](api.md#imports)).
-- Make a new matcher for each `Build`. If two `Build` objects use one matcher, `build.each` of the second `Build` throws.
+- Make a new matcher for each `Build`. `build.each` throws for a matcher that another `Build` uses.
 
 ## Next
 

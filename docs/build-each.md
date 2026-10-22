@@ -21,7 +21,7 @@ next build
 └─ new Build, new matchers → a new scan
 ```
 
-[Matches during the run](#matches-during-the-run) gives the rules of `during the run`. [Between builds](#between-builds) gives the rules of `next build`. [Error messages](api.md#error-messages) gives the text of each error of `build.each`.
+[Matches during the run](#matches-during-the-run) and [Between builds](#between-builds) give the rules of `during the run` and `next build`.
 
 ## The config
 
@@ -41,7 +41,7 @@ The build gives each joined set a label: the number of the `build.each` call, th
 
 ## FileMatcher
 
-`new FileMatcher(pattern, { stamp })` makes one match for each file that fits `pattern`. Use it when each file gets its own tasks, such as one HTML page for each Markdown file. The [vars](guide.md#buildeach) of the match come from the path of the file. Each match's data is a [`FileArtifact`](builtins.md#files) with the matcher's `stamp` option: `"hash"` (the default) or `"time"` ([hash or time](builtins.md#hash-or-time)). Any other `stamp` value throws.
+`new FileMatcher(pattern, { stamp })` makes one match for each file that fits `pattern`. Use it when each file gets its own tasks, such as one HTML page for each Markdown file. Each match's data is a [`FileArtifact`](builtins.md#files) with the matcher's `stamp` option: `"hash"` (the default) or `"time"` ([hash or time](builtins.md#hash-or-time)). Any other `stamp` value throws.
 
 | Pattern | File | Vars |
 | --- | --- | --- |
@@ -54,10 +54,9 @@ The build gives each joined set a label: the number of the `build.each` call, th
 
 The pattern:
 
-- A pattern has parts separated by `/`. In a pattern, `<name>` marks a var. The name has ASCII letters, digits and `_`, and does not start with a digit.
-- A var matches one or more characters other than `/`, including a leading `.`.
+- A pattern has parts separated by `/`. `<name>` marks a var. The name has ASCII letters, digits and `_`, and does not start with a digit.
+- A var matches one or more characters other than `/`.
 - A part can mix text and vars. The first var takes as much text as it can, as long as the rest of the path still fits.
-- A var that comes two times must have the same value in both places.
 - The constructor drops `.` parts and empty parts. So `./a//<b>.md` is `a/<b>.md`, and `a/b/` matches the file `a/b`, not the files in the folder `a/b`.
 - The constructor resolves a relative pattern against the current folder. A later `process.chdir` does not change the files that the matcher finds.
 
@@ -107,12 +106,10 @@ sitemap:en lists about.md hello.md
 
 - The data is a readonly list of `FileArtifact` objects with the matcher's `stamp` option, sorted by the whole path, by UTF-16 code unit. Spread it into `inputs`, as the sample does ([known issue 7](limits.md#known-issues-in-010)).
 - Write the pattern for the sources, such as `content/<lang>/*.md`, not for the outputs. A pattern such as `site/<lang>/*.html` also finds the output of a deleted source, because dapat deletes no file ([layout rules](guide.md#layout-rules)).
-- The pattern follows the [FileMatcher](#filematcher) rules, and it must have a `*` or `**`. Vars can come only in the parts before the first part with a `*` or `**`. The constructor throws for other patterns ([error messages](api.md#error-messages)). A `*` or `**` makes no var, so read the other names from the path of each file, as the sample does with `source.path`.
+- The pattern follows the [FileMatcher](#filematcher) rules, and it must have a `*` or `**`. Vars can come only in the parts before the first part with a `*` or `**`. The constructor throws for other patterns ([error messages](api.md#error-messages)). A `*` or `**` makes no var, so read the other names from the path of each file.
 - `*` matches any text in one part, including empty text and a leading `.`. So the match of `notes/*.md` holds `notes/.md` and `notes/.draft.md`. A pattern with no var gives one match, or none when no file fits.
 - `**` matches zero or more folders, hidden folders too. So the match of `en` for `content/<lang>/**/*.md` holds `content/en/top.md` and `content/en/blog/hello.md`. `**` must be a whole part, and not the last part: for every file below `content`, write `content/**/*`. At a `**`, the scan reads every folder below it. So start the pattern with a fixed folder, such as `content/**/*.md`, not `**/*.md`.
 - The matcher sends one found for each list after the whole scan. During the run, each change to a list sends found with the new list, or gone when the list is empty ([matches during the run](#matches-during-the-run)).
-
-[examples/file-pipeline.ts](../examples/file-pipeline.ts) uses this matcher for one sitemap for each `lang`.
 
 ## Joins
 
@@ -163,7 +160,7 @@ console.log(`ran [${ran.join(" ")}]`)
 ran [page:about:ann page:about:bob page:hello:-]
 ```
 
-`about` gets one set for each review. The set of `hello` has no `review` key in `matched` and no `reviewer` key in `vars`.
+The set of `hello` has no `review` key in `matched` and no `reviewer` key in `vars`.
 
 - Optional matchers join one after the other, in `matchersByName` order. The **ON vars** of an optional matcher are its var names that a required matcher or an earlier optional matcher has. For `review`, the ON var is `slug`. A match joins a set when it has the set's value for each ON var. An optional matcher with no ON vars, such as `tags/<tag>.txt`, joins each of its matches to each set.
 - The order matters only when two optional matchers share a var name that no required matcher has. Then the later matcher joins only a set where the earlier one gave that var a value. For example, with `rating: new FileMatcher("ratings/<slug>.<reviewer>.txt")` after `review`, a rating joins only the set of the review by the same reviewer.
@@ -172,7 +169,7 @@ ran [page:about:ann page:about:bob page:hello:-]
 
 ## Matches during the run
 
-During the run, `FileMatcher` and `FileGroupMatcher` get the build's [events](guide.md#events). So a file that a task declares or reports gets its tasks in the same `run()`. In this program, `write` reports `chapters/1.txt`, and `build.each` makes the task `summary:1` for it:
+During the run, `FileMatcher` and `FileGroupMatcher` get the build's [events](guide.md#events). So a file that a task declares or reports gets its tasks in the same `run()`. In this program, `write` reports `chapters/1.txt`:
 
 ```ts
 import { Build, Task, type Context } from "dapat"
@@ -209,9 +206,9 @@ write ends
 summary:1 runs
 ```
 
-- `build.each` adds `summary:1` before `ctx.produced` returns. `summary:1` starts only when `write` ends, because `write` declares the folder that holds the chapter.
-- A `FileMatcher` gives a file a match when the [scan](guide.md#buildeach) finds the file or a `produced` event comes for it. The matcher uses only the events of a `FileArtifact` or a subclass. So an artifact of another class makes no match, even for the same path. A `deleted` event ends the match. A `promised` event for a folder makes no match. So report each file that a task writes in a folder, or the file gets a match only at the next build's scan.
-- A file also has a match while a task declares it as an exact output, from the `promised` event to the `withdrawn` event. So the file has a match before it exists. A `deleted` event does not end this match ([known issue 8](limits.md#known-issues-in-010)).
+- `summary:1` starts only when `write` ends, because `write` declares the folder that holds the chapter.
+- A `FileMatcher` gives a file a match when the [scan](guide.md#buildeach) finds the file or a `produced` event comes for it. The matcher uses only the events of a `FileArtifact` or a subclass, not of another class with the same path. A `deleted` event ends the match. A `promised` event for a folder makes no match. So report each file that a task writes in a folder, or the file gets a match only at the next build's scan.
+- A file also has a match while a task declares it as an exact output, from the `promised` event to the `withdrawn` event. A `deleted` event does not end this match ([known issue 8](limits.md#known-issues-in-010)).
 - `FileGroupMatcher` uses these rules for each file of a list. At each report that changes a list, `build.each` runs `tasks()` again for each joined set that holds the list. The new task [replaces](guide.md#tasks-and-dependencies) the old one, so `result.cancelled` can hold several tasks with one id. The build time grows with the square of the number of reports ([scale](limits.md#scale)). A declared file joins the list at its `promised` event, so its report does not run `tasks()` again.
 
 ## Loops
@@ -256,7 +253,7 @@ ran [turn:0 turn:1 turn:2 turn:3]
 
 ## Between builds
 
-A matcher belongs to the first `Build` whose `build.each` uses it, so give each new `Build` new matchers. The new matchers scan again.
+A matcher belongs to the first `Build` whose `build.each` uses it, so give each new `Build` new matchers. They scan again.
 
 - The new scan does not find a deleted file that no task declares or reports, so its tasks are not in the build. Their outputs and records stay ([layout rules](guide.md#layout-rules)).
 - A deleted file that a task declares, or writes and reports, still has its tasks in the build. The task declares the file again, or runs again and reports it.

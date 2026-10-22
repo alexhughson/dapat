@@ -1,12 +1,12 @@
 # API reference
 
-Look up the signature and members of any export of dapat here, or the exact text of an [error message](#error-messages). Read part 1 of the [guide](guide.md) first. [How a build works](semantics.md) tells when the build calls your code, and which errors are fatal.
+Look up the signature and members of any export of dapat here, or the exact text of an [error message](#error-messages). Read part 1 of the [guide](guide.md) first.
 
 ## Imports
 
-Import each export from `"dapat"` or `"dapat/contrib"`, for example `import { Build, Task } from "dapat"`. Bun and tsc cannot find other paths, such as `dapat/contrib/fs`. Bun gives `Cannot find module 'dapat/contrib/fs'`, and tsc gives error TS2307.
+Import each export from `"dapat"` or `"dapat/contrib"`. Other paths, such as `dapat/contrib/fs`, fail: Bun gives `Cannot find module 'dapat/contrib/fs'`, and tsc gives error TS2307.
 
-This table lists every export. Use the Extend dapat column when you write an [artifact type](write-an-artifact.md), a [store](write-an-artifact.md#the-store), a [matcher](guide.md#buildeach) ([walkthrough](write-a-matcher.md)) or an `S3Client`. Also use it to [subclass `Build`](semantics.md#subclass-build-settasksofgroups).
+This table lists every export. Use the Extend dapat column to write an [artifact type](write-an-artifact.md), a [store](write-an-artifact.md#the-store), a [matcher](write-a-matcher.md) or an `S3Client`, or to [subclass `Build`](semantics.md#subclass-build-settasksofgroups).
 
 | From | Kind | Write a build | Extend dapat |
 | --- | --- | --- | --- |
@@ -16,15 +16,15 @@ This table lists every export. Use the Extend dapat column when you write an [ar
 | `dapat/contrib` | class | [`FileArtifact`](#fileartifact), [`FileGroupMatcher`](#filegroupmatcher), [`FileMatcher`](#filematcher), [`FilesystemPrefix`](#filesystemprefix), [`JsonStore`](#jsonstore), [`MemoryS3`](#memorys3), [`MemoryStore`](#store) (the same class as in `dapat`), [`S3ObjectArtifact`](#s3objectartifact), [`S3Prefix`](#s3prefix), [`SqliteStore`](#sqlitestore) | – |
 | `dapat/contrib` | type | [`FileStampMode`](#fileartifact), [`FileStampOptions`](#fileartifact) | [`S3Client`](#s3client), [`S3Head`](#s3client), [`S3ListEntry`](#s3client) |
 
-`fileId`, `dirId`, `sha256Hex`, `hashLines`, `KeyPattern`, `FileMatchStates` and `TaskMaterializer` are in the source, but neither module exports them. For the id of a file or folder, read the `id` of a `FileArtifact` or `FilesystemPrefix`. For `sha256Hex`, call `Bun.SHA256.hash(text, "hex")`. For `hashLines`, hash the sorted lines joined with `"\n"`. In a [custom matcher](write-a-matcher.md), write your own pattern code.
+`fileId`, `dirId`, `sha256Hex`, `hashLines`, `KeyPattern`, `FileMatchStates` and `TaskMaterializer` are in the source, but neither module exports them. For the id of a file or folder, read the `id` of a `FileArtifact` or `FilesystemPrefix`. For `sha256Hex`, call `Bun.SHA256.hash(text, "hex")`. For `hashLines`, hash the sorted lines joined with `"\n"`.
 
 ## Core entries
 
-These are the exports of `"dapat"`. The [Imports](#imports) table links each name to the entry that holds it.
+These are the exports of `"dapat"`.
 
 ### Build
 
-A `Build` holds tasks, runs each task after its producers, and saves a record of each successful run in its store ([What a build does](guide.md#what-a-build-does)). It is an [`Emitter`](#emitter): it sends each `ArtifactEvent` below to its subscribers ([Events](guide.md#events)).
+A `Build` holds tasks, runs each task after its producers, and saves a record of each successful run in its store ([What a build does](guide.md#what-a-build-does)). It sends each `ArtifactEvent` below to its subscribers ([Events](guide.md#events)).
 
 <!-- no-run -->
 ```ts
@@ -47,17 +47,13 @@ type ArtifactEvent =
 const SEND_LIMIT = 10_000 // the default sendLimit
 ```
 
-- `sendLimit` caps the events that subscribers cause in one [pass](semantics.md#terms), and the passes in one [drain](semantics.md#terms) ([The send limit](semantics.md#the-send-limit)). The constructor throws `sendLimit must be a positive integer, not <v>`.
-- `add` throws and changes nothing in these cases:
-
-  | Case | Message |
-  | --- | --- |
-  | Another task has an [exact output](guide.md#tasks-and-dependencies) of the task | `duplicate output '<artifact id>': claimed by '<id>' and '<id>'` |
-  | The task declares one exact output two times | `task '<id>' declares output '<artifact id>' twice` |
-  | `build.each` or `setTasksOfGroups` already gave a task with this id | `task '<id>' is in two groups: '<group>' and 'build.add <id>'` |
-
-- After the first `run()` starts, `add` starts the task immediately, but not after a fatal error, or while the scans run, with one exception ([The order rule](semantics.md#the-order-rule)).
-- [`each`](build-each.md) makes tasks for each [joined set](guide.md#buildeach) of matches. After the first `run()` starts, it throws `build.each must come before the first build.run()`. A bad config also throws ([Error messages](#error-messages)).
+- `sendLimit` caps the events that subscribers cause in one [pass](semantics.md#terms), and the passes in one [drain](semantics.md#terms) ([The send limit](semantics.md#the-send-limit)). It must be a positive integer, or the constructor throws.
+- `add` throws and changes nothing in these cases ([Error messages](#error-messages)):
+  - Another task has an [exact output](guide.md#tasks-and-dependencies) of the task.
+  - The task declares one exact output two times.
+  - `build.each` or `setTasksOfGroups` already gave a task with this id.
+- After the first `run()` starts its tasks, `add` starts the task immediately, unless the build has a fatal error. Before that, the task waits, with one exception ([The order rule](semantics.md#the-order-rule)).
+- [`each`](build-each.md) makes tasks for each [joined set](guide.md#buildeach) of matches. It throws after the first `run()` starts, or for a bad config ([Error messages](#error-messages)).
 - `run()` rejects with the first [fatal error](semantics.md#fatal-errors). [build.run()](semantics.md#buildrun) gives the order of its calls and events.
 
 ### TaskGroup
@@ -72,7 +68,7 @@ type GroupTasks = { group: TaskGroup; tasks: readonly Task[] } // one group and 
 
 ### Task
 
-A `Task` has an id, inputs, outputs and a `run` function ([Tasks and dependencies](guide.md#tasks-and-dependencies)). `run` gets [`ctx`](guide.md#outputs-with-unknown-names), a `Context`. [Replacement and removal](semantics.md#replacement-and-removal) tells what `ctx` does in a [stopped run](semantics.md#terms). Use an instance of a subclass of `Artifact` or `Prefix` for each input and output, not a plain object ([known issue 4](limits.md#known-issues-in-010)). `TaskInit` takes only mutable arrays ([known issue 7](limits.md#known-issues-in-010)).
+A `Task` has an id, inputs, outputs and a `run` function that gets `ctx`, a `Context` ([Tasks and dependencies](guide.md#tasks-and-dependencies), [Outputs with unknown names](guide.md#outputs-with-unknown-names)). [Replacement and removal](semantics.md#replacement-and-removal) tells what `ctx` does in a [stopped run](semantics.md#terms). Use an instance of a subclass of `Artifact` or `Prefix` for each input and output, not a plain object ([known issue 4](limits.md#known-issues-in-010)). `TaskInit` takes only mutable arrays ([known issue 7](limits.md#known-issues-in-010)).
 
 <!-- no-run -->
 ```ts
@@ -91,12 +87,10 @@ interface Context {
   readonly signal: AbortSignal // aborts with an AbortError when the build replaces or removes the task, or on a fatal error
   add(task: Task): void // build.add
   remove(id: string): void // build.remove
-  produced(artifact: Artifact): void // sends a produced event
-  deleted(artifact: Artifact): void // sends a deleted event
+  produced(artifact: Artifact): void // sends a produced event; throws when no output covers the artifact
+  deleted(artifact: Artifact): void // sends a deleted event; throws when no output covers the artifact
 }
 ```
-
-- `ctx.produced` throws `task '<id>' produced '<artifact id>', which no output covers`. For `ctx.deleted`, the message says `deleted`.
 
 ### Artifact
 
@@ -113,7 +107,7 @@ abstract class Artifact<T = unknown> {
 
 ### Prefix
 
-Extend `Prefix` for the artifacts whose ids start with one id, such as the files in one folder ([Folders: prefixes](guide.md#folders-prefixes), [walkthrough](write-an-artifact.md#step-2-a-prefix-for-keys-with-unknown-names)). [What you write](write-an-artifact.md#what-you-write) tells which `covers` and `overlaps` the build calls, and that they must not throw. [`IdPrefix`](builtins.md#idprefix) is a `Prefix` that has only an id.
+Extend `Prefix` for the artifacts whose ids start with one id, such as the files in one folder ([Folders: prefixes](guide.md#folders-prefixes), [walkthrough](write-an-artifact.md#step-2-a-prefix-for-keys-with-unknown-names)). [What you write](write-an-artifact.md#what-you-write) tells which `covers` and `overlaps` the build calls, and that they must not throw. [`IdPrefix`](builtins.md#idprefix) has only an id.
 
 <!-- no-run -->
 ```ts
@@ -139,7 +133,7 @@ interface Store {
   delete(taskId: string): Promise<void>
   clear(): Promise<void>
 }
-class MemoryStore implements Store { constructor() } // a Map in this process; also in dapat/contrib
+class MemoryStore implements Store { constructor() } // a Map in this process
 ```
 
 ### Result
@@ -163,7 +157,7 @@ class Result {
 
 ### Emitter
 
-An `Emitter` calls its [subscribers](guide.md#events) with each event, one at a time, in the order in which they subscribed. `Build` and `Matcher` extend it. A subscriber must be synchronous. If it returns a promise, `send` throws `subscriber returned a promise; subscribers must be synchronous`, and passes the rejection reason of that promise to `rejected`.
+An `Emitter` calls its [subscribers](guide.md#events) with each event, one at a time, in the order in which they subscribed. A subscriber must be synchronous. If it returns a promise, `send` throws, and passes the rejection reason of that promise to `rejected`.
 
 <!-- no-run -->
 ```ts
@@ -213,11 +207,11 @@ type MatchedByName<M extends Record<string, AnyMatcher>, R extends keyof M & str
 
 ## Contrib entries
 
-These are the exports of `"dapat/contrib"`: the artifacts, prefixes and matchers for files, the stores, and the S3 interfaces and classes.
+These are the exports of `"dapat/contrib"`.
 
 ### FileArtifact
 
-`new FileArtifact(p, opts)` is the artifact for one file ([Files](builtins.md#files)). The `opts` of `FileArtifact`, `FilesystemPrefix`, `FileMatcher` and `FileGroupMatcher` is a `FileStampOptions`. With no `stamp`, the [stamp mode](guide.md#artifacts-and-stamps) is `"hash"` ([Hash or time](builtins.md#hash-or-time)). For another value, such as `"md5"`, each constructor throws `stamp must be "time" or "hash", not "md5"`.
+`new FileArtifact(p, opts)` is the artifact for one file ([Files](builtins.md#files)). `FilesystemPrefix`, `FileMatcher` and `FileGroupMatcher` take the same `opts`. With no `stamp`, the [stamp mode](guide.md#artifacts-and-stamps) is `"hash"` ([Hash or time](builtins.md#hash-or-time)). Another value makes each of these constructors throw ([Error messages](#error-messages)).
 
 <!-- no-run -->
 ```ts
@@ -253,7 +247,7 @@ class FilesystemPrefix extends Prefix {
 
 ### FileMatcher
 
-`new FileMatcher(pattern, opts)` takes a pattern such as `content/<lang>/<slug>.md` ([FileMatcher](build-each.md#filematcher)). It makes one match for each file that fits the pattern. A file gets its match when the scan finds it, a task reports it, or a task declares it as an exact output ([Matches during the run](build-each.md#matches-during-the-run)). The data of a match is a `FileArtifact` with the stamp mode of the matcher.
+`new FileMatcher(pattern, opts)` makes one match for each file that fits a pattern such as `content/<lang>/<slug>.md` ([FileMatcher](build-each.md#filematcher)). A file gets its match when the scan finds it, a task reports it, or a task declares it as an exact output ([Matches during the run](build-each.md#matches-during-the-run)). The data of a match is a `FileArtifact` with the stamp mode of the matcher.
 
 <!-- no-run -->
 ```ts
@@ -335,7 +329,7 @@ class S3Prefix extends Prefix {
 }
 ```
 
-- For an entry that is not a `{ key, etag }` object, `stamp()` throws `S3Client.list must return { key, etag } objects, not <entry as JSON> (<prefix id>)`.
+- `stamp()` throws when `client.list` returns an entry that is not a `{ key, etag }` object ([Error messages](#error-messages)).
 
 ### MemoryS3
 
@@ -353,7 +347,7 @@ class MemoryS3 implements S3Client {
 
 ## Error messages
 
-This table gives the exact text of each error message of dapat, and of some messages from Bun. Search the page for a fixed part of the text. `<…>` stands for a value from your build, and `<class>` is `FileMatcher` or `FileGroupMatcher`. `<group>` is the label of a [task group](semantics.md#subclass-build-settasksofgroups). For a task that `build.add` adds, it is `build.add <id>`. For a joined set, it is the [label](build-each.md#the-config) of the set, such as `build.each 1 lang=en`. `<n>` is the number of the `build.each` call ([build.each internals](semantics.md#buildeach-internals)). The Where column tells where your code gets the error, and the rows go in the order of this list:
+This table gives the exact text of each error message of dapat, and of some messages from Bun. `<…>` stands for a value from your build, and `<class>` is `FileMatcher` or `FileGroupMatcher`. `<group>` is the label of a [task group](semantics.md#subclass-build-settasksofgroups), such as `build.add <id>` for a task that `build.add` adds, or `build.each 1 lang=en` for a [joined set](build-each.md#the-config). `<n>` is the number of the `build.each` call ([build.each internals](semantics.md#buildeach-internals)). The Where column tells where your code gets the error, and the rows go in the order of this list:
 
 - call throws: the call changes nothing.
 - call throws, or `run()` rejects: `build.add`, `ctx.add`, or `setTasksOfGroups` with no open step throws and changes nothing. For the tasks that `build.each` gives, or a `setTasksOfGroups` call in an [open step](semantics.md#terms), `run()` rejects.
@@ -364,23 +358,23 @@ This table gives the exact text of each error message of dapat, and of some mess
 | Message | Where | Cause | See |
 | --- | --- | --- | --- |
 | `sendLimit must be a positive integer, not <v>` | call throws | – | [Build](#build) |
-| `stamp must be "time" or "hash", not <v>` | call throws | `new FileArtifact`, `new FilesystemPrefix`, `new FileMatcher` or `new FileGroupMatcher` got another `stamp` value | [Hash or time](builtins.md#hash-or-time) |
+| `stamp must be "time" or "hash", not <v>` | call throws | – | [Hash or time](builtins.md#hash-or-time) |
 | `group '<group>' is in one setTasksOfGroups step twice` | call throws | a `setTasksOfGroups` call names one `TaskGroup` two times | [Subclass Build](semantics.md#subclass-build-settasksofgroups) |
 | `build.each must come before the first build.run()`<br>`build.each <n> has no matcher; build.each needs at least one matcher`<br>`build.each <n>: '<name>' and '<name>' are one matcher object; give each name its own matcher`<br>`build.each <n>: its matcher '<name>' belongs to another Build; make a new matcher for each Build` | call throws | – | [The config](build-each.md#the-config), [Between builds](build-each.md#between-builds) |
 | `build.each <n>: required is empty; name at least one matcher, or leave required out to require every matcher`<br>`build.each <n>: required names '<name>', which is not a name in matchersByName`<br>`build.each <n>: the required matchers ['<name>', …] share no var name with required matcher '<name>' or its required partners; each required matcher must share a var name with another required matcher, and a matcher that is not required does not connect them` | call throws | – | [required](build-each.md#required), [Joins](build-each.md#joins) |
-| `<class>: the pattern is empty`<br>`<class> pattern '<pattern>' names no file`<br>`<class> pattern '<pattern>': a '..' part is not allowed; for a folder above the working directory, use path.resolve to make the pattern absolute`<br>`<class> pattern '<pattern>': each '<' and '>' must enclose a var name of letters, digits, and '_' that does not start with a digit` | call throws | for the second message: a pattern such as `.` or `/` names no file | [FileMatcher](build-each.md#filematcher) |
+| `<class>: the pattern is empty`<br>`<class> pattern '<pattern>' names no file`<br>`<class> pattern '<pattern>': a '..' part is not allowed; for a folder above the working directory, use path.resolve to make the pattern absolute`<br>`<class> pattern '<pattern>': each '<' and '>' must enclose a var name of letters, digits, and '_' that does not start with a digit` | call throws | second message: for example, `.` or `/` | [FileMatcher](build-each.md#filematcher) |
 | `<class> pattern '<pattern>': '**' must be a whole part, as in 'a/**/b'`<br>`<class> pattern '<pattern>': the last part must name files, not '**'; use '**/*' for every file`<br>`FileMatcher pattern '<pattern>': '*' and '**' are not allowed; use a <name> var for each part that changes, or FileGroupMatcher for one match with a list of files`<br>`FileGroupMatcher pattern '<pattern>' has no '*' or '**'; use FileMatcher for one match for each file`<br>`FileGroupMatcher pattern '<pattern>': a var must come in a part before the first '*' or '**'; read the other names from the path of each file` | call throws | in the `FileMatcher` message, `<name>` is part of the text | [FileGroupMatcher](build-each.md#filegroupmatcher) |
-| `pattern '<pattern>': the var <x> comes twice with nothing between`<br>`pattern '<pattern>': the vars <x> and <y> have nothing between them, so a key has no single split` | call throws | `<x>` and `<y>` are the vars as you wrote them, with their brackets, such as `<slug>`. `<pattern>` is your pattern without its `.` and empty parts, such as `a/<x><y>.md` for `a/./<x><y>.md` | [FileMatcher](build-each.md#filematcher) |
-| `duplicate output '<artifact id>': claimed by '<id>' and '<id>'`<br>`task '<id>' declares output '<artifact id>' twice` | call throws, or `run()` rejects | two tasks declare one exact output, or one task lists it two times | [Tasks and dependencies](guide.md#tasks-and-dependencies) |
+| `pattern '<pattern>': the var <x> comes twice with nothing between`<br>`pattern '<pattern>': the vars <x> and <y> have nothing between them, so a key has no single split` | call throws | `<x>` and `<y>` keep their brackets, such as `<slug>`. `<pattern>` has no `.` or empty parts: `a/./<x><y>.md` gives `a/<x><y>.md` | [FileMatcher](build-each.md#filematcher) |
+| `duplicate output '<artifact id>': claimed by '<id>' and '<id>'`<br>`task '<id>' declares output '<artifact id>' twice` | call throws, or `run()` rejects | – | [Tasks and dependencies](guide.md#tasks-and-dependencies) |
 | `task '<id>' is in two groups: '<group>' and '<group>'`<br>`group '<group>' gives task '<id>' twice` | call throws, or `run()` rejects | for example, two [joined sets](guide.md#buildeach) give one id, or `build.add` and a `build.each` do. The second message: one `tasks()` call, or the list of one group in `setTasksOfGroups`, gives two tasks with one id | [The config](build-each.md#the-config) |
-| `task '<id>' produced '<artifact id>', which no output covers` | task fails | `ctx.produced` threw it, and the task's `run` did not catch it. For `ctx.deleted`, the message says `deleted` | [Outputs with unknown names](guide.md#outputs-with-unknown-names) |
+| `task '<id>' produced '<artifact id>', which no output covers` | task fails | `ctx.produced` threw it. For `ctx.deleted`, the message says `deleted` | [Outputs with unknown names](guide.md#outputs-with-unknown-names) |
 | `dependency of '<id>' failed` | task fails | `<id>` is the waiting task, not the task that failed | [Results and failure](guide.md#results-and-failure), [known issue 6](limits.md#known-issues-in-010) |
 | `deadlock waiting for inputs of '<id>'` | task fails | the task is in a cycle of tasks that wait for each other, or it waits for a task in such a cycle | [Tasks and dependencies](guide.md#tasks-and-dependencies) |
 | `not a file: <path>` | task fails | a build with a store stamps a `FileArtifact` whose path is not a regular file, such as a folder or a FIFO | [Files](builtins.md#files) |
 | `ENOENT: no such file or directory, open '<path>'` | task fails | `FileArtifact.read()` found no file | [Files](builtins.md#files) |
-| `EACCES: permission denied, <call> '<path>'` | task fails | `open`: a hash `stamp()` or `read()` found a file with no read permission. `scandir`: a folder `stamp()` or `list()` found a folder with no read permission. A time stamp of a file needs no read permission | [Files](builtins.md#files), [Folders](builtins.md#folders) |
+| `EACCES: permission denied, <call> '<path>'` | task fails | `open`: a hash `stamp()` or `read()` found a file with no read permission. `scandir`: a folder `stamp()` or `list()` found a folder with no read permission | [Files](builtins.md#files), [Folders](builtins.md#folders) |
 | `ENOTDIR: not a directory, lstat '<path>/'`<br>`ENOTDIR: not a directory, stat '<path>'` | task fails | a build with a store stamps a `FilesystemPrefix` whose path is a file, or a task calls its `list()` (`lstat`). Or a build with a store stamps a `FileArtifact` whose path goes through a file, such as `out.txt/x` (`stat`) | [Folders](builtins.md#folders), [Files](builtins.md#files) |
-| `JSON Parse error: <detail>`<br>`Cannot use a closed database` | task fails | the `JsonStore` file is not valid JSON, such as an empty file (`Unexpected EOF`), or the `SqliteStore` is closed. When `store.delete` throws it after a [removal](guide.md#tasks-and-dependencies), `result.errors` holds it, and no task fails | [Stores](builtins.md#stores) |
+| `JSON Parse error: <detail>`<br>`Cannot use a closed database` | task fails | the `JsonStore` file is not valid JSON, such as an empty file (`Unexpected EOF`), or the `SqliteStore` is closed. From `store.delete`, it goes to `result.errors`, and no task fails | [Stores](builtins.md#stores) |
 | `missing s3://<bucket>/<key>`<br>`S3Client.list must return { key, etag } objects, not <entry as JSON> (<prefix id>)` | task fails | First message: `MemoryS3.get` found no object for the key. Second message: in a build with a store, the `list` of your `S3Client` returned an entry with no string `key` or `etag` | [S3](builtins.md#s3) |
 | *the thrown error* | task fails | the `run` of the task, a `stamp()`, `store.get` or `store.set` threw it | [Results and failure](guide.md#results-and-failure) |
 | `send limit: subscribers caused <sendLimit> events in one pass of a drain, and more wait; the last sent was '<kind> <id> by <task id>'`<br>`send limit: <sendLimit> passes in one drain, and more task changes wait; a build.each can feed itself` | `run()` rejects | a subscriber or a `build.each` adds tasks with no end | [The send limit](semantics.md#the-send-limit), [Loops](build-each.md#loops) |
