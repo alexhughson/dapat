@@ -18,16 +18,19 @@ Page n sends n references. So with this model, a book can have at most 15 pages.
 ## The tasks
 
 ```
-chunk:<book>/lines=<n>  books/<book>/text.txt  ->  FilesystemPrefix("out/<book>/pages/")
+chunk/lines=<n>:<book>  one-task form; books/<book>/text.txt  ->  FolderTemplate("out/<book>/pages/")
                         writes 000.txt, 001.txt, ... with n lines each, and calls ctx.produced for each page
-image:<book>/<page>     pages/<page>.txt + books/<book>/style.txt + images/000.png ... images/<page - 1>.png
-                        ->  images/<page>.png
-assemble:<book>         FilesystemPrefix(pages/) + FilesystemPrefix(images/)  ->  out/<book>/book.html
+image:<book>/<page>     tasks form; pages/<page>.txt + books/<book>/style.txt + images/000.png ... images/<page - 1>.png
+                        ->  FileTemplate("out/<book>/images/<page>.png")
+assemble:<book>         one-task form; FileGroupMatcher("out/<book>/pages/*.txt") + FileGroupMatcher("out/<book>/images/*.png")
+                        ->  FileTemplate("out/<book>/book.html")
 ```
 
-The number of lines on each page is in the id of `chunk`. A new number makes a new task id. The new task has no record in the store, so it runs.
+`chunk` and `assemble` use the one-task form (`name` and `run`), because their inputs are their matches. `image` uses `tasks`, because its earlier images come from no matcher.
 
-On the first run, `pages/` is empty. Each `ctx.produced(page)` makes the page matcher send `found`, and `build.each` adds the image task of that page. So all images are drawn in the same run.
+The number of lines on each page is in the name of `chunk`, so it is in the task id. A new number makes a new task id. The new task has no record in the store, so it runs.
+
+On the first run, `pages/` is empty. Each `ctx.produced(page)` makes the page matcher send `found`, and `build.each` adds the image task of that page. So all images are drawn in the same run. The image groups of `assemble` get the image files when the image tasks declare them, so `assemble` waits for every image.
 
 ## What an edit costs
 

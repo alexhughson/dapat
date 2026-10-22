@@ -5,8 +5,8 @@
 import * as fs from "node:fs"
 import * as fsPromises from "node:fs/promises"
 import path from "node:path"
-import { Build, Task, type Ref } from "dapat"
-import { FileArtifact, FileMatcher, FilesystemPrefix, JsonStore } from "dapat/contrib"
+import { Build, Task } from "dapat"
+import { FileArtifact, FileGroupMatcher, FileMatcher, FileTemplate, FolderTemplate, JsonStore } from "dapat/contrib"
 
 let scriptPath = path.relative(process.cwd(), import.meta.path)
 if (scriptPath.startsWith("..")) {
@@ -84,58 +84,51 @@ async function drawImage(prompt: string, earlierImages: Uint8Array[]): Promise<U
 const pageName = (index: number) => String(index).padStart(3, "0")
 const build = new Build({ store: new JsonStore(".dapat/state.json") })
 
-// chunk:<book> writes one file for each page. It does not know the page count before it runs,
-// so it declares the folder and reports each page. Each report makes the image task of that page.
-// linesPerPage is in the task id, so a new value makes a new task, and that task runs.
+// chunk/lines=<n>:<book> writes one file for each page. It does not know the page count before it
+// runs, so it declares the folder and reports each page. Each report makes the image task of that
+// page. linesPerPage is in the task id, so a new value makes a new task, and that task runs.
 build.each({
+  name: `chunk/lines=${linesPerPage}`,
   matchersByName: { text: new FileMatcher("books/<book>/text.txt") },
-  *tasks(vars, matched) {
-    const pagesFolder = new FilesystemPrefix(`out/${vars.book}/pages/`)
-    yield new Task({
-      id: `chunk:${vars.book}/lines=${linesPerPage}`,
-      inputs: [matched.text.data],
-      outputs: [pagesFolder],
-      run: async (ctx) => {
-        const text = await Bun.file(matched.text.data.path).text()
-        const lines = text.split("\n").filter((line) => line.trim().length > 0)
-        const pages = new Set<string>()
-        for (let index = 0; index * linesPerPage < lines.length; index++) {
-          const pageLines = lines.slice(index * linesPerPage, (index + 1) * linesPerPage)
-          const page = new FileArtifact(`out/${vars.book}/pages/${pageName(index)}.txt`)
-          await Bun.write(page.path, pageLines.join("\n"))
-          pages.add(page.path)
-          ctx.produced(page)
-        }
-        // A shorter text leaves old pages behind. Delete them, so their image tasks go away.
-        for (const file of await pagesFolder.list()) {
-          if (!pages.has(file)) {
-            await fsPromises.unlink(file)
-            ctx.deleted(new FileArtifact(file))
-          }
-        }
-      },
-    })
+  outputsByName: { pages: new FolderTemplate("out/<book>/pages/") },
+  async run({ matched, outputs, ctx }) {
+    const text = await Bun.file(matched.text.data.path).text()
+    const lines = text.split("\n").filter((line) => line.trim().length > 0)
+    const written = new Set<string>()
+    for (let index = 0; index * linesPerPage < lines.length; index++) {
+      const pageLines = lines.slice(index * linesPerPage, (index + 1) * linesPerPage)
+      const page = new FileArtifact(path.join(outputs.pages.path, `${pageName(index)}.txt`))
+      await Bun.write(page.path, pageLines.join("\n"))
+      written.add(page.path)
+      ctx.produced(page)
+    }
+    // A shorter text leaves old pages behind. Delete them, so their image tasks go away.
+    for (const file of await outputs.pages.list()) {
+      if (!written.has(file)) {
+        await fsPromises.unlink(file)
+        ctx.deleted(new FileArtifact(file))
+      }
+    }
   },
 })
 
 // image:<book>/<page> joins each page to the style of its book, and reads every image before it.
+// The earlier images come from no matcher, so this build.each uses the tasks form.
 build.each({
   matchersByName: {
     page: new FileMatcher("out/<book>/pages/<page>.txt"),
     style: new FileMatcher("books/<book>/style.txt"),
   },
-  *tasks(vars, matched) {
-    const index = Number(vars.page)
-    const image = new FileArtifact(`out/${vars.book}/images/${vars.page}.png`)
+  outputsByName: { image: new FileTemplate("out/<book>/images/<page>.png") },
+  *tasks(vars, matched, outputs) {
     const earlierImages: FileArtifact[] = []
-    for (let earlier = 0; earlier < index; earlier++) {
+    for (let earlier = 0; earlier < Number(vars.page); earlier++) {
       earlierImages.push(new FileArtifact(`out/${vars.book}/images/${pageName(earlier)}.png`))
     }
-    const inputs: Ref[] = [matched.page.data, matched.style.data, ...earlierImages]
     yield new Task({
       id: `image:${vars.book}/${vars.page}`,
-      inputs,
-      outputs: [image],
+      inputs: [matched.page.data, matched.style.data, ...earlierImages],
+      outputs: [outputs.image],
       run: async () => {
         const style = await Bun.file(matched.style.data.path).text()
         const pageText = await Bun.file(matched.page.data.path).text()
@@ -144,35 +137,28 @@ build.each({
           earlierBytes.push(await earlier.read())
         }
         const prompt = `A picture book illustration. Style: ${style.trim()}\nScene: ${pageText}`
-        await Bun.write(image.path, await drawImage(prompt, earlierBytes))
+        await Bun.write(outputs.image.path, await drawImage(prompt, earlierBytes))
       },
     })
   },
 })
 
-// assemble:<book> reads both folders, so it waits for chunk and for every image task.
+// assemble:<book> reads every page and every image of its book, so it waits for all of them.
 build.each({
-  matchersByName: { text: new FileMatcher("books/<book>/text.txt") },
-  *tasks(vars) {
-    const pagesFolder = new FilesystemPrefix(`out/${vars.book}/pages/`)
-    const imagesFolder = new FilesystemPrefix(`out/${vars.book}/images/`)
-    const book = new FileArtifact(`out/${vars.book}/book.html`)
-    yield new Task({
-      id: `assemble:${vars.book}`,
-      inputs: [pagesFolder, imagesFolder],
-      outputs: [book],
-      run: async () => {
-        const pageFiles = await pagesFolder.list()
-        pageFiles.sort()
-        const figures: string[] = []
-        for (const file of pageFiles) {
-          const name = path.basename(file, ".txt")
-          const pageText = await Bun.file(file).text()
-          figures.push(`<figure><img src="images/${name}.png"><figcaption>${pageText}</figcaption></figure>`)
-        }
-        await Bun.write(book.path, `<!doctype html>\n<title>${vars.book}</title>\n${figures.join("\n")}\n`)
-      },
-    })
+  name: "assemble",
+  matchersByName: {
+    pages: new FileGroupMatcher("out/<book>/pages/*.txt"),
+    images: new FileGroupMatcher("out/<book>/images/*.png"),
+  },
+  outputsByName: { book: new FileTemplate("out/<book>/book.html") },
+  async run({ vars, matched, outputs }) {
+    const figures: string[] = []
+    for (const page of matched.pages.data) {
+      const name = path.basename(page.path, ".txt")
+      const pageText = await Bun.file(page.path).text()
+      figures.push(`<figure><img src="images/${name}.png"><figcaption>${pageText}</figcaption></figure>`)
+    }
+    await Bun.write(outputs.book.path, `<!doctype html>\n<title>${vars.book}</title>\n${figures.join("\n")}\n`)
   },
 })
 
