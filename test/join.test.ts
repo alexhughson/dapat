@@ -258,20 +258,20 @@ describe("build.each joins matchers on shared var names", () => {
     expect(made.sort()).toEqual(["en/a with template:en", "en/new with template:en"])
   })
 
-  test("matchers that do not share a var name make build.each throw", () => {
+  test("matchers that do not share a var name join as a cross product", async () => {
+    const pages = new PathMatcher("page:", ["slug"], [new Mem("page:a", "A"), new Mem("page:b", "B")])
+    const templates = new PathMatcher("template:", ["lang"], [new Mem("template:en", "E"), new Mem("template:fr", "F")])
     const build = new Build()
-    expect(() =>
-      build.each({
-        matchersByName: {
-          page: new PathMatcher("page:", ["slug"]),
-          template: new PathMatcher("template:", ["lang"]),
-        },
-        *tasks() {},
-      }),
-    ).toThrow(
-      "build.each 1: the required matchers ['template'] share no var name with required matcher 'page' or its required partners; " +
-        "each required matcher must share a var name with another required matcher, and a matcher that is not required does not connect them",
-    )
+    build.each({
+      matchersByName: { page: pages, template: templates },
+      *tasks(vars, matched) {
+        yield new Task({ id: `render:${vars.lang}/${vars.slug}:${matched.page.data.value}${matched.template.data.value}`, run: async () => {} })
+      },
+    })
+
+    const result = await build.run()
+
+    expect(sortedIds(result.executed)).toEqual(["render:en/a:AE", "render:en/b:BE", "render:fr/a:AF", "render:fr/b:BF"])
   })
 
   test("three matchers are connected when each shares a var with another one, not with all", async () => {
@@ -387,14 +387,28 @@ describe("build.each joins matchers on shared var names", () => {
     )
   })
 
-  test("a matcher with no var shares nothing, so it fails the connectivity check", () => {
-    const build = new Build()
-    expect(() =>
-      build.each({
-        matchersByName: { page: new PathMatcher("page:", ["slug"]), site: new PathMatcher("site:", []) },
-        *tasks() {},
-      }),
-    ).toThrow("build.each 1: the required matchers ['site'] share no var name with required matcher 'page' or its required partners")
+  test("a required matcher with no var joins every set; its found and gone make and remove every set", async () => {
+    const pages = new PathMatcher("page:", ["slug"], [new Mem("page:a", "A"), new Mem("page:b", "B")])
+    const sites = new PathMatcher("site:", [])
+    const build = new Build({ store: new MemoryStore() })
+    build.each({
+      // site comes first, so its join steps start from no var.
+      matchersByName: { site: sites, page: pages },
+      *tasks(vars, matched) {
+        yield new Task({ id: `render:${vars.slug}:${matched.site.data.value}`, outputs: [new Mem(`out:${vars.slug}`)], run: async () => {} })
+      },
+    })
+    const taskIds = watchTaskIds(build)
+
+    const result = await build.run()
+    expect(result.executed).toEqual([])
+
+    sites.foundArtifact(new Mem("site:", "S"))
+    expect(taskIds()).toEqual(["render:a:S", "render:b:S"])
+    sites.foundArtifact(new Mem("site:#2", "T"))
+    expect(taskIds()).toEqual(["render:a:T", "render:b:T"])
+    sites.goneArtifact("site:")
+    expect(taskIds()).toEqual([])
   })
 })
 
@@ -603,22 +617,23 @@ describe("build.each with required", () => {
     ).toThrow("build.each 1: required is empty; name at least one matcher, or leave required out to require every matcher")
   })
 
-  test("the required matchers must connect among themselves; a matcher that is not required does not connect them", () => {
+  test("required matchers with no shared var join as a cross product, and a matcher that is not required left-joins onto it", async () => {
     const build = new Build()
-    expect(() =>
-      build.each({
-        matchersByName: {
-          page: new PathMatcher("page:", ["slug"]),
-          template: new PathMatcher("template:", ["lang"]),
-          review: new PathMatcher("review:", ["lang", "slug"]),
-        },
-        required: ["page", "template"],
-        *tasks() {},
-      }),
-    ).toThrow(
-      "build.each 1: the required matchers ['template'] share no var name with required matcher 'page' or its required partners; " +
-        "each required matcher must share a var name with another required matcher, and a matcher that is not required does not connect them",
-    )
+    build.each({
+      matchersByName: {
+        page: new PathMatcher("page:", ["slug"], [new Mem("page:a", "A"), new Mem("page:b", "B")]),
+        template: new PathMatcher("template:", ["lang"], [new Mem("template:en", "E")]),
+        review: new PathMatcher("review:", ["lang", "slug"], [new Mem("review:en/a", "R")]),
+      },
+      required: ["page", "template"],
+      *tasks(vars, matched) {
+        yield new Task({ id: `render:${vars.lang}/${vars.slug}:${matched.review?.data.value}`, run: async () => {} })
+      },
+    })
+
+    const result = await build.run()
+
+    expect(sortedIds(result.executed)).toEqual(["render:en/a:R", "render:en/b:undefined"])
   })
 })
 

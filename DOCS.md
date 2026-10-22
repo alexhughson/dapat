@@ -815,13 +815,20 @@ If the `template` matcher sends `gone` for `{ lang: "fr" }`, `build.each` remove
 
 With three matchers, each pair joins on the var names that the pair shares. For example, `page` has `lang` and `slug`, `template` has `lang`, and `review` has `lang` and `slug`. Then each page gets the template of its `lang` and the review of its `lang` and `slug`. A page with no review is in no set, unless `review` is not in `required`.
 
-A matcher does not need to share a var name with every other matcher. It needs to share one with at least one other matcher, so that all the matchers form one connected group. `template` with `lang`, `page` with `lang` and `slug`, and `author` with `slug` form one group: `page` connects the other two.
+A matcher does not need to share a var name with every other matcher. `template` with `lang`, `page` with `lang` and `slug`, and `author` with `slug` form one group: `page` connects the other two.
 
-If the matchers do not form one connected group, `build.each` throws. Without a shared var name, each match of one group would join with each match of the other group, and the number of tasks would be the product of the two. Example: `page` has only `slug`, and `template` has only `lang`:
+Required matchers that share no var name join as a cross product: each match of one group joins with each match of the other. A matcher with no vars, such as `new FileMatcher("plan.txt")`, joins every set. If it has no match, there are no sets, and when its file comes, every set comes. An edit to the file does not change the sets. Each task that has the file as an input runs again, because its stamp changed. When the file goes, each set goes, and the build deletes the record of each of its tasks. When the file comes back, each task runs again. The scene step of the book example reads three such files beside its pages:
 
+```ts
+matchersByName: {
+  page: new FileMatcher("pages/<page>.txt"),
+  plan: new FileMatcher("plan.txt"),
+  text: new FileMatcher("text.txt"),
+  style: new FileMatcher("style.txt"),
+},
 ```
-build.each 1: the required matchers ['template'] share no var name with required matcher 'page' or its required partners; each required matcher must share a var name with another required matcher, and a matcher that is not required does not connect them
-```
+
+Two matchers with vars and no shared name, such as `pages/<page>.txt` and `styles/<style>.css`, give one set for each page and style: the number of sets is the product of the two counts.
 
 Only shared var names join. To join two matchers on some of their vars and not on others, give the others different names in the patterns. Example: each page gets a card with each banner of its `lang`:
 
@@ -951,7 +958,7 @@ A matcher that is not required and has no ON vars joins each set with each of it
 #### The rules
 
 - **If you leave `required` out, every matcher is required.** This is the behavior of a `build.each` with no `required`.
-- **The required matchers must form one connected group by shared var names.** A matcher that is not required does not connect them.
+- **Required matchers that share no var name join as a cross product.** A matcher that is not required left-joins onto each set the same way: with no shared var name, each of its matches joins each set.
 - **`required` must name at least one matcher, and each name must be a name in `matchersByName`.** A set needs a required match, so `required: []` is an error.
 
 #### Types
@@ -1427,7 +1434,6 @@ An error in `build.each` is fatal for the build, as a subscriber error is. The `
 | Where | Example | What you see |
 | --- | --- | --- |
 | `build.each` | `matchersByName` has no matcher | `build.each` throws |
-| `build.each` | the required matchers do not form one connected group by shared var names | `build.each` throws, and names the matchers that do not connect |
 | `build.each` | `required` is `[]` | `build.each` throws |
 | `build.each` | `required` has a name that is not in `matchersByName` | `build.each` throws, and names it |
 | `build.each` | one matcher object is under two names | `build.each` throws |
@@ -1663,7 +1669,7 @@ new Build(opts?: { store?: Store; sendLimit?: number })
 | `remove(id: string): void` | Removes a task. Aborts it if it is running and sends a `withdrawn` event for each declared output. Does not throw when a subscriber throws. Starts to delete its store record. Does not wait for the delete, but `run()` does. A delete error goes into `result.errors`. Does nothing if the id is not known. The other tasks of the same task group stay. |
 | `subscribe(listener: (event: ArtifactEvent) => void): void` | From `Emitter`. Calls `listener` synchronously for each artifact event, in the order of the event queue. Does not replay earlier events. See [section 9](#9-subscribe-to-artifact-events). |
 | `protected setTasksOfGroups(changes: readonly GroupTasks[]): void` | Makes the tasks of each group in `changes` its new tasks, in one step ([Task groups](#task-groups)). `GroupTasks` is `{ group: TaskGroup; tasks: readonly Task[] }`. Adds each new id, replaces each known id, and removes each id that a group had before and that no group of the step gets now. A task id can move from one group of the step to another group of the step. That is a replacement, as a known id in one group is: the task ends as `cancelled` with the reason `"replaced"` if it had not finished, and its store record stays. A removed task ends as `cancelled` with the reason `"removed"` if it had not finished, and its store record is deleted. Changes all state first, then puts the events on the queue: all `withdrawn` events of the step first, then the `promised` events, by id in list order. Throws and changes nothing if two groups of the step or another group have one id, if a group gets one id two times, if two tasks declare one exact output, or if a group is in `changes` two times. The checks use the state after the whole step. **An open step:** while the first `run()` scans, during each pass of a drain over the event queue, and during each matcher event that comes from outside a drain, the build keeps a step open. Then a call does not throw: its changes join the open step, a later change of a group replaces its earlier one, and the build applies the step when the scans return, when the pass ends, or when the event ends. The events of the applied step make the next pass of the drain. An error then is fatal for the build. `build.each` gives its changes here. `add` never joins an open step. A subclass of `Build` can call it with its own `new TaskGroup(label)`. |
-| `each<M extends Record<string, AnyMatcher>, const R extends keyof M & string = keyof M & string>(config: TaskMaterializerConfig<M, R>): void` | Makes tasks for each joined set of matched artifacts ([section 10](#10-buildeach-tasks-for-each-matched-artifact)). TypeScript gets `R` from `required`. Subscribes to each matcher in `matchersByName`, joins their matches on shared var names, and gives the tasks of each joined set through `setTasksOfGroups`, with one task group for each set, labeled `build.each <number> <var name>=<var value> ...`. All the changes of one pass of a drain over the event queue are one step, and all the changes during the scans of the first `run()` are one step. The build sends each artifact event to `matcher.receiveArtifactEvent`, one time for each matcher. An error in `tasks` or in a matched artifact is fatal for the build, like a subscriber error. Throws if `matchersByName` has no matcher, if one matcher object is under two names, if `required` is empty or has a name that is not in `matchersByName`, if its required matchers do not form one connected group by shared var names, if `run()` has started, or if another `Build` uses a matcher. |
+| `each<M extends Record<string, AnyMatcher>, const R extends keyof M & string = keyof M & string>(config: TaskMaterializerConfig<M, R>): void` | Makes tasks for each joined set of matched artifacts ([section 10](#10-buildeach-tasks-for-each-matched-artifact)). TypeScript gets `R` from `required`. Subscribes to each matcher in `matchersByName`, joins their matches on shared var names, and gives the tasks of each joined set through `setTasksOfGroups`, with one task group for each set, labeled `build.each <number> <var name>=<var value> ...`. All the changes of one pass of a drain over the event queue are one step, and all the changes during the scans of the first `run()` are one step. The build sends each artifact event to `matcher.receiveArtifactEvent`, one time for each matcher. An error in `tasks` or in a matched artifact is fatal for the build, like a subscriber error. Throws if `matchersByName` has no matcher, if one matcher object is under two names, if `required` is empty or has a name that is not in `matchersByName`, if `run()` has started, or if another `Build` uses a matcher. |
 | `run(): Promise<Result>` | The first time, sends a `promised` event for each output of each task that is in the build, and then runs the scan of each matcher and waits for all of them. A call during the scans waits for the same scans. Then starts every task and resolves when every started task has finished. Does not reject when a task fails. Rejects with the first subscriber error, `build.each` error, scan error, or send-limit error of the build, at once if that error happened before the call ([section 9](#subscriber-errors)). After a scan error, no task starts. |
 
 ### `class TaskGroup`
@@ -1908,7 +1914,7 @@ type MatchedByName<M extends Record<string, AnyMatcher>, R extends keyof M & str
 
 `R` is the names in `required`. If you leave `required` out, `R` is every name, so no matched artifact is `undefined`. A matcher that is not in `R` can be `undefined` in `matched`. It left-joins onto the matchers in `R`, after the earlier matchers that are not in `R`, in name order, on its ON vars. Each of its matches that agrees makes its own joined set. `JoinedVars` is `Vars` when every name is in `R`, else `Readonly<Record<string, string | undefined>>`. `required` must name at least one matcher. See [`required`](#required-matchers-that-a-set-can-do-without).
 
-`AnyMatcher` is `Matcher<any>`: a matcher of any data type. Each matched artifact has the data type of its own matcher: `DataOf` reads `D` from the matcher type. `matchersByName` must have at least one entry, and its required matchers must form one connected group by shared var names. `tasks` gets the vars of one joined set, which hold the vars of all its matches (a var of a matcher with no match in the set is `undefined`), and each matched artifact under its matcher's name. See [The `build.each` config](#the-buildeach-config).
+`AnyMatcher` is `Matcher<any>`: a matcher of any data type. Each matched artifact has the data type of its own matcher: `DataOf` reads `D` from the matcher type. `matchersByName` must have at least one entry. Required matchers that share no var name join as a cross product. `tasks` gets the vars of one joined set, which hold the vars of all its matches (a var of a matcher with no match in the set is `undefined`), and each matched artifact under its matcher's name. See [The `build.each` config](#the-buildeach-config).
 
 The config has `tasks`, or `name` and `run`. The exported types `TasksConfig<M, R, O>` and `RunConfig<M, R, O>` are the two forms. Each one sets the fields of the other to `never`, so a config with both is a type error, and `build.each` also throws for it at run time. `run` needs a `name`. See [The one-task form](#the-one-task-form-name-and-run).
 

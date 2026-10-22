@@ -196,7 +196,7 @@ export class TaskMaterializer<M extends Record<string, AnyMatcher>, R extends ke
       table.addIndex(sharedVarNames)
       this.optionalMatchersByName.set(table.name, { table, sharedVarNames, onVarNames, baseIndex: new JoinIndex(sharedVarNames) })
     }
-    this.joinStepsByName = planJoins(requiredTables, number)
+    this.joinStepsByName = planJoins(requiredTables)
     const outputTemplates: OutputTemplates = config.outputsByName ?? {}
     for (const [outputName, template] of Object.entries(outputTemplates)) {
       for (const varName of template.varNames) {
