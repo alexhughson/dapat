@@ -1,7 +1,7 @@
 // Makes a picture book from each <folder>/books/<book>/text.txt: a page for each group of lines,
 // one image for each page, and <folder>/out/<book>/book.html. drawImage calls the OpenRouter image
-// API, and each call costs money. Each image also gets every image before it as a reference, so the
-// look stays the same from page to page. Run it with no arguments to see the usage.
+// API, and each call costs money. Each image also gets the first 5 and the last 5 images before it as
+// references, so the look stays the same from page to page. Run it with no arguments to see the usage.
 import * as fs from "node:fs"
 import * as fsPromises from "node:fs/promises"
 import path from "node:path"
@@ -112,7 +112,8 @@ build.each({
   },
 })
 
-// image:<book>/<page> joins each page to the style of its book, and reads every image before it.
+// image:<book>/<page> joins each page to the style of its book. It reads the first 5 images and the
+// 5 images before it, so the look stays the same and the model gets at most 10 references.
 // The earlier images come from no matcher, so this build.each uses the tasks form.
 build.each({
   matchersByName: {
@@ -122,8 +123,13 @@ build.each({
   outputsByName: { image: new FileTemplate("out/<book>/images/<page>.png") },
   *tasks(vars, matched, outputs) {
     const earlierImages: FileArtifact[] = []
-    for (let earlier = 0; earlier < Number(vars.page); earlier++) {
-      earlierImages.push(new FileArtifact(`out/${vars.book}/images/${pageName(earlier)}.png`))
+    const index = Number(vars.page)
+    for (let earlier = 0; earlier < index; earlier++) {
+      const isFirstFive = earlier < 5
+      const isLastFive = earlier >= index - 5
+      if (isFirstFive || isLastFive) {
+        earlierImages.push(new FileArtifact(`out/${vars.book}/images/${pageName(earlier)}.png`))
+      }
     }
     yield new Task({
       id: `image:${vars.book}/${vars.page}`,
