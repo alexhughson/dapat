@@ -2,9 +2,10 @@
 //   bun scripts/check-docs.ts [file.md ...]
 // A block that follows a line `<!-- no-run -->` is skipped (signatures and shapes).
 // A ```text block that follows a line `<!-- output -->` must equal the stdout of the ts block before it.
+// Each relative link must name a file that exists, and each #anchor a heading in that file.
 // Each program runs in a fresh folder under .doccheck/<pid>/, so it can write files with relative paths,
 // `import ... from "dapat"` resolves to this checkout, and two checks can run at the same time.
-import { mkdirSync, rmSync, writeFileSync } from "node:fs"
+import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs"
 import path from "node:path"
 
 type Block = {
@@ -30,7 +31,7 @@ function docFiles(): string[] {
     return args.map((arg) => path.resolve(arg))
   }
   const files: string[] = []
-  const globs = ["README.md", "DOCS.md", "docs/**/*.md", "examples/**/README.md"]
+  const globs = ["README.md", "docs/**/*.md", "examples/**/README.md"]
   for (const pattern of globs) {
     for (const match of new Bun.Glob(pattern).scanSync({ cwd: root })) {
       files.push(path.join(root, match))
@@ -143,16 +144,85 @@ async function typeCheck(samples: Sample[]): Promise<string | undefined> {
   return undefined
 }
 
+function proseLines(text: string): string[] {
+  const lines: string[] = []
+  let inFence = false
+  for (const line of text.split("\n")) {
+    if (line.startsWith("```")) {
+      inFence = !inFence
+      continue
+    }
+    if (!inFence) {
+      lines.push(line)
+    }
+  }
+  return lines
+}
+
+// The anchors GitHub makes for headings: lowercase, punctuation dropped, spaces as "-", "-1" on repeats.
+function anchorsOf(text: string): Set<string> {
+  const anchors = new Set<string>()
+  for (const line of proseLines(text)) {
+    const heading = line.match(/^#+\s+(.*)$/)
+    if (!heading) {
+      continue
+    }
+    const base = heading[1]!.toLowerCase().replaceAll(/[^\p{L}\p{N} _-]/gu, "").replaceAll(" ", "-")
+    let anchor = base
+    let repeat = 0
+    while (anchors.has(anchor)) {
+      repeat++
+      anchor = `${base}-${repeat}`
+    }
+    anchors.add(anchor)
+  }
+  return anchors
+}
+
+async function linkErrors(file: string, text: string): Promise<string[]> {
+  const errors: string[] = []
+  const lines = proseLines(text)
+  for (const line of lines) {
+    const withoutCode = line.replaceAll(/`[^`]*`/g, "")
+    for (const link of withoutCode.matchAll(/\]\(([^)\s]+)\)/g)) {
+      const target = link[1]!
+      if (/^(https?|mailto):/.test(target)) {
+        continue
+      }
+      const [targetPath, anchor] = target.split("#")
+      const targetFile = targetPath === "" ? file : path.resolve(path.dirname(file), targetPath!)
+      const where = `${path.relative(root, file)}: link ${target}`
+      if (!existsSync(targetFile)) {
+        errors.push(`${where}: no file ${path.relative(root, targetFile)}`)
+        continue
+      }
+      if (anchor === undefined || !targetFile.endsWith(".md")) {
+        continue
+      }
+      const anchors = anchorsOf(await Bun.file(targetFile).text())
+      if (!anchors.has(anchor)) {
+        errors.push(`${where}: no heading for #${anchor}`)
+      }
+    }
+  }
+  return errors
+}
+
 rmSync(checkRoot, { recursive: true, force: true })
+let failures = 0
 const samples: Sample[] = []
 let skipped = 0
 for (const file of docFiles()) {
-  const found = samplesOf(readBlocks(file, await Bun.file(file).text()))
+  const text = await Bun.file(file).text()
+  const found = samplesOf(readBlocks(file, text))
   samples.push(...found.samples)
   skipped += found.skipped
+  for (const error of await linkErrors(file, text)) {
+    failures++
+    console.log(`FAIL ${error}`)
+  }
 }
 
-let failures = 0
 for (const sample of samples) {
   const where = `${path.relative(root, sample.block.file)}:${sample.block.line}`
   const failure = await runSample(sample)

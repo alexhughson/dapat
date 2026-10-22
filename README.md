@@ -1,51 +1,18 @@
 # dapat
 
-dapat is a build tool for TypeScript on Bun. As in `make`, you declare tasks, and each task names its inputs and its outputs. dapat then runs the tasks in the correct order, and it builds again only what changed.
+dapat is a build library for TypeScript, on Bun only, with ideas from [doit](https://github.com/pydoit/doit). You declare tasks, and each task names its inputs and its outputs. Inputs and outputs can be files, S3 objects, or any other value that you wrap in an [`Artifact` subclass](docs/write-an-artifact.md). Use dapat for data pipelines, generated sites and agent loops, where a task is slow or costs money. When a build runs, dapat does these three things:
 
-Inspired by [doit](https://github.com/pydoit/doit)
-
-Inputs and outputs can be files. They can also be S3 objects, database rows, or values in memory. dapat wraps each input and output in a subclass of `Artifact`. The subclass gives dapat a stamp: a string that changes when the thing changes, for example a hash. dapat includes artifact classes for files and S3 objects. For anything else, write a small subclass.
-
-When you run a build, dapat does these things:
-
-- **Order:** it starts a task only after the tasks that write its inputs have finished.
-- **Skip:** it skips a task when each input and output has the same stamp as in the last run, and each output still exists. A task with no input always runs. This needs a store. By default, the file artifacts use a hash of the bytes as stamps. So a file that a task writes again with the same bytes does not cause a rebuild. Pass `{ stamp: "time" }` to use the modification time and the size. That is faster, because dapat reads no bytes. But then a rewrite with the same bytes, a `touch`, or a git branch switch causes a rebuild. A folder (`new FilesystemPrefix("pages")`) also has a stamp, so a new file in a folder that a task reads makes the task run.
-- **Grow:** it adds tasks during the build. A subscriber (`build.subscribe`) gets a `promised` event for each output that a task declares, a `produced` event for each output that a task writes, a `deleted` event for each output that a task deletes, and a `withdrawn` event when the declaring task leaves the build. The subscriber can add the task that reads that output. dapat calls subscribers synchronously, so the new task exists before the writer continues. If a subscriber throws, `build.run()` rejects with that error.
-
-```
-Use dapat for data pipelines, generated files, and agent loops, where a step is expensive and must run again only when its inputs change.
-```
-
-```
-Status: version 0.1.0. dapat is not published to a registry, and the API can change.
-`build.each` makes tasks for each artifact that a matcher finds. With several matchers, it joins their matches on shared var names, like a database join. `FileMatcher` finds files that fit a pattern, such as `content/<lang>/<slug>.md`. `FileGroupMatcher` gives one list of files for each value of its vars, such as `site/<lang>/**/*.html`.
-```
-
-```
-dapat does not:
-```
-
-- give a command-line tool. You write a TypeScript program that calls the library.
-- watch files for changes.
-- limit how many tasks run at the same time.
-- share a cache between machines.
-- run on Node.js.
-- write outputs for you. Each task writes its own outputs.
-
-
+- Order: when an output of task A is an input of task B, B starts after A finishes.
+- Skip: a task [skips](docs/guide.md#the-store-and-the-skip-rule) only when each input and output has the same [stamp](docs/guide.md#what-a-build-does) as in the record of its last successful run. By default, the stamp of a file is a hash of its bytes ([hash or time](docs/builtins.md#hash-or-time)). A [store](docs/guide.md#what-a-build-does) keeps the records between builds, so a build without a store skips nothing.
+- Tasks from files: [`build.each`](docs/guide.md#buildeach) makes a task for each file that fits a pattern, such as `posts/<slug>.md`. It also makes tasks for the files that other tasks in the same build declare or report as outputs.
 
 ## Install
 
-dapat runs on Bun only. Link it from a local checkout:
-
-```sh
-cd path/to/dapat && bun link
-cd path/to/your-project && bun link dapat
-```
-
-
+dapat 0.1.0 is not on npm, and its API can change. Run `bun link` in a checkout of dapat. Then run `bun link dapat` in your project.
 
 ## Example
+
+This program makes `out.txt` from `in.txt` in two tasks. Save it as `pipeline.ts` in a project that links dapat. Then run `bun pipeline.ts`.
 
 ```ts
 import { Build, Task } from "dapat"
@@ -54,91 +21,64 @@ import { FileArtifact, JsonStore } from "dapat/contrib"
 const src = new FileArtifact("in.txt")
 const mid = new FileArtifact("mid.txt")
 const out = new FileArtifact("out.txt")
-
+// write in.txt only on the first run, so the edits in the table stay
+const hasInput = await Bun.file(src.path).exists()
+if (!hasInput) await Bun.write(src.path, "hello")
 const build = new Build({ store: new JsonStore(".dapat/state.json") })
 
-build.add(
-  new Task({
-    id: "upper",
-    inputs: [src],
-    outputs: [mid],
-    run: async () => {
-      const text = new TextDecoder().decode(await src.read())
-      await Bun.write(mid.path, text.toUpperCase())
-    },
-  }),
-)
-
-build.add(
-  new Task({
-    id: "wrap",
-    inputs: [mid],
-    outputs: [out],
-    run: async () => {
-      const text = new TextDecoder().decode(await mid.read())
-      await Bun.write(out.path, `[${text}]`)
-    },
-  }),
-)
-
-const result = await build.run()
-if (!result.success) {
-  for (const [task, error] of result.failed) {
-    console.error(`${task.id}: ${error.message}`)
-  }
-  for (const error of result.errors) {
-    console.error(error.message)
-  }
-  process.exit(1)
+async function upper() {
+  const text = await Bun.file(src.path).text()
+  await Bun.write(mid.path, text.toUpperCase())
 }
+async function wrap() {
+  const text = await Bun.file(mid.path).text()
+  await Bun.write(out.path, `[${text}]`)
+}
+build.add(new Task({ id: "wrap", inputs: [mid], outputs: [out], run: wrap }))
+build.add(new Task({ id: "upper", inputs: [src], outputs: [mid], run: upper }))
+const result = await build.run()
+const ran = result.executed.map((task) => task.id).sort()
+const skipped = result.skipped.map((task) => task.id).sort()
+console.log(`ran [${ran.join(" ")}] skipped [${skipped.join(" ")}]`)
+for (const [task, error] of result.failed) console.error(`${task.id}: ${error.message}`)
+process.exit(result.success ? 0 : 1)
 ```
 
-`wrap` waits for `upper`, because `mid` is an output of `upper` and an input of `wrap`. Put `hello` into `in.txt`, and then run the script more than one time:
+The first run writes `[HELLO]` to `out.txt` and prints:
+<!-- output -->
+```text
+ran [upper wrap] skipped []
+```
 
-1. **First run.** Both tasks execute. `out.txt` contains `[HELLO]`.
-2. **No change.** Both tasks skip.
-3. **Change** `in.txt` **to** `bye`**.** Both tasks execute. `out.txt` contains `[BYE]`.
-4. **Run** `touch in.txt`**.** The modification time changes, but the bytes do not. The default stamp is a hash of the bytes, so both tasks skip. With `new FileArtifact("in.txt", { stamp: "time" })`, the modification time is part of the stamp, and both tasks run.
+The program adds `wrap` first, but `wrap` waits for `upper`, because `mid.txt` is an output of `upper` and an input of `wrap`. `build.run()` does not throw when a task fails, so check `result.success`.
 
-`build.run()` does not throw when a task fails. Always check `result.success`.
+Make each change in the table, in order. After each change, run the program again.
 
-## What is in the package
+| Change | Ran | Skipped | Why |
+| --- | --- | --- | --- |
+| no change | – | `upper` `wrap` | no stamp changed |
+| `touch in.txt` | – | `upper` `wrap` | the bytes of `in.txt` did not change, so its hash did not change |
+| `printf HELLO > in.txt` | `upper` | `wrap` | `upper` writes the same bytes to `mid.txt` |
+| `printf bye > in.txt` | `upper` `wrap` | – | `upper` writes new bytes to `mid.txt` |
+| `rm out.txt` | `wrap` | `upper` | an output of `wrap` is missing |
 
+## What dapat does not do
 
-| Import          | Contents                                                                                                                                  |
-| --------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
-| `dapat`         | the engine: `Build`, `Task`, `Artifact`, `Prefix`, `MemoryStore`, `Result`, `Emitter`, `Matcher`                                          |
-| `dapat/contrib` | `FileArtifact`, `FilesystemPrefix` (a folder), `FileMatcher` (a matcher of files), `FileGroupMatcher` (a matcher of lists of files), `S3ObjectArtifact`, `S3Prefix`. Stores that write to JSON or SQLite. |
-
-
-
+- It deletes no files. Old outputs stay on disk ([layout rules](docs/guide.md#layout-rules)).
+- It does not watch files, and it has no command-line tool.
+- It does not see changes to the code of a task ([recipe](docs/recipes.md#rerun-when-your-code-changes)).
+- It does not limit how many tasks run at the same time ([recipe](docs/recipes.md#limit-parallel-work)).
+- It does not copy outputs or stamps between machines.
 
 ## Documentation
 
-[DOCS.md](DOCS.md) explains each part of the library:
-
-- how to write your own artifact
-- how dapat finds dependencies
-- the rule for when a task skips, and how to find out why a task ran
-- failure, cancellation, and replacement of tasks
-- subscribers for the outputs that tasks declare and write during the build, and their errors
-- `build.each` and matchers, which make tasks for each artifact that a matcher finds
-- recipes: force a rebuild, limit parallel work, run in CI
-- known limits
-- the full API reference
-
-[examples/first-build.ts](examples/first-build.ts) is a runnable version of the example above. It keeps its state in `.dapat/state.json`, so a second run skips both tasks. Edit `in.txt` to see them run again. Run it from a folder that contains `in.txt`, with `bun run <path to dapat>/examples/first-build.ts`.
-
-[examples/file-pipeline.ts](examples/file-pipeline.ts) uses `build.each` and `FileMatcher`. It makes one HTML page for each `content/<lang>/<slug>.md`, with the template `templates/<lang>.html`. Then it makes one sitemap for each lang with `FileGroupMatcher`. It writes sample files when `content/` is missing. Run it two times from an empty folder: the second run skips each task. [examples/book-chapters.ts](examples/book-chapters.ts) splits each book into chapters while the build runs, and makes a summary of each chapter.
-
-[examples/book/](examples/book/README.md) makes a picture book from the folder of one book. It cuts the text into pages, asks an LLM for a scene for each page, and draws each scene with an image model. Each call costs money. Run `bun examples/book/book.ts` to see how to use it.
-
-
+Next, read part 1 of the [guide](docs/guide.md). It explains each call in the example. [docs/README.md](docs/README.md) lists every page by goal. It also lists the problems that show no clear error, with their causes. [examples/README.md](examples/README.md) lists the examples and how to run each one.
 
 ## Development
 
 ```sh
 bun install
 bun test
+bun add -g typescript # the docs check needs tsc on your PATH
+bun run docs:check
 ```
-
