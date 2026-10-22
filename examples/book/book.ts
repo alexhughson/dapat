@@ -162,9 +162,9 @@ build.each({
       inputs,
       outputs: [outputs.scene],
       run: async () => {
-        const planText = await Bun.file(plan.path).text()
-        const textText = await Bun.file(text.path).text()
-        const styleText = await Bun.file(style.path).text()
+        const planText = await Bun.file(matched.plan.data.path).text()
+        const textText = await Bun.file(matched.text.data.path).text()
+        const styleText = await Bun.file(matched.style.data.path).text()
         const pageText = await Bun.file(matched.page.data.path).text()
         let notesText = "None."
         if (notes !== null) {
