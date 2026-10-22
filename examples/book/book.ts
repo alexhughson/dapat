@@ -1,16 +1,18 @@
 // Makes a picture book from one book folder: text.txt is cut into pages, an LLM writes a scene for
 // each page from plan.txt and page<nnn>_notes.txt, and an image model draws each scene in the style
 // of style.txt. Image models follow plain descriptions well and conditions badly, so the LLM does
-// all the reasoning and the image prompt is only the style and the scene. Each call costs money.
-// Run it with no arguments to see the usage.
+// all the reasoning and the image prompt is only the style and the scene. The last step puts every
+// page image into book.pdf. Each call costs money. Run it with no arguments to see the usage.
 import * as fs from "node:fs"
 import * as fsPromises from "node:fs/promises"
 import path from "node:path"
+import { PDFDocument } from "pdf-lib"
 import { Artifact, Build, Task } from "dapat"
 import { FileArtifact, FileMatcher, FileTemplate, FilesystemPrefix, JsonStore } from "dapat/contrib"
+import { assert } from "node:console"
 
-const IMAGE_MODEL = "google/gemini-nano-banana-2.1"
-const TEXT_MODEL = "anthropic/claude-sonnet-5.5"
+const IMAGE_MODEL = "openai/gpt-image-2.5-flare"
+const TEXT_MODEL = "anthropic/claude-opus-5.5"
 const DEFAULT_LINES_PER_PAGE = 2
 const FIRST_REFERENCES = 5
 const RECENT_REFERENCES = 5
@@ -30,8 +32,8 @@ Makes a picture book from the files in <book folder>:
                         {{style}} and {{scene}}.
   Run with --prompts to print the default prompts.
 
-It writes pages/, scenes/, images/ and book.html into the book folder. When the
-book folder is missing, it copies a sample book into it.
+It writes pages/, scenes/, images/, book.html and book.pdf into the book folder.
+When the book folder is missing, it copies a sample book into it.
 
   <book folder>     the folder of one book. It can be anywhere.
   [lines per page]  how many lines of text go on each page. The default is ${DEFAULT_LINES_PER_PAGE}.
@@ -135,17 +137,19 @@ build.each({
   matchersByName: {
     page: new FileMatcher("pages/<page>.txt"),
     notes: new FileMatcher("page<page>_notes.txt"),
+
   },
   required: ["page"],
   outputsByName: { scene: new FileTemplate("scenes/<page>.txt") },
   *tasks(vars, matched, outputs) {
+
     const index = Number(vars.page)
     let notes: FileArtifact | null = null
     if (matched.notes !== undefined) {
       notes = matched.notes.data
     }
     let previousScene: FileArtifact | null = null
-    const inputs: Artifact[] = [scenePrompt, plan, matched.page.data]
+    const inputs: Artifact[] = [scenePrompt, plan, text, style, matched.page.data]
     if (notes !== null) {
       inputs.push(notes)
     }
@@ -158,7 +162,9 @@ build.each({
       inputs,
       outputs: [outputs.scene],
       run: async () => {
-        const planText = await Bun.file(plan.path).text()
+        const planText = await Bun.file(matched.plan.data.path).text()
+        const textText = await Bun.file(matched.text.data.path).text()
+        const styleText = await Bun.file(matched.style.data.path).text()
         const pageText = await Bun.file(matched.page.data.path).text()
         let notesText = "None."
         if (notes !== null) {
@@ -170,6 +176,8 @@ build.each({
         }
         const prompt = await scenePrompt.fill({
           plan: planText,
+          text: textText,
+          style: styleText,
           page: pageText,
           notes: notesText,
           previous_scene: previousSceneText,
@@ -184,11 +192,15 @@ build.each({
 // 5 images before it, as references for the look. So a change to one image draws that image and
 // the images after it again.
 build.each({
-  matchersByName: { page: new FileMatcher("pages/<page>.txt") },
+  matchersByName: {
+    pageText: new FileMatcher("pages/<page>.txt"),
+    pageScene: new FileMatcher("scenes/<page>.txt"),
+  },
   outputsByName: { image: new FileTemplate("images/<page>.png") },
-  *tasks(vars, _matched, outputs) {
+  *tasks(vars, matched, outputs) {
     const index = Number(vars.page)
-    const scene = new FileArtifact(`scenes/${vars.page}.txt`)
+    const scene = matched.pageScene.data
+    const pageText = matched.pageText.data
     const earlierImages: FileArtifact[] = []
     for (let earlier = 0; earlier < index; earlier++) {
       const isFirst = earlier < FIRST_REFERENCES
@@ -199,16 +211,17 @@ build.each({
     }
     yield new Task({
       id: `image:${vars.page}`,
-      inputs: [imagePrompt, scene, style, ...earlierImages],
+      inputs: [imagePrompt, scene, pageText, style, ...earlierImages],
       outputs: [outputs.image],
       run: async () => {
         const styleText = await Bun.file(style.path).text()
         const sceneText = await Bun.file(scene.path).text()
+        const pageTextContent = await Bun.file(pageText.path).text()
         const earlierBytes: Uint8Array[] = []
         for (const earlier of earlierImages) {
           earlierBytes.push(await earlier.read())
         }
-        const prompt = await imagePrompt.fill({ style: styleText.trim(), scene: sceneText.trim() })
+        const prompt = await imagePrompt.fill({ style: styleText.trim(), scene: sceneText.trim(), page: pageTextContent.trim() })
         await Bun.write(outputs.image.path, await generateImage(prompt, earlierBytes))
       },
     })
@@ -234,6 +247,28 @@ build.add(
       }
       const title = path.basename(bookFolder)
       await Bun.write(book.path, `<!doctype html>\n<title>${title}</title>\n${figures.join("\n")}\n`)
+    },
+  }),
+)
+
+// pdf puts every page image into one PDF, in name order. One image fills one page.
+const bookPdf = new FileArtifact("book.pdf")
+build.add(
+  new Task({
+    id: "pdf",
+    inputs: [imagesFolder],
+    outputs: [bookPdf],
+    run: async () => {
+      const imageFiles = (await imagesFolder.list()).filter((file) => file.endsWith(".png"))
+      imageFiles.sort()
+      const pdf = await PDFDocument.create()
+      for (const file of imageFiles) {
+        const bytes = await Bun.file(file).bytes()
+        const image = await pdf.embedPng(bytes)
+        const page = pdf.addPage([image.width, image.height])
+        page.drawImage(image, { x: 0, y: 0, width: image.width, height: image.height })
+      }
+      await Bun.write(bookPdf.path, await pdf.save())
     },
   }),
 )
@@ -326,6 +361,7 @@ async function generateImage(prompt: string, earlierImages: Uint8Array[]): Promi
     inputReferences.push({ type: "image_url", image_url: { url } })
   }
   const response = await fetch("https://openrouter.ai/api/v1/images", {
+
     method: "POST",
     headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
     body: JSON.stringify({ model: IMAGE_MODEL, prompt, input_references: inputReferences }),
@@ -349,11 +385,17 @@ here and give the image model only what it must draw.
 The goals of the plot:
 {{plan}}
 
+The style of the book:
+{{style}}
+
 The description of the picture on the page before:
 {{previous_scene}}
 
 Notes from the author for this picture. They win over the plan and the page before:
 {{notes}}
+
+The text of the entire story:
+{{text}}
 
 The text of this page:
 {{page}}
@@ -361,16 +403,21 @@ The text of this page:
 Write the description of the one picture for this page. Rules:
 - Describe only what is visible: each character with their looks and clothes, what they do, where
   they stand, the place, the light, and the colours.
-- Describe each character in full on every page, with the same looks as on the page before.
 - Use plain statements. Do not use "if", "unless", "or", "should", "maybe", or "not".
-- Put no written words or letters in the picture.
 - Use 4 to 6 sentences. Reply with only the description.`
 }
 
 function defaultImagePrompt(): string {
-  return `A children's picture book illustration. Draw the same characters as in the reference images.
+  return `A children's picture book illustration. 
+
+  We are converting a text story into a picture book.
+  Draw the same characters as in the reference images.
+
+  Draw the text at the bottom of the page, drawing above, unless the style says otherwise.
 
 Style: {{style}}
 
-{{scene}}`
+{{scene}}
+
+Text of this page is: {{page}}`
 }
