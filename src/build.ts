@@ -1,5 +1,6 @@
 import type { Artifact } from "./artifact"
 import { Emitter } from "./emitter"
+import type { ArtifactTemplate } from "./artifact-template"
 import type { AnyMatcher } from "./matcher"
 import type { MatchedArtifactEvent } from "./matched-artifact"
 import { OutputIndex } from "./output-index"
@@ -111,6 +112,12 @@ export class Build extends Emitter<ArtifactEvent> {
   // with the TaskMaterializers that use each one.
   private readonly hearersByMatcher = new Map<AnyMatcher, MatcherHearer[]>()
   private eachCount = 0
+  // The gate task of each build.each that has one, by task id. See gateOf().
+  private readonly gatesById = new Map<string, Task>()
+  // The gate of the build.each that made each group.
+  private readonly gateIdByGroup = new Map<TaskGroup, string>()
+  // For each gate id, the gates in its cycle, itself too. null until producersOf needs it. See gateCycles().
+  private cyclesByGateId: Map<string, Set<string>> | null = null
   // The matcher events that wait for a TaskMaterializer.hear, oldest first. See hearMatchEvents.
   private matchEvents: MatchEventToHear[] = []
   private hearing = false
@@ -183,7 +190,13 @@ export class Build extends Emitter<ArtifactEvent> {
       throw new Error("build.each must come before the first build.run()")
     }
     const number = this.eachCount + 1
-    const taskMaterializer = new TaskMaterializer(number, config, (group, tasks) => this.setTasksOfGroups([{ group, tasks }]))
+    const gate = gateOf(number, config)
+    const taskMaterializer = new TaskMaterializer(number, config, (group, tasks) => {
+      if (gate !== null) {
+        this.gateIdByGroup.set(group, gate.id)
+      }
+      this.setTasksOfGroups([{ group, tasks }])
+    })
     const matcherNames = Object.keys(config.matchersByName)
     for (const name of matcherNames) {
       const matcherBuild = matcherBuilds.get(config.matchersByName[name]!)
@@ -218,6 +231,11 @@ export class Build extends Emitter<ArtifactEvent> {
         }
         this.hearMatchEvents()
       })
+    }
+    if (gate !== null) {
+      this.gatesById.set(gate.id, gate)
+      this.cyclesByGateId = null
+      this.add(gate)
     }
   }
 
@@ -700,15 +718,86 @@ export class Build extends Emitter<ArtifactEvent> {
    * Prefix input: every current writer of a covered artifact or
    * overlapping prefix.
    */
-  private producersOf(task: Task): string[] {
+  private producersOf(slot: Slot): string[] {
+    const task = slot.task
+    // The gates that this slot does not wait for: the cycle of the gate of its build.each, or of the slot itself.
+    let ownGateId = this.gateIdByGroup.get(slot.group)
+    if (this.gatesById.has(task.id)) {
+      ownGateId = task.id
+    }
+    let ownCycle = new Set<string>()
+    if (ownGateId !== undefined) {
+      ownCycle = this.gateCycles().get(ownGateId)!
+    }
+    // A gate in a cycle waits for the writers of what each gate of the cycle reads.
+    let inputs: readonly Ref[] = task.inputs
+    if (this.gatesById.has(task.id)) {
+      const cycleInputs: Ref[] = []
+      for (const gateId of ownCycle) {
+        cycleInputs.push(...this.gatesById.get(gateId)!.inputs)
+      }
+      inputs = cycleInputs
+    }
     const ids = new Set<string>()
-    for (const input of task.inputs) {
+    for (const input of inputs) {
       this.liveOutputs.ownersFor(input, (taskId) => {
+        if (ownCycle.has(taskId)) return
         ids.add(taskId)
       })
     }
     ids.delete(task.id)
     return [...ids]
+  }
+
+  /**
+   * Gate A waits for gate B when an input of A overlaps an output of B. Gates that wait for each other,
+   * directly or through other gates, are one cycle. The gates are fixed after the first run() starts.
+   */
+  private gateCycles(): Map<string, Set<string>> {
+    if (this.cyclesByGateId !== null) return this.cyclesByGateId
+    const gateOutputs = new OutputIndex<string>()
+    for (const gate of this.gatesById.values()) {
+      for (const output of gate.outputs) {
+        gateOutputs.add(output, gate.id)
+      }
+    }
+    const waitsFor = new Map<string, Set<string>>()
+    for (const gate of this.gatesById.values()) {
+      const producers = new Set<string>()
+      for (const input of gate.inputs) {
+        gateOutputs.ownersFor(input, (gateId) => {
+          producers.add(gateId)
+        })
+      }
+      waitsFor.set(gate.id, producers)
+    }
+    const reachable = (from: string): Set<string> => {
+      const seen = new Set<string>()
+      const next = [from]
+      while (next.length > 0) {
+        const gateId = next.pop()!
+        for (const producer of waitsFor.get(gateId)!) {
+          if (seen.has(producer)) continue
+          seen.add(producer)
+          next.push(producer)
+        }
+      }
+      return seen
+    }
+    const reachableById = new Map<string, Set<string>>()
+    for (const gateId of this.gatesById.keys()) {
+      reachableById.set(gateId, reachable(gateId))
+    }
+    const cycles = new Map<string, Set<string>>()
+    for (const gateId of this.gatesById.keys()) {
+      const cycle = new Set<string>([gateId])
+      for (const other of reachableById.get(gateId)!) {
+        if (reachableById.get(other)!.has(gateId)) cycle.add(other)
+      }
+      cycles.set(gateId, cycle)
+    }
+    this.cyclesByGateId = cycles
+    return cycles
   }
 
   /** Keeps the outputs of each slot in `dropped` in removedOutputs, with `reporter`, the running task whose report dropped them. */
@@ -790,6 +879,11 @@ export class Build extends Emitter<ArtifactEvent> {
       })
       return
     }
+    // A gate only waits. It has no run, no stamps, and no store record.
+    if (this.gatesById.has(slot.task.id)) {
+      this.finish(slot, { type: "skipped" })
+      return
+    }
 
     // The input stamps from before the run. The record keeps these, so an input
     // that changes during the run makes the next build run the task again.
@@ -863,7 +957,7 @@ export class Build extends Emitter<ArtifactEvent> {
     while (true) {
       if (generation !== slot.generation) return "cancelled"
       if (this.fatal !== null) return "cancelled"
-      const producers = this.producersOf(slot.task)
+      const producers = this.producersOf(slot)
       const unfinished: Slot[] = []
       for (const id of producers) {
         const producer = this.slots.get(id)
@@ -1107,7 +1201,11 @@ export class Build extends Emitter<ArtifactEvent> {
     slot.phase = "completed"
     slot.outcome = outcome
     this.forgetRemovedOutputs(slot)
-    this.outcomes.set(slot.task, outcome)
+    // A gate that ends well is not a task of the user, so the result does not show it. A failed gate shows why.
+    const isGate = this.gatesById.has(slot.task.id)
+    if (!isGate || outcome.type === "failed") {
+      this.outcomes.set(slot.task, outcome)
+    }
     // A slot that ends while it waits (replaced or removed) wakes and sees its new generation.
     this.resume(slot, "wake")
     this.endWait(slot, outcome.type === "failed")
@@ -1213,4 +1311,31 @@ function isAbort(error: unknown, signal: AbortSignal): boolean {
   if (error === signal.reason) return true
   if (typeof error !== "object" || error === null) return false
   return (error as { name?: unknown }).name === "AbortError"
+}
+
+/**
+ * The gate task of build.each `number`, or null when no template of its outputsByName has a region.
+ * The gate reads what each matcher sees and writes what each template can write, and its run does nothing.
+ * So a task that reads a template folder waits for the gate, and the gate waits for each task that can still
+ * add a match, and so a task of this build.each. Example: a pdf task that reads `images/` waits for the gate
+ * of `outputsByName: { image: new FileTemplate("images/<page>.png") }`, also before any image task exists.
+ */
+function gateOf(number: number, config: TaskMaterializerConfig<any, any, any>): Task | null {
+  const outputs: Ref[] = []
+  for (const template of Object.values(config.outputsByName ?? {}) as ArtifactTemplate[]) {
+    if (template.region === undefined) continue
+    outputs.push(template.region())
+  }
+  if (outputs.length === 0) return null
+  const inputs: Ref[] = []
+  for (const matcher of Object.values(config.matchersByName) as AnyMatcher[]) {
+    const region = matcher.region()
+    if (region === null) continue
+    inputs.push(region)
+  }
+  let id = `gate:each ${number}`
+  if (config.name !== undefined) {
+    id = `gate:${config.name}`
+  }
+  return new Task({ id, inputs, outputs, run: async () => {} })
 }

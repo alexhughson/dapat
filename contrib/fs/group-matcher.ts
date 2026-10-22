@@ -4,6 +4,7 @@ import { Matcher } from "../../src/matcher"
 import type { FileArtifact } from "./file"
 import { FileMatchStates, type FileMatchChange } from "./file-match-states"
 import { FilePattern, type FilePatternOptions } from "./file-pattern"
+import { FilePatternRegion } from "./region"
 import { stampMode } from "./stamp"
 
 /** The files that have a match now and have the same vars. */
@@ -78,6 +79,10 @@ export class FileGroupMatcher extends Matcher<readonly FileArtifact[]> {
   }
 
   /** Each event that adds a file to a group, or removes one, sends the new list of that group. */
+  override region(): FilePatternRegion {
+    return new FilePatternRegion(this.filePattern)
+  }
+
   override receiveArtifactEvent(event: ArtifactEvent): void {
     const change = this.fileStates.receive(event)
     if (change === null) return

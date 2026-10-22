@@ -10,6 +10,8 @@ export interface ArtifactTemplate<R extends Ref = Ref> {
   /** The var names that `expand` reads. `build.each` calls `expand` only for a set that has a value for each of them. */
   readonly varNames: readonly string[]
   expand(vars: Vars): R
+  /** Every ref that `expand` can give, as one ref. Left out: the build.each gets no gate task for this template. */
+  region?(): Ref
 }
 
 /** The ref type of a template: `FileArtifact` for an `ArtifactTemplate<FileArtifact>`. */

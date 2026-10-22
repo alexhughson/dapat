@@ -3,6 +3,7 @@ import type { Vars } from "../../src/matched-artifact"
 import { FileArtifact } from "./file"
 import { FilePattern, type FilePatternOptions } from "./file-pattern"
 import { FilesystemPrefix } from "./folder"
+import { FilePatternRegion } from "./region"
 
 /**
  * A file path with vars, such as `site/<lang>/<slug>.html`, for `outputsByName` of `build.each`.
@@ -28,6 +29,10 @@ export class FileTemplate implements ArtifactTemplate<FileArtifact> {
   expand(vars: Vars): FileArtifact {
     return new FileArtifact(this.filePattern.render(vars), { stamp: this.opts?.stamp })
   }
+
+  region(): FilePatternRegion {
+    return new FilePatternRegion(this.filePattern)
+  }
 }
 
 /**
@@ -51,5 +56,13 @@ export class FolderTemplate implements ArtifactTemplate<FilesystemPrefix> {
 
   expand(vars: Vars): FilesystemPrefix {
     return new FilesystemPrefix(this.filePattern.render(vars), { stamp: this.opts?.stamp })
+  }
+
+  /** Every file at any depth below a folder that the pattern names. */
+  region(): FilePatternRegion {
+    const syntax = this.filePattern.syntax
+    const folderPattern = this.filePattern.pattern.replace(/\/+$/, "")
+    const filesBelow = new FilePattern(`${folderPattern}/${syntax.anyFolders}/${syntax.anyName}`, "FolderTemplate", this.opts?.syntax)
+    return new FilePatternRegion(filesBelow)
   }
 }

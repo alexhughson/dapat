@@ -259,13 +259,12 @@ build.add(
 )
 
 // pdf puts every page image into one PDF, in name order. One image fills one page.
-// It also reads pages/, so it waits for chunk. On the first run, the image tasks exist only after
-// chunk reports the pages, so images/ alone has no producer to wait for, and pdf would run at once.
+// It waits for the gate of the image build.each, so also for image tasks that do not exist yet.
 const bookPdf = new FileArtifact("book.pdf")
 build.add(
   new Task({
     id: "pdf",
-    inputs: [pagesFolder, imagesFolder],
+    inputs: [imagesFolder],
     outputs: [bookPdf],
     run: async () => {
       const imageFiles = (await imagesFolder.list()).filter((file) => file.endsWith(".png"))

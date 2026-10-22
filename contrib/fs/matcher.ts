@@ -3,6 +3,7 @@ import { Matcher } from "../../src/matcher"
 import type { FileArtifact } from "./file"
 import { FileMatchStates, type FileMatchChange } from "./file-match-states"
 import { FilePattern, type FilePatternOptions } from "./file-pattern"
+import { FilePatternRegion } from "./region"
 import { stampMode } from "./stamp"
 
 /**
@@ -58,6 +59,10 @@ export class FileMatcher extends Matcher<FileArtifact> {
    * `promised` and `produced` of a `FileArtifact` that fits the pattern make a match.
    * `deleted` and `withdrawn` remove it, unless the file is still on disk or a task still declares it.
    */
+  override region(): FilePatternRegion {
+    return new FilePatternRegion(this.filePattern)
+  }
+
   override receiveArtifactEvent(event: ArtifactEvent): void {
     const change = this.fileStates.receive(event)
     this.sendChange(change)

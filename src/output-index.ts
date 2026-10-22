@@ -91,10 +91,15 @@ export class OutputIndex<O> {
     const defaultCovers = input.covers === Prefix.prototype.covers
     const defaultOverlaps = input.overlaps === Prefix.prototype.overlaps
     if (defaultCovers && defaultOverlaps) {
+      // A prefix output with its own rule can be narrower than its id, so its rule decides.
+      const visitPrefixEntry = (entry: PrefixEntry<O>) => {
+        if (this.customPrefixes.has(entry) && !entry.output.overlaps(input)) return
+        visit(entry.owner)
+      }
       // The artifact outputs under the input, the prefix outputs under it, and the prefix outputs above it.
       this.artifacts.withPrefix(input.id, visitEntry)
-      this.prefixes.withPrefix(input.id, visitEntry)
-      this.prefixes.startsOf(input.id, visitEntry)
+      this.prefixes.withPrefix(input.id, visitPrefixEntry)
+      this.prefixes.startsOf(input.id, visitPrefixEntry)
       return
     }
     // A class with its own rule: check every output. withPrefix("") visits every prefix output.

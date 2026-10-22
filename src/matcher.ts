@@ -1,4 +1,5 @@
 import type { ArtifactEvent } from "./build"
+import type { Ref } from "./task"
 import { Emitter } from "./emitter"
 import type { MatchedArtifactEvent, MatchedData } from "./matched-artifact"
 
@@ -20,6 +21,14 @@ export abstract class Matcher<D extends MatchedData = MatchedData> extends Emitt
    * Default: matches never change during a run.
    */
   receiveArtifactEvent(_event: ArtifactEvent): void {}
+
+  /**
+   * The artifacts that the matcher can see, as one ref. The gate task of a build.each waits for each task
+   * that writes into it. Default: null, so the gate does not wait for the writers of what this matcher sees.
+   */
+  region(): Ref | null {
+    return null
+  }
 }
 
 /**

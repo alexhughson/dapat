@@ -139,6 +139,39 @@ export class FilePattern {
     this.hasVarAtOrAfterGlob = varAtOrAfterGlob
   }
 
+  /** The absolute folder of the literal parts at the start of the pattern: `/w/images/` for `images/<page>.png`. */
+  literalFolder(): string {
+    const names: string[] = []
+    for (let index = 0; index < this.segments.length - 1; index++) {
+      const segment = this.segments[index]!
+      if (segment.kind !== "literal") break
+      names.push(segment.name)
+    }
+    return path.join(this.root, ...names, path.sep)
+  }
+
+  /**
+   * True when a file that fits the pattern can be below the absolute `folder`. It checks each part of
+   * the folder against a part of the pattern, so it can say true for a file that `match` rejects later.
+   */
+  canHaveFileBelow(folder: string): boolean {
+    const relativeFolder = path.relative(this.root, folder)
+    // A folder above the root holds every file of the pattern.
+    if (relativeFolder === ".." || relativeFolder.startsWith(`..${path.sep}`)) return true
+    if (relativeFolder === "") return true
+    const names = relativeFolder.split(path.sep)
+    for (let index = 0; index < names.length; index++) {
+      const segment = this.segments[index]
+      if (segment === undefined) return false
+      if (segment.kind === "anyDepth") return true
+      // The last part of the pattern names the file, so it cannot be a folder above the file.
+      if (index === this.segments.length - 1) return false
+      if (segment.kind === "literal" && segment.name !== names[index]) return false
+      if (segment.kind === "names" && segment.pattern.match(names[index]!) === null) return false
+    }
+    return true
+  }
+
   /** The vars of the file at the absolute `filePath`, or null when the file does not fit the pattern. */
   match(filePath: string): Vars | null {
     const relativePath = path.relative(this.root, filePath)
