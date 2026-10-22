@@ -142,7 +142,7 @@ await build.run()
 
 ## Run in CI
 
-A task skips in a CI job only when the job has the task's [record](guide.md#what-a-build-does) from an earlier job. Its output files must also have the stamps in that record. Use a `JsonStore` or a `SqliteStore` ([Stores](builtins.md#stores)). At the end of each job, save the store file (for example `.dapat/state.json`) and the output files in the CI cache. At the start of each job, restore them. Check out the project at the same path in each job, because [file ids](builtins.md#files) are absolute paths. Keep the default hash stamps, because a checkout changes the mtime of every file ([Hash or time](builtins.md#hash-or-time)).
+A task skips in a CI job only when the job has the task's [record](guide.md#what-a-build-does) from an earlier job. Its output files must also have the stamps in that record. Use a `JsonStore` or a `SqliteStore` ([Stores](builtins.md#stores)). At the end of each job, save the store file (for example `.dapat/state.json`) and the output files in the CI cache. At the start of each job, restore them. The GitHub Actions step `actions/cache` does both: set `path` to the store folder and the output folders, `key` to a new value in each job, such as `dapat-${{ github.job }}-${{ github.run_id }}-${{ github.run_attempt }}`, and `restore-keys` to `dapat-${{ github.job }}-`. A saved cache never changes, so a fixed `key` keeps the records of the first job. Check out the project at the same path in each job, because [file ids](builtins.md#files) are absolute paths. Keep the default hash stamps, because a checkout changes the mtime of every file ([Hash or time](builtins.md#hash-or-time)).
 
 ## Call a paid model
 

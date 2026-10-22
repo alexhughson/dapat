@@ -7,7 +7,7 @@ An **artifact type** is a class that extends `Artifact`. Write one when tasks re
 - Extend `Artifact` for one value: give it an `id`, a `stamp()` and a `read()`.
 - Extend [`Prefix`](guide.md#folders-prefixes) for a group of artifacts: give it an `id` and a `stamp()`.
 - Extend the class, not a plain object. The build tests each output with `instanceof`, so no task waits for a plain object, and `ctx.produced` throws for it.
-- Only `stamp()` decides a skip. `covers` and `overlaps` decide the order of the tasks and which reports a task can make.
+- Only `stamp()` decides a skip. `Prefix` also has the methods `covers(artifact)` and `overlaps(other)`, whose defaults compare the start of the ids. They decide the order of the tasks and which reports a task can make ([How the build uses your classes](#how-the-build-uses-your-classes)).
 
 ## Step 1: one key of a JSON file
 
@@ -169,7 +169,7 @@ await runBuild("3. a new line", "Call me Ishmael.\nSome years ago.\nNever mind h
 
 In build 1, `index` lists both page keys, although the program adds `make-index` first. `make-index` waits, because the output `pages` of `split` has the id of its input `pages`. In build 2, `book` changed, so `split` runs, but it trims the spaces and writes the same page values. So the stamps of `pages` and `index` equal the record of `make-index`, and it skips.
 
-This `split` does not delete the page keys of an old, longer book. To delete them, delete each old key and report it with `ctx.deleted`, as `split` does in Outputs with unknown names in the guide.
+This `split` does not delete the page keys of an old, longer book. To delete them, delete each old key and report it with `ctx.deleted`, as `split` does in [Outputs with unknown names](guide.md#outputs-with-unknown-names).
 
 ## How the build uses your classes
 

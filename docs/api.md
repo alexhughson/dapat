@@ -288,8 +288,8 @@ class FileMatcher extends Matcher<FileArtifact> {
 class FileGroupMatcher extends Matcher<readonly FileArtifact[]> {
   constructor(pattern: string, opts?: FilePatternOptions) // throws for a bad pattern, syntax or stamp, for a pattern with no * or **, and for a var at or after the first * or **; see Error messages
   readonly pattern: string; readonly root: string; readonly varNames: readonly string[] // as in FileMatcher
-  scan(signal: AbortSignal): Promise<void> // sends one found for each group after the whole scan
-  receiveArtifactEvent(event: ArtifactEvent): void // the FileMatcher rules for each file; sends the new list of the group, or gone when the list is empty
+  scan(signal: AbortSignal): Promise<void> // sends one found for each list after the whole scan
+  receiveArtifactEvent(event: ArtifactEvent): void // the FileMatcher rules for each file; sends found with the new list, or gone when the list is empty
 }
 ```
 

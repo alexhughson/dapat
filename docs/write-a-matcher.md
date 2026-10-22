@@ -162,7 +162,7 @@ out/intro.html: Hi
 
 ## Send from a watcher
 
-`send` is protected, so other code, such as a file watcher, cannot call it. Give your matcher a public method, such as `changed(key, exists)`, that calls `update`. The build adds the tasks of each `found` event before `send` returns. After the scans of the first `run()`, these tasks start immediately, even after `run()` resolves ([the order rule](semantics.md#the-order-rule)). Call `run()` again to wait for them. Its `Result` also holds the tasks of earlier runs.
+`send` is protected, so other code, such as a file watcher, cannot call it. Give your matcher a public method, such as `changed(key, exists)`, that calls `update`. The build adds the tasks of each `found` event before `send` returns. After the scans of the first `run()`, these tasks start immediately, even after `run()` resolves ([the order rule](semantics.md#the-order-rule)). To wait for them, call `run()` again on the same `Build`. This `run()` does not scan, and its `Result` also holds the tasks of earlier runs.
 
 ## Lists
 

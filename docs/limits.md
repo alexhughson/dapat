@@ -4,16 +4,17 @@ This page gives the sizes at which a build gets slow, and the known issues of ve
 
 ## Scale
 
-dapat's own time, without the work of the tasks, grows about as the number of tasks ([Scheduling cost](semantics.md#scheduling-cost)). The last column gives the cause of each row that grows faster, and the fix. The table gives the shortest and longest time of several runs on one machine with Bun 1.4.2, with tasks that do almost no work. Each time includes the `build.add` calls and `run()`. `bun bench/scheduler.ts <scenario> <n>` measures row 1 (`flat`, `chain`), row 5 (`custom-prefix`, `shared-prefix`) and row 6 (`one-at-a-time`).
+dapat's own time, without the work of the tasks, grows about as the number of tasks ([Scheduling cost](semantics.md#scheduling-cost)). The last column gives the cause of each row that grows faster, and the fix. The table gives the shortest and longest time of several runs on a Linux VM with 4 cores of an Intel Xeon at 2.8 GHz and Bun 1.4.2, with tasks that do almost no work. Each time includes the `build.add` calls and `run()`. `bun bench/scheduler.ts <scenario> <n>` measures rows 1 and 2 (`flat`, `chain`), row 6 (`custom-prefix`, `shared-prefix`) and row 7 (`one-at-a-time`).
 
 | Case | Time | Cause, and how to keep it fast |
 | --- | --- | --- |
-| independent tasks, or a chain in which each task reads the output of the task before it, with `MemoryStore` | Independent: 1,000 tasks: 22–38 ms. 8,000: 0.16–0.22 s. 32,000: 0.59–0.71 s. Chain: 1,000: 32–50 ms. 8,000: 0.22–0.28 s. 32,000: 0.74–0.87 s | – |
+| independent tasks, with `MemoryStore` | 1,000 tasks: 22–38 ms. 8,000: 0.16–0.22 s. 32,000: 0.59–0.71 s | – |
+| a chain in which each task reads the output of the task before it, with `MemoryStore` | 1,000 tasks: 32–50 ms. 8,000: 0.22–0.28 s. 32,000: 0.74–0.87 s | – |
 | a chain from `build.each`, with `JsonStore`: one task reports each page of a book | 100 pages: 0.28–0.37 s. 400: 1.5 s. 1,000: 5.9–7.2 s (2.9–3.1 s when every task skips). With `SqliteStore`, 1,000 pages: 3.1–3.3 s (0.65–0.68 s) | `JsonStore` reads the whole file at each call, and writes it at each `set`. So its time grows about as the square of the number of tasks. Use [`SqliteStore`](builtins.md#stores) for a thousand tasks or more |
 | 2,000 independent tasks, each reads and writes one file | `JsonStore`: 6.6–6.7 s. `SqliteStore`: 3.6–4.6 s | With `JsonStore`, the same cause |
 | one task writes files into a folder and reports each one. One `FileGroupMatcher` match lists them | 2,000 files: 1.0–1.9 s. 4,000: 4.5–5.1 s | Each report makes the tasks of the match again ([Matches during the run](build-each.md#matches-during-the-run)). Declare the files as exact outputs when you know their names |
-| n tasks that read the same prefix, whose class overrides `covers()` | 4,000 tasks: 0.60–0.77 s. 16,000: 10.7–11.2 s. With an `IdPrefix` in its place, 16,000: 0.35–0.39 s | Each look for producers checks every output. Override `covers` and `overlaps` only for a prefix that does not compare id starts ([How the build uses your classes](write-an-artifact.md#how-the-build-uses-your-classes)) |
-| one task reads a prefix, and each producer of the prefix adds the next one when it runs | 4,000 producers: 0.94–1.01 s. 16,000: 29.5–33.4 s | Each look lists the outputs under the prefix to find the next producer. Add the producers together, such as in one loop |
+| n tasks that read the same prefix, whose class overrides `covers()` | 4,000 tasks: 0.60–0.77 s. 16,000: 10.7–11.2 s. With an `IdPrefix` in its place, 16,000: 0.35–0.39 s | Each time a task looks for its producers, it checks every output. Override `covers` and `overlaps` only for a prefix that does not compare id starts ([How the build uses your classes](write-an-artifact.md#how-the-build-uses-your-classes)) |
+| one task reads a prefix, and each producer of the prefix adds the next one when it runs | 4,000 producers: 0.94–1.01 s. 16,000: 29.5–33.4 s | Each time the task looks for its producers, it lists the outputs under the prefix to find the next one. Add the producers together, such as in one loop |
 | a pattern part with many `*` or vars, such as `*a*a*a*a*b` or `<v>a<w>a<x>a<y>a<z>b`, on a name of 200 `a` characters | about 5 s | The match tries each way to split the name between the markers. A part such as `*-*-*.jpg` stays fast |
 
 ## Known issues in 0.1.0
