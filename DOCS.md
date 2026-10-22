@@ -121,6 +121,20 @@ The repo has this build in `examples/first-build.ts`. Run it from a folder that 
 - `failed` is a `Map<Task, Error>`.
 - `cancelled` lists the tasks that were replaced or removed before they finished ([section 8](#8-failure-cancellation-and-replacement)).
 - `errors` lists the errors that no task owns: a non-abort error that a task throws after it was replaced or removed ([section 8](#replacement)), and a store delete that rejects ([section 8](#removal)).
+- `outcomes` maps each task to its `Outcome`. An executed outcome has a `reason`: the first difference that the skip check found ([`RunReason`](#type-runreason)).
+
+For example, you edit `in.txt` and run the build again. `upper` runs, and its outcome says why:
+
+```ts
+for (const task of result.executed) {
+  console.log(task.id, result.outcomes.get(task))
+}
+// upper { type: "executed", reason: { kind: "input-changed", id: "file:/abs/path/in.txt" } }
+```
+
+If `upper` writes other text to `mid.txt`, `wrap` runs too, with `input-changed` and the id of `mid.txt`.
+
+dapat sees only the inputs that a task declares. A change to a file that the task reads but does not declare does not make it run.
 
 A failed task does not stop the build. The other tasks continue. `build.run()` does not throw when a task fails, so always check `result.success`. `build.run()` rejects in three cases only: a subscriber throws, a subscriber returns a promise, or subscribers reach the send limit ([section 9](#subscriber-errors)).
 
@@ -479,6 +493,8 @@ Some more results of the rule:
 - The task has an `IdPrefix` input or output. Its stamp is `null`, so the task runs on each build.
 - A task deletes one of its declared artifact outputs and calls `ctx.deleted`. That output is then missing, so the task runs on each build. To delete an artifact and still skip, declare its folder as a prefix output with a stamp, for example a `FilesystemPrefix`. The task must also have an input. An `IdPrefix` output makes the task run on each build. Call `ctx.deleted` on each run, also when the artifact is already gone. If you do not, dapat sends a `produced` event for the missing output after the task returns.
 
+A task reads a file that it does not declare: dapat does not see it ([Read the result](#read-the-result)).
+
 dapat does not ask which modification time is newer. Older versions of dapat skipped a task when its outputs were newer than its inputs, as `make` does. That check is gone. A file stamp can hold a modification time, but dapat compares it for equality only. Without a store record, a task runs.
 
 dapat stamps the inputs, artifacts and prefixes, before the task runs. It stamps a prefix input after the tasks that write under the prefix have finished. After the task runs with no error, dapat stamps the outputs, artifacts and prefixes. Then it writes the input stamps from before the run and the output stamps from after the run to the store. If an input changes while the task runs, the record keeps the old stamp, so the next build runs the task again. dapat does not write stamps for a failed task, so a failed task runs again on the next build.
@@ -486,14 +502,6 @@ dapat stamps the inputs, artifacts and prefixes, before the task runs. It stamps
 The `stamp()` methods do real I/O. For example, `FileArtifact.stamp()` reads and hashes the full bytes of the file, and `FilesystemPrefix.stamp()` walks the folder and does the same for each file. With `{ stamp: "time" }`, they read only the modification time and the size. dapat calls `stamp()` only when the build has a store. Before a task runs, it always stamps the inputs. It stamps the outputs only when the store has a record for the task.
 
 If `store.get()` or a `stamp()` method throws during this check, the task fails with that error. It does not run. The tasks that read its outputs fail too, as for any failed task.
-
-### 6.1 Why did a task run or skip?
-
-`Result` tells you which tasks ran and which skipped. It does not tell you the reason. To find the reason, do these steps:
-
-1. Read the task's record with `await store.get(taskId)`. If it is `null`, the task has never succeeded with this store, so it runs.
-2. Call `await ref.stamp()` on each input and output. Compare the values with `inputStamps` and `outputStamps` in the record. The key of an artifact is `artifact <id>`, and the key of a prefix is `prefix <id>`. A missing key, an extra key, a different stamp, a `null` output stamp, or a `null` prefix stamp makes the task run.
-3. Make sure that the task declares every file that it reads. dapat does not see an input that the task does not declare. A change to that file does not make the task run.
 
 ## 7. Stores
 
@@ -1706,18 +1714,35 @@ Keeps records in a `Map`. The records are lost when the process ends. `MemorySto
 | `skipped` | `readonly Task[]` | Tasks that the skip rule skipped. |
 | `failed` | `ReadonlyMap<Task, Error>` | Tasks that threw, whose producer failed, or that were in a deadlock. |
 | `cancelled` | `readonly Task[]` | Tasks that were replaced or removed before they completed. |
+| `outcomes` | `ReadonlyMap<Task, Outcome>` | The same tasks as `executed`, `skipped`, `failed` and `cancelled`, with the `Outcome` of each. An executed outcome has the `RunReason` that the task ran for. |
 | `errors` | `readonly Error[]` | Errors that no task owns: a non-abort error that a task throws after it was replaced or removed, and a store delete that rejects. It keeps the errors of earlier runs of the same build. A subscriber error is not here: `run()` rejects with it. |
-
-`Result` does not say why a task ran. The build keeps an `Outcome` for each task, but no public member returns it. See [section 6.1](#61-why-did-a-task-run-or-skip).
 
 ### `type Outcome`
 
 ```ts
 type Outcome =
-  | { type: "executed" }
+  | { type: "executed"; reason: RunReason }
   | { type: "skipped" }
   | { type: "failed"; error: Error }
   | { type: "cancelled"; reason: "replaced" | "removed" }
+```
+
+### `type RunReason`
+
+The first difference that the skip check found ([section 6](#6-when-a-task-skips)). `id` is the id of the input or output. Only an executed outcome has a reason.
+
+```ts
+type RunReason =
+  | { kind: "no-store" } // the build has no store
+  | { kind: "no-inputs" } // the task has no input
+  | { kind: "no-record" } // the store has no record for the task, or a record that this version of dapat cannot read
+  | { kind: "input-unstamped"; id: string } // this prefix input has a null stamp, for example an IdPrefix
+  | { kind: "output-unstamped"; id: string } // this prefix output has a null stamp, for example an IdPrefix
+  | { kind: "input-ids-changed" } // the input ids differ from the record
+  | { kind: "input-changed"; id: string } // this input's stamp differs from the record
+  | { kind: "output-missing"; id: string } // this artifact output's stamp is null
+  | { kind: "output-ids-changed" } // the output ids differ from the record
+  | { kind: "output-changed"; id: string } // this output's stamp differs from the record
 ```
 
 ### `class Emitter<E>`

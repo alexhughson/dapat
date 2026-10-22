@@ -5,7 +5,7 @@ import type { MatchedArtifactEvent } from "./matched-artifact"
 import { OutputIndex } from "./output-index"
 import { Task, isArtifact, isPrefix, type Context, type Ref } from "./task"
 import type { Store, TaskState } from "./store"
-import { Outcome, Result } from "./result"
+import { Outcome, Result, type RunReason } from "./result"
 import { TaskGroup, type GroupTasks } from "./task-group"
 import { TaskMaterializer, type TaskMaterializerConfig } from "./task-materializer"
 
@@ -793,11 +793,12 @@ export class Build extends Emitter<ArtifactEvent> {
     // that changes during the run makes the next build run the task again.
     // The wait above already gave the producers under each prefix input time to finish.
     let inputStamps: StampMap | null = null
-    let skip = false
+    // Null when the task skips.
+    let reason: RunReason | null = { kind: "no-store" }
     try {
       if (this.store) {
         inputStamps = await this.stampRefs(slot.task.inputs)
-        skip = await this.canSkip(this.store, slot.task, inputStamps)
+        reason = await this.runReason(this.store, slot.task, inputStamps)
       }
     } catch (error) {
       // A store or a stamp() that throws fails the task, as an error in task.run does.
@@ -808,7 +809,7 @@ export class Build extends Emitter<ArtifactEvent> {
     }
     if (generation !== slot.generation) return
     if (this.fatal !== null) return
-    if (skip) {
+    if (reason === null) {
       this.finish(slot, { type: "skipped" })
       return
     }
@@ -824,7 +825,7 @@ export class Build extends Emitter<ArtifactEvent> {
       if (this.endIfStopped(slot, generation)) return
       await this.recordSuccess(slot, generation, inputStamps)
       if (this.endIfStopped(slot, generation)) return
-      this.finish(slot, { type: "executed" })
+      this.finish(slot, { type: "executed", reason })
     } catch (error) {
       if (generation !== slot.generation) {
         // A stopped task often throws because ctx.signal aborted. That is not an error.
@@ -1040,38 +1041,44 @@ export class Build extends Emitter<ArtifactEvent> {
   protected override rejected(): void {}
 
   /**
-   * True when the task has an input, every prefix has a stamp, every output exists,
-   * and the stamps and ids equal the record. `inputStamps` are the current input stamps.
+   * Null when the task has an input, every prefix has a stamp, every output exists,
+   * and the stamps and ids equal the record. Otherwise the first difference, which is
+   * why the task runs. `inputStamps` are the current input stamps.
    */
-  private async canSkip(store: Store, task: Task, inputStamps: StampMap): Promise<boolean> {
+  private async runReason(store: Store, task: Task, inputStamps: StampMap): Promise<RunReason | null> {
     // With no input, nothing can show that the result is still current.
-    if (task.inputs.length === 0) return false
+    if (task.inputs.length === 0) return { kind: "no-inputs" }
     // stampRefs leaves out a prefix with a null stamp. That prefix cannot tell what is under it.
     for (const input of task.inputs) {
-      if (!Object.hasOwn(inputStamps, refKey(input))) return false
+      if (!Object.hasOwn(inputStamps, refKey(input))) return { kind: "input-unstamped", id: input.id }
     }
     const record = await store.get(task.id)
-    if (!record) return false
+    if (!record) return { kind: "no-record" }
     // A record with two stamps for each id has a different shape. It counts as no record.
     // A record from PR 7, before prefix stamps, keyed its stamps by bare id. No key
     // matches the current "artifact <id>" keys, so the task runs once and writes a new record.
-    if (!isStampMap(record.inputStamps)) return false
-    if (!isStampMap(record.outputStamps)) return false
-    if (!sameStamps(record.inputStamps, inputStamps)) return false
+    if (!isStampMap(record.inputStamps)) return { kind: "no-record" }
+    if (!isStampMap(record.outputStamps)) return { kind: "no-record" }
+    if (!sameIds(record.inputStamps, inputStamps)) return { kind: "input-ids-changed" }
+    for (const input of task.inputs) {
+      const key = refKey(input)
+      if (record.inputStamps[key] !== inputStamps[key]) return { kind: "input-changed", id: input.id }
+    }
 
     const outputStamps = newStampMap()
     for (const output of task.outputs) {
       const stamp = await output.stamp()
-      if (stamp === null) return false
+      if (stamp === null && isPrefix(output)) return { kind: "output-unstamped", id: output.id }
       const key = refKey(output)
-      if (!Object.hasOwn(record.outputStamps, key)) return false
-      if (record.outputStamps[key] !== stamp) return false
+      if (!Object.hasOwn(record.outputStamps, key)) return { kind: "output-ids-changed" }
+      if (stamp === null) return { kind: "output-missing", id: output.id }
+      if (record.outputStamps[key] !== stamp) return { kind: "output-changed", id: output.id }
       outputStamps[key] = stamp
     }
     const recordedCount = Object.keys(record.outputStamps).length
     const currentCount = Object.keys(outputStamps).length
-    if (recordedCount !== currentCount) return false
-    return true
+    if (recordedCount !== currentCount) return { kind: "output-ids-changed" }
+    return null
   }
 
   /**
@@ -1136,14 +1143,13 @@ function newStampMap(): StampMap {
   return Object.create(null) as StampMap
 }
 
-/** True when both maps have the same ids, and each id has the same stamp. */
-function sameStamps(recorded: StampMap, current: StampMap): boolean {
+/** True when both maps have the same ids. The stamps can differ. */
+function sameIds(recorded: StampMap, current: StampMap): boolean {
   const recordedIds = Object.keys(recorded)
   const currentIds = Object.keys(current)
   if (recordedIds.length !== currentIds.length) return false
   for (const id of currentIds) {
     if (!Object.hasOwn(recorded, id)) return false
-    if (recorded[id] !== current[id]) return false
   }
   return true
 }
