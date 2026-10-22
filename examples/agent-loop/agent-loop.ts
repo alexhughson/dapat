@@ -9,7 +9,7 @@
 import { existsSync } from "node:fs"
 import path from "node:path"
 import { Build, Task } from "dapat"
-import { FileArtifact, FileMatcher, FilesystemPrefix, JsonStore } from "dapat/contrib"
+import { FileArtifact, FileMatcher, FileTemplate, FilesystemPrefix, JsonStore } from "dapat/contrib"
 
 type Step = { kind: "tools"; terms: string[] } | { kind: "answer"; text: string }
 
@@ -36,41 +36,37 @@ if (!existsSync("inbox")) {
 const build = new Build({ store: new JsonStore(".dapat/state.json") })
 
 build.each({
+  name: "seed",
   matchersByName: { question: new FileMatcher("inbox/<sid>.txt") },
-  *tasks(vars, matched) {
-    const prompt = new FileArtifact(`prompts/${vars.sid}/0/prompt.txt`)
-    yield new Task({
-      id: `seed:${vars.sid}`,
-      inputs: [matched.question.data],
-      outputs: [prompt],
-      run: async () => {
-        await Bun.write(prompt.path, await Bun.file(matched.question.data.path).text())
-      },
-    })
+  outputsByName: { prompt: new FileTemplate("prompts/<sid>/0/prompt.txt") },
+  async run({ matched, outputs }) {
+    await Bun.write(outputs.prompt.path, await Bun.file(matched.question.data.path).text())
   },
 })
 
 build.each({
+  name: "think",
   matchersByName: { prompt: new FileMatcher("prompts/<sid>/<n>/prompt.txt") },
+  outputsByName: { step: new FileTemplate("turns/<sid>/<n>/step.json") },
+  async run({ matched, outputs }) {
+    const reply = await model(await Bun.file(matched.prompt.data.path).text())
+    await Bun.write(outputs.step.path, JSON.stringify(reply))
+  },
+})
+
+// advance writes the next prompt only when the model asked for tools. An output that may not be
+// written must be a folder: a declared file would make the next turn at the start of each build,
+// and that turn the next one, until build.run() rejects with "send limit".
+// The folder of turn n+1 has one writer, this task. A shared folder makes tasks rerun.
+build.each({
+  matchersByName: {
+    prompt: new FileMatcher("prompts/<sid>/<n>/prompt.txt"),
+    step: new FileMatcher("turns/<sid>/<n>/step.json"),
+  },
   *tasks(vars, matched) {
     const prompt = matched.prompt.data
-    const step = new FileArtifact(`turns/${vars.sid}/${vars.n}/step.json`)
-    // The next prompt folder has one writer: this task. A shared folder makes tasks rerun.
+    const step = matched.step.data
     const nextFolder = new FilesystemPrefix(`prompts/${vars.sid}/${Number(vars.n) + 1}`)
-
-    yield new Task({
-      id: `think:${vars.sid}/${vars.n}`,
-      inputs: [prompt],
-      outputs: [step],
-      run: async () => {
-        const reply = await model(await Bun.file(prompt.path).text())
-        await Bun.write(step.path, JSON.stringify(reply))
-      },
-    })
-
-    // advance writes the next prompt only when the model asked for tools. An output that may not be
-    // written must be a folder: a declared file would make the next turn at the start of each build,
-    // and that turn the next one, until build.run() rejects with "send limit".
     yield new Task({
       id: `advance:${vars.sid}/${vars.n}`,
       inputs: [prompt, step],
