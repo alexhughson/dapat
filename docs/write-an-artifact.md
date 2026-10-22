@@ -1,10 +1,10 @@
 # Write an artifact type
 
-An **artifact type** is a class that extends `Artifact` or `Prefix`. Write one when tasks read or write a value that dapat has no class for, such as a database row. On this page you write `JsonKey` for one key of a JSON file, and `JsonKeyPrefix` for the keys under `pages/`. [The store](#the-store) gives the contract for a store of your own. Read part 1 of the [guide](guide.md) first.
+An **artifact type** is a class that extends `Artifact`. Write one when tasks read or write a value that dapat has no class for, such as a database row. On this page you write `JsonKey` for one key of a JSON file, and the `Prefix` class `JsonKeyPrefix` for the keys under `pages/`. Read part 1 of the [guide](guide.md) first.
 
 ## What you write
 
-Extend `Artifact` for one value. Extend [`Prefix`](guide.md#folders-prefixes) for the values whose ids start with one id. Both classes come from `"dapat"`:
+Extend `Artifact` for one value. Extend [`Prefix`](guide.md#folders-prefixes) for a group of artifacts, usually the artifacts whose ids start with one id. Both classes come from `"dapat"`:
 
 | Member | `Artifact` | `Prefix` |
 | --- | --- | --- |
@@ -16,28 +16,27 @@ Extend `Artifact` for one value. Extend [`Prefix`](guide.md#folders-prefixes) fo
 
 `covers` and `overlaps` decide only the order of the tasks and which reports a task can make. Of these methods, only `stamp()` decides a skip.
 
+- Extend the class. The build tests each input and output with `instanceof`, so the tasks that read a plain object do not wait for the task that writes it ([How the build uses your classes](#how-the-build-uses-your-classes)).
+- Make `covers` and `overlaps` fast, and make them give the same result for the same ids. They get the artifacts and prefixes of every task, of any class. Check the class before you read a field that only your class has. Do not throw.
 - The build calls no `exists`, `delete` or `list` method. A subclass can add one, as `FilesystemPrefix` adds `list()`. To delete a value, your task deletes it, then [reports](guide.md#outputs-with-unknown-names) it with `ctx.deleted`.
-- The build matches outputs with inputs to find the [producers](guide.md#what-a-build-does) of a task. It also matches each `ctx.produced` and `ctx.deleted` with the outputs of the task. Two artifacts match when their ids are equal. For a prefix and an artifact, it calls `covers` of the prefix. For two prefixes, it calls `overlaps` of the prefix input. It calls them again each time a waiting task checks its producers. So make them fast, and make them give the same result for the same ids.
-- `covers` and `overlaps` get the artifacts and prefixes of every task, of any class. Check the class before you read a field that only your class has. Do not throw: a throw while a task waits for its producers is an unhandled rejection, and that task is in no list of the `Result`.
-- Extend the class. A plain object with the same members type-checks, but the build tests each input and output with `instanceof`. For a plain-object output, the tasks that read it do not wait, two tasks can declare it, and `ctx.produced` throws for it.
 
 ## Step 1: one key of a JSON file
 
-`JsonKey` extends `Artifact`. The task `make-slug` reads the key `title` and writes the key `slug`. Each key has its own stamp, so `make-slug` skips in build 2, although its run in build 1 changed `data.json`.
+`JsonKey` extends `Artifact`. The task `make-slug` reads the key `title` and writes the key `slug`. Each key has its own stamp. So `make-slug` skips in builds 2 and 3, although `data.json` changed before each of them.
 
 - The id is `json:<absolute path>#<key>`. It starts with `json:`, a fixed text that no other kind of value uses. The `#` ends the path, so a prefix for the keys of `data.json` does not cover the keys of `data.json.bak`. A `FileArtifact` or `FilesystemPrefix` id starts with `file:`. So a task that reads `data.json` as a file does not wait for the tasks that write its keys. Declare each key that a task reads as a `JsonKey` input.
-- `stamp()` returns the SHA-256 hash of `JSON.stringify(value)`, or `null` when the key is missing. For an output, a `null` stamp makes the task run. For an input, the build compares a `null` stamp with the record, as it does any other stamp ([skip checks 2 and 4](semantics.md#the-skip-check)). `stamp()` throws when the file is not valid JSON.
+- `stamp()` returns the SHA-256 hash of `JSON.stringify(value)`, or `null` when the key is missing. For an output, a `null` stamp makes the task run. For an input, the build compares a `null` stamp with the record, as it does any other stamp ([the skip rule](guide.md#the-store-and-the-skip-rule)). `stamp()` throws when the file is not valid JSON.
 - `read()` returns the value, and throws when the key is missing.
 
 ```ts
 import path from "node:path"
-import { Artifact, Build, MemoryStore, Task, type TaskState } from "dapat"
-
-const calls: string[] = [] // stamp(), get, run and set add to it, in call order
+import { Artifact, Build, MemoryStore, Task } from "dapat"
 
 async function load(file: string): Promise<Record<string, unknown>> {
   const exists = await Bun.file(file).exists()
-  if (!exists) return {} // a missing file has no keys
+  if (!exists) {
+    return {} // a missing file has no keys
+  }
   return await Bun.file(file).json()
 }
 
@@ -51,37 +50,25 @@ class JsonKey<T = unknown> extends Artifact<T> {
   }
   async stamp() {
     const doc = await load(this.file)
-    let stamp: string | null = null
-    if (Object.hasOwn(doc, this.key)) {
-      stamp = Bun.SHA256.hash(JSON.stringify(doc[this.key]), "hex")
+    if (!Object.hasOwn(doc, this.key)) {
+      return null
     }
-    calls.push(`stamp ${this.key} ${stamp?.slice(0, 8) ?? null}`) // trace only
-    return stamp
+    return Bun.SHA256.hash(JSON.stringify(doc[this.key]), "hex")
   }
   async read() {
     const doc = await load(this.file)
-    if (!Object.hasOwn(doc, this.key)) throw new Error(`missing ${this.id}`)
+    if (!Object.hasOwn(doc, this.key)) {
+      throw new Error(`missing ${this.id}`)
+    }
     return doc[this.key] as T
   }
 }
 
-class LoggingStore extends MemoryStore {
-  override async get(taskId: string) {
-    calls.push("get")
-    return await super.get(taskId)
-  }
-  override async set(taskId: string, state: TaskState) {
-    calls.push("set")
-    await super.set(taskId, state)
-  }
-}
-
-const store = new LoggingStore()
+const store = new MemoryStore()
 const title = new JsonKey<string>("data.json", "title")
 const slug = new JsonKey("data.json", "slug")
 
 async function makeSlug() {
-  calls.push("run")
   const text = await title.read()
   const doc = await load("data.json")
   doc.slug = text.toLowerCase().replaceAll(" ", "-")
@@ -91,30 +78,32 @@ async function makeSlug() {
 async function runBuild(label: string) {
   const build = new Build({ store })
   build.add(new Task({ id: "make-slug", inputs: [title], outputs: [slug], run: makeSlug }))
-  await build.run()
-  const trace = calls.splice(0)
-  console.log(`${label.padEnd(16)}${trace.join(", ")}`)
+  const result = await build.run()
+  const ran = result.executed.map((task) => task.id).sort()
+  const skipped = result.skipped.map((task) => task.id).sort()
+  console.log(`${label.padEnd(16)}ran [${ran.join(" ")}] skipped [${skipped.join(" ")}]`)
 }
 
 await Bun.write("data.json", JSON.stringify({ title: "Hello World" }))
 await runBuild("1. no record")
 await runBuild("2. no change")
+await Bun.write("data.json", JSON.stringify({ title: "Hello World", slug: "hello-world", draft: true }))
+await runBuild("3. other key")
 await Bun.write("data.json", JSON.stringify({ title: "Bye World", slug: "hello-world" }))
-await runBuild("3. new title")
+await runBuild("4. new title")
 ```
 
 <!-- output -->
 ```text
-1. no record    stamp title 07cf5509, get, run, stamp slug 058df09e, set
-2. no change    stamp title 07cf5509, get, stamp slug 058df09e
-3. new title    stamp title 737a860c, get, run, stamp slug af55aa8e, set
+1. no record    ran [make-slug] skipped []
+2. no change    ran [] skipped [make-slug]
+3. other key    ran [] skipped [make-slug]
+4. new title    ran [make-slug] skipped []
 ```
-
-In build 3, the stamp of `title` differs, so the build runs the task before it stamps `slug` ([full order of calls](#how-the-build-uses-your-classes)).
 
 ## Step 2: a prefix for keys with unknown names
 
-`JsonKeyPrefix` extends `Prefix`. It stands for the keys of `data.json` that start with `pages/`. The task `split` writes one page key for each line of `book`: `pages/1`, `pages/2`, and so on. It declares the prefix `pages` as its output and [reports](guide.md#outputs-with-unknown-names) each page key. The task `make-index` reads `pages` and writes the page keys to the key `index`. `load` and `JsonKey` are as in step 1, without `calls`. `writeKey` reads `data.json` and writes it back, so two tasks must not run it at the same time ([checklist](#checklist)).
+`JsonKeyPrefix` extends `Prefix`. It stands for the keys of `data.json` that start with `pages/`. The task `split` writes one page key for each line of `book`: `pages/1`, `pages/2`, and so on. It declares the prefix `pages` as its output and [reports](guide.md#outputs-with-unknown-names) each page key. The task `make-index` reads `pages` and writes the page keys to the key `index`. `load` and `JsonKey` are as in step 1. `writeKey` reads `data.json` and writes it back, so two tasks must not run it at the same time ([checklist](#checklist)).
 
 - The id of `pages` is `json:<absolute path>#pages/`, which ends with a [delimiter](guide.md#folders-prefixes). The id of each page key starts with it, so `covers` of `pages` returns true for each page key, and `ctx.produced` does not throw.
 - `stamp()` of `JsonKeyPrefix` returns the SHA-256 hash of the lines `<key>=<stamp of the key>`, in key order. So a changed value, a new key and a deleted key each give a new stamp. With no keys, `stamp()` returns the hash of an empty string, not `null`, so a task that reads an empty prefix can skip.
@@ -125,7 +114,9 @@ import { Artifact, Build, MemoryStore, Prefix, Task, type Context } from "dapat"
 
 async function load(file: string): Promise<Record<string, unknown>> {
   const exists = await Bun.file(file).exists()
-  if (!exists) return {} // a missing file has no keys
+  if (!exists) {
+    return {} // a missing file has no keys
+  }
   return await Bun.file(file).json()
 }
 
@@ -145,12 +136,16 @@ class JsonKey<T = unknown> extends Artifact<T> {
   }
   async stamp() {
     const doc = await load(this.file)
-    if (!Object.hasOwn(doc, this.key)) return null
+    if (!Object.hasOwn(doc, this.key)) {
+      return null
+    }
     return Bun.SHA256.hash(JSON.stringify(doc[this.key]), "hex")
   }
   async read() {
     const doc = await load(this.file)
-    if (!Object.hasOwn(doc, this.key)) throw new Error(`missing ${this.id}`)
+    if (!Object.hasOwn(doc, this.key)) {
+      throw new Error(`missing ${this.id}`)
+    }
     return doc[this.key] as T
   }
 }
@@ -165,17 +160,14 @@ class JsonKeyPrefix extends Prefix {
   }
   async keys() {
     const doc = await load(this.file)
-    const keys: string[] = []
-    for (const key of Object.keys(doc)) {
-      if (key.startsWith(this.keyPrefix)) keys.push(key)
-    }
+    const keys = Object.keys(doc).filter((key) => key.startsWith(this.keyPrefix))
     return keys.sort()
   }
   async stamp() {
     const doc = await load(this.file) // one read for all keys
+    const keys = Object.keys(doc).filter((key) => key.startsWith(this.keyPrefix))
     const lines: string[] = []
-    for (const key of Object.keys(doc).sort()) {
-      if (!key.startsWith(this.keyPrefix)) continue
+    for (const key of keys.sort()) {
       const stamp = Bun.SHA256.hash(JSON.stringify(doc[key]), "hex") // as in JsonKey
       lines.push(`${key}=${stamp}`)
     }
@@ -227,53 +219,31 @@ await runBuild("3. a new line", "Call me Ishmael.\nSome years ago.\nNever mind h
 3. a new line   ran [make-index split] skipped [] index: pages/1 pages/2 pages/3
 ```
 
-1. In build 1, `index` lists both page keys, although the program adds `make-index` first. `make-index` waits, because [`overlaps`](#what-you-write) of its input `pages` returns true for the output `pages` of `split`.
-2. In build 2, `book` changed, so `split` runs. It trims the spaces and writes the same page keys. So the stamps of `pages` and `index` equal the record of `make-index`, and it skips.
+1. In build 1, `index` lists both page keys, although the program adds `make-index` first. `make-index` waits, because the output `pages` of `split` has the id of its input `pages` ([How the build uses your classes](#how-the-build-uses-your-classes)).
+2. In build 2, `book` changed, so `split` runs. It trims the spaces, so it writes the same values to the same page keys. So the stamps of `pages` and `index` equal the record of `make-index`, and it skips.
 
 To delete the page keys of an old, longer book, do as `split` does in [outputs with unknown names](guide.md#outputs-with-unknown-names).
 
-## A prefix that does not compare id starts
-
-Some prefixes do not compare the start of ids, such as a prefix for rows 100 to 199 of a table. For such a prefix, override `covers` and `overlaps`. Return `true` from `overlaps` when both prefixes can cover one id. The build calls `overlaps` of the prefix input, not of the output ([What you write](#what-you-write)). So a task whose input has the default `overlaps`, such as an `IdPrefix`, waits for your prefix output only when one id starts with the other. To make a task wait for your prefix output, give the task an input of your own prefix class.
-
 ## How the build uses your classes
 
-The build calls your methods and your store in this order. The check numbers are those of [the skip check](semantics.md#the-skip-check).
+The build connects outputs to inputs to find the [producers](guide.md#what-a-build-does) of a task. It also connects each `ctx.produced` and `ctx.deleted` to the outputs of the task:
 
-```text
-for each task: wait for its producers  ← the build calls covers() and overlaps() each time the task looks for them
-├─ no store → run, with no stamp() calls
-├─ stamp each input, one at a time  ← here and in checks 3–6, a throw fails the task, and it does not run
-├─ checks 1–2: no inputs, or a prefix input whose stamp is null → run, with no store.get
-├─ checks 3–4: store.get(task id): no record, or the input ids or stamps differ → run
-├─ checks 5–6: stamp each output; at the first null or difference → run
-├─ all stamps equal the record → skip, and the task ends: no produced events, no store.set
-├─ run(ctx)  ← at each ctx.produced(a) or ctx.deleted(a), the build calls covers(a) of your prefix outputs
-├─ a produced event for each exact output that the task did not report
-└─ stamp each output, then store.set(task id, record)  ← a throw fails the task after its run
-```
+- Two artifacts connect when their ids are equal.
+- For a prefix and an artifact, the `covers` of the prefix decides.
+- For two prefixes, the `overlaps` of the prefix input decides.
 
-With a store, the build stamps an artifact or a prefix again for each task that declares it. In [step 2](#step-2-a-prefix-for-keys-with-unknown-names), it stamps `pages` for `split` and again for `make-index`. So make `stamp()` fast. Tasks that do not wait for each other can call `stamp()` of one artifact at the same time. A cache in `stamp()` must allow this.
+A throw in `covers` or `overlaps` while a task looks for its producers leaves the task out of the `Result`, and `result.success` stays true. The throw is an unhandled rejection. Bun prints it, and the process exits with code 1 when it ends. A throw in `ctx.produced` or `ctx.deleted` fails the reporting task.
 
-## The store
+A plain-object input counts as an artifact, even when it has `covers`. A plain-object output gets no `produced` event, and the tasks that read it do not wait. Two tasks can declare it, and `ctx.produced` throws for it.
 
-To keep records where no [built-in store](builtins.md#stores) can, such as in Redis, write a class that implements [`Store`](api.md#store). A record is a [`TaskState`](api.md#store) with two maps, `inputStamps` and `outputStamps`. In each map, a key is `artifact <id>` or `prefix <id>`, and its value is a stamp. Only an artifact stamp can be `null`, because the build leaves out a prefix whose stamp is `null`. After step 2, the record of `make-index` is:
+[One task](semantics.md#one-task) gives the order in which the build calls your methods and the store. Two rules follow from it:
 
-```text
-{"inputStamps":{"prefix json:/…/data.json#pages/":"<hash>"},"outputStamps":{"artifact json:/…/data.json#index":"<hash>"}}
-```
+- With a store, the build stamps an artifact or a prefix again for each task that declares it. In [step 2](#step-2-a-prefix-for-keys-with-unknown-names), it stamps `pages` for `split` and again for `make-index`. So make `stamp()` fast.
+- Tasks that do not wait for each other can call `stamp()` of one artifact at the same time. A cache in `stamp()` must allow this.
 
-The build calls the store at these times:
+## A prefix that does not compare id starts
 
-| Method | The build calls it |
-| --- | --- |
-| `get(taskId)` | in skip check 3, after the input stamps ([tree](#how-the-build-uses-your-classes)) |
-| `set(taskId, state)` | after each successful run, unless the build has a [fatal error](semantics.md#fatal-errors) |
-| `delete(taskId)` | when a task [leaves the `Build`](guide.md#layout-rules), not when a task is replaced. The current `run()`, or the next one, waits for it and puts its error in [`result.errors`](guide.md#results-and-failure) |
-| `clear()` | never |
-
-- `get` returns `null` for a task id with no record. Otherwise it returns the keys and values that `set` got, `null` values too.
-- The build can call the store for several tasks at the same time. It can also call `delete` while a `set` for the same id runs. Do the writes in the order of the calls, as [`JsonStore`](../contrib/store/json.ts) does with a promise chain.
+Some prefixes do not compare the start of ids, such as a prefix for rows 100 to 199 of a table. For such a prefix, override `covers` and `overlaps`. Return `true` from `overlaps` when both prefixes can cover one id. An artifact input of any class waits for your prefix output when your `covers` returns true for it. For a prefix input, the build calls `overlaps` of the input, not of the output ([How the build uses your classes](#how-the-build-uses-your-classes)). So a task whose input has the default `overlaps`, such as an `IdPrefix`, waits for your prefix output only when one id starts with the other. To make such a task wait, give it an input of your own prefix class. With an override, n tasks that use such a prefix cost about n² ([Scheduling cost](semantics.md#scheduling-cost)), even when the override keeps the default rule.
 
 ## Checklist
 
@@ -281,8 +251,7 @@ The build calls the store at these times:
 - The `id` is the same in each process. It starts with a fixed text, such as `json:`, that no other kind of value uses. A prefix id starts with the same text as the artifacts that it covers, and ends with a delimiter, such as `/` ([prefixes](guide.md#folders-prefixes)).
 - An artifact's `stamp()` returns the same string for the same value, and a different string when the value changes. It returns `null` only when the value is missing. It throws for every other error.
 - A prefix stamp changes when a task or a person adds, deletes or changes an artifact that the prefix covers. Otherwise, the stamp stays the same. With no artifacts, it is still a string, not `null`. Return `null` only when the prefix cannot tell what it covers.
-- If your prefix does not compare the start of ids, override both `covers` and `overlaps` ([a prefix that does not compare id starts](#a-prefix-that-does-not-compare-id-starts)).
-- `covers` and `overlaps` are fast, give the same result for the same ids, and never throw.
+- `covers` and `overlaps` are fast, give the same result for the same ids, and never throw. Override both only when your prefix does not compare the start of ids, because an override costs more time ([a prefix that does not compare id starts](#a-prefix-that-does-not-compare-id-starts)).
 - A prefix stamp does not include the store's records, such as the `dapat_task_state` table of a `SqliteStore` in the same database. Each `set` changes that table, so each task that uses the prefix runs on every build ([layout rules](guide.md#layout-rules)).
 - Your task code writes each value completely in one operation, so a `stamp()` never reads half a value. For a file, write a temporary file, then rename it. The samples on this page use a plain `Bun.write` to stay short.
 - Tasks that write different keys of one file do not wait for each other. When each write reads the whole file and writes it back, a later write can remove the change of an earlier one. dapat gives no error. Make the writes to one file wait for each other, as [`JsonStore`](../contrib/store/json.ts) does with a promise chain.
@@ -290,4 +259,4 @@ The build calls the store at these times:
 
 ## Next
 
-[Write a matcher](write-a-matcher.md) uses `JsonKey` again: its matcher finds the keys of a JSON file, and [`build.each`](guide.md#buildeach) makes a task for each key.
+[Write a matcher](write-a-matcher.md) makes [`build.each`](guide.md#buildeach) find S3 objects, with a matcher of your own. To keep the records in a database of your own, see [Write a store](builtins.md#write-a-store). To name an output of your type in `build.each`, write an [output template](build-each.md#output-templates) for it.

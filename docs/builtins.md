@@ -1,23 +1,23 @@
 # Built-in artifacts and stores
 
-This page gives the details and edge cases of the artifacts, prefixes and stores that ship with dapat. `FileMatcher` and `FileGroupMatcher` are in [build.each](build-each.md). Read part 1 of the [guide](guide.md) first.
+This page gives the details and edge cases of the artifacts, prefixes and stores that ship with dapat, and the contract for a store of your own. `FileMatcher`, `FileGroupMatcher`, `FileTemplate` and `FolderTemplate` are in [build.each](build-each.md). Read part 1 of the [guide](guide.md) first.
 
 ## Files
 
 `new FileArtifact(path, { stamp })` from `dapat/contrib` is the artifact for one file. The `stamp` option sets the [stamp mode](guide.md#artifacts-and-stamps): `"hash"` (the default) or `"time"`. Any other value makes the constructor throw ([error messages](api.md#error-messages)). `read()` returns the bytes as a `Uint8Array`, and it throws `ENOENT` for a missing file.
 
 - The id is `file:` plus the absolute path. The constructor resolves and normalizes `path` one time, so a later `process.chdir` does not change the id. For example, `new FileArtifact("sub/../dir/")` in `/home/me/project` has the id `file:/home/me/project/dir`.
-- After you move the project folder, each `FileArtifact` and `FilesystemPrefix` in it gets a new id, so each task with an input or an output in the folder runs again ([the skip rule](guide.md#the-store-and-the-skip-rule)). In CI, check out the project at the same path ([Run in CI](recipes.md#run-in-ci)).
+- After you move the project folder, each `FileArtifact` and `FilesystemPrefix` in it gets a new id, so each task with an input or an output in the folder runs again ([the skip rule](guide.md#the-store-and-the-skip-rule)).
 
-When `stamp()` throws, the task fails ([known issue 3](limits.md#known-issues-in-010)).
+When `stamp()` throws, the task fails ([one task](semantics.md#one-task)).
 
 | The path is | `stamp()` |
 | --- | --- |
-| a file | Hash stamp: the SHA-256 hash of the bytes, in hex. Time stamp: `<mtime in ns>:<size>` |
+| a file | its [hash stamp or time stamp](guide.md#artifacts-and-stamps) |
 | a symlink | the stamp of its target |
 | missing (the error `ENOENT`) | `null` |
 | not a regular file, such as a folder or a FIFO | throws `not a file: <path>` |
-| a file with no read permission | With hash stamps: throws `EACCES`, unless the process runs as root. With time stamps: `<mtime in ns>:<size>` |
+| a file with no read permission | With hash stamps: throws `EACCES`, unless the process runs as root. With time stamps: its time stamp |
 | any other error | throws |
 
 ## Hash or time
@@ -54,7 +54,7 @@ A task that has the prefix as an input does not wait for a task that writes in a
 
 ## IdPrefix
 
-`new IdPrefix(id)` from `dapat` is a [prefix](guide.md#folders-prefixes) with only an id and the stamp `null`, so a task that has it as an input or output [never skips](guide.md#the-store-and-the-skip-rule). To let such a task skip, write a `Prefix` subclass that has a `stamp()` ([step 2](write-an-artifact.md#step-2-a-prefix-for-keys-with-unknown-names)).
+An [`IdPrefix`](guide.md#folders-prefixes) has the stamp `null`. To let its task skip, write a `Prefix` subclass that has a `stamp()` ([step 2](write-an-artifact.md#step-2-a-prefix-for-keys-with-unknown-names)).
 
 `new IdPrefix("")` covers every artifact and overlaps every prefix. Use it as an input for a task that must run last: the task waits for every other task that has an output. Use it as an output for a task that must run first: every other task that has an input waits for it. Two tasks wait for each other when both have it as an input and both have an output, or both have it as an output and both have an input. Both fail with `deadlock waiting for inputs of '<id>'` ([error messages](api.md#error-messages)).
 
@@ -110,7 +110,7 @@ dapat has three [stores](guide.md#what-a-build-does):
 | `JsonStore(path)` from `dapat/contrib` | one JSON file: `{"tasks":{"<task id>":<record>}}` | builds with fewer than a thousand tasks |
 | `SqliteStore(db)` from `dapat/contrib` | the SQLite table `dapat_task_state (task_id TEXT PRIMARY KEY, payload TEXT NOT NULL)` | builds with a thousand tasks or more ([Scale](limits.md#scale)) |
 
-Each store has the four methods of [`Store`](api.md#store): `get`, `set`, `delete` and `clear`. `store.clear()` removes all records, also those of tasks that a build no longer adds ([Force a rerun](recipes.md#force-a-rerun)). To write your own store, see [The store](write-an-artifact.md#the-store).
+Each store has the four methods of [`Store`](api.md#store): `get`, `set`, `delete` and `clear`. `store.clear()` removes all records, also those of tasks that a build no longer adds ([Force a rerun](recipes.md#force-a-rerun)). To write your own store, see [Write a store](#write-a-store).
 
 `MemoryStore` keeps the object that `set` gets, and `get` returns it, with no copy. Do not change it.
 
@@ -125,4 +125,26 @@ Each store has the four methods of [`Store`](api.md#store): `get`, `set`, `delet
 `SqliteStore`:
 - `db` is a file path, `":memory:"` (no file), or a `Database` from `bun:sqlite`. For a file path, the constructor makes the parent folder and opens the database. So a later `process.chdir` does not change the file.
 - Each `get`, `set` or `delete` reads or writes one row, with the record as JSON in `payload`.
-- `close()` closes the database only when `db` is a string. After that, each `get`, `set` and `delete` throws `Cannot use a closed database`, so each task fails ([error messages](api.md#error-messages)).
+- `close()` closes the database only when `db` is a string. After that, each `get`, `set` and `delete` throws `Cannot use a closed database`, so each task fails, and `clear` throws `Database has closed` ([error messages](api.md#error-messages)).
+
+## Write a store
+
+To keep records where no built-in store can, such as in Redis, write a class that implements [`Store`](api.md#store). A record is a [`TaskState`](api.md#store) with two maps, `inputStamps` and `outputStamps`. In each map, a key is `artifact <id>` or `prefix <id>`, and its value is a stamp. Only an artifact stamp can be `null`, because the build leaves out a prefix whose stamp is `null`.
+
+For example, a task reads `mem:src` (stamp `a`) and an `IdPrefix`, and it declares the output `mem:out` but does not write it. After its run, `store.set` gets this record:
+
+```text
+{"inputStamps":{"artifact mem:src":"a"},"outputStamps":{"artifact mem:out":null}}
+```
+
+The build calls the store at these times:
+
+| Method | The build calls it |
+| --- | --- |
+| `get(taskId)` | in skip check 3, after the input stamps and check 2 ([one task](semantics.md#one-task)). A throw fails the task, and it does not run |
+| `set(taskId, state)` | after each successful run, unless the build has a [fatal error](semantics.md#fatal-errors) or the run stopped before the call ([stopped run](semantics.md#replacement-and-removal)). A throw fails the task after its run and its `produced` events ([known issue 3](limits.md#known-issues-in-010)) |
+| `delete(taskId)` | when a task [leaves the `Build`](semantics.md#replacement-and-removal), not when a task is replaced. The current `run()`, or the next one, waits for it and puts its error in [`result.errors`](guide.md#results-and-failure) |
+| `clear()` | never |
+
+- `get` returns `null` for a task id with no record. Otherwise it returns the keys and values that `set` got, `null` values too.
+- The build can call the store for several tasks at the same time. It can also call `delete` while a `set` for the same id runs. Do the writes in the order of the calls, as [`JsonStore`](../contrib/store/json.ts) does with a promise chain.

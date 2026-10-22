@@ -2,25 +2,14 @@
 
 This page gives the exact rules of a build: when it calls your code, sends events and applies task changes, and which errors are [fatal](#fatal-errors). Use it when you write an artifact type or a matcher, subclass `Build`, or debug a build. Read the [guide](guide.md) first: this page uses its terms.
 
-## Terms
-
-| Term | Meaning |
-| --- | --- |
-| **step** | A set of task changes (adds, [replacements and removals](guide.md#tasks-and-dependencies)) that the build applies at one time ([Steps](#steps)). An **open step** still collects changes |
-| **drain** | In a drain, the build sends each event of the [queue](#the-event-queue) to every [subscriber](guide.md#events), one at a time, in one or more passes |
-| **pass** | One round of a drain, in which the build sends events until the queue is empty. When no step is open, the pass opens a step and closes it at its end. When that step changes tasks, the events of those changes make the next pass |
-| **wake** | A time when the build makes each waiting task check its [producers](guide.md#what-a-build-does) again ([The order rule](#the-order-rule)) |
-| **send limit** | The `sendLimit` option of `new Build`: a cap on events and passes ([The send limit](#the-send-limit)) |
-| **stopped run** | The run of a task when a change replaces or removes the task after `run` starts and before the task finishes |
-
 ## build.run()
 
 ```text
 build.run()
 ├─ the first call only
 │  ├─ mark the build as started; from now on it sends events
-│  ├─ with matchers: open a step
-│  ├─ queue promised for each output of each task, then drain
+│  ├─ with matchers: open a step (Steps)
+│  ├─ queue promised for each output of each task, then drain (The event queue)
 │  └─ with matchers and no fatal error: start every scan at the same time
 ├─ any call, while the scans run: wait until every scan returns and the step closes, or until a fatal error
 ├─ a fatal error → reject with it; else start each task that has not started (One task)
@@ -37,23 +26,25 @@ Two calls at the same time both reject with the same error, or both resolve with
 ```text
 the build starts a task
 ├─ wait until the current synchronous code ends
-├─ wait for the producers, and check again on each wake
-│  ├─ the task is replaced or removed  → end; it is already cancelled
-│  ├─ the build has a fatal error      → end, with no outcome
-│  ├─ a producer failed                → failed (dependency)
-│  ├─ no producer waits or runs        → go on
-│  └─ no task runs and no waiting task can go on → failed (deadlock)
-├─ with a store: stamp the inputs, then the skip check
-│  ├─ replaced, removed or fatal error → end, as in the wait
-│  ├─ a stamp or store.get throws      → failed with that error
-│  └─ the task can skip                → skipped; its record stays as it was
-├─ run(ctx), then send produced for each exact output that the task did not report
-├─ with a store and no fatal error: stamp the outputs, then store.set(id, record)
-└─ executed
+├─ look for the producers (The order rule)  ← can call covers() and overlaps() (Scheduling cost)
+│  ├─ replaced, removed or fatal error      → end; a replaced or removed task is already cancelled
+│  ├─ a producer failed                     → failed (dependency)
+│  ├─ producers wait or run                 → wait until they end, then look again
+│  ├─ a deadlock                            → look once more: failed (dependency) or failed (deadlock)
+│  └─ none waits or runs                    → go on
+├─ no store                                 → run; no stamp() calls, and the reason is no-store
+├─ stamp() each input, one at a time        ← a throw fails the task, and it does not run
+├─ the skip check (The skip check)          ← store.get, then stamp() of the outputs; a throw fails the task
+│  ├─ replaced, removed or fatal error      → end, as in the wait
+│  └─ every check passes                    → skipped: no produced events, no store.set
+├─ run(ctx)                                 ← ctx.produced(a) and ctx.deleted(a) call covers(a) of the prefix outputs
+├─ send produced for each exact output that the task did not report
+├─ with a store and no fatal error          → stamp() each output, then store.set(id, record); a throw fails the task
+└─ executed, with the reason of the first check that failed
 ```
 
 - When `run` throws, the task fails with that error, even when the error is an `AbortError`. When an output `stamp()` or `store.set` throws, the task fails too ([known issue 3](limits.md#known-issues-in-010)).
-- A [stopped run](#terms) ends as `cancelled`, even when it throws. An error that is not named `AbortError` goes to `result.errors`. The build saves no record unless the stop comes while `store.set` runs.
+- A [stopped run](#replacement-and-removal) ends as `cancelled`, even when it throws. An error that is not named `AbortError` goes to `result.errors`. The build saves no record unless the stop comes while `store.set` runs.
 
 ## The order rule
 
@@ -66,38 +57,37 @@ A task waits until each of its [producers](guide.md#what-a-build-does) has finis
 | prefix `mem:a/b/` | artifact `mem:a/` | no |
 | prefix `mem:out/` or `mem:out/sub/` | prefix `mem:out/` or `mem:out/sub/` | yes |
 
-A [wake](#terms) comes when a task finishes, when a change adds, [replaces or removes](guide.md#tasks-and-dependencies) a task, and on a fatal error. At each wake, a waiting task looks for its producers among the current tasks:
+In a **look**, a task searches the current tasks for its producers. When none of them waits or runs, the task goes on. A failed producer makes it fail with `dependency of '<id>' failed`, where `<id>` is the id of the waiting task.
 
-- A producer that waits or runs makes the task wait for the next wake. A `ctx.produced` call does not end the wait.
-- A producer that is executed or skipped counts as finished. A producer that failed makes the task fail immediately ([One task](#one-task)).
-- When a change replaces or removes a producer, the task stops waiting for it. It waits for a replacement only when the replacement is also a producer.
-- A **deadlock** is a state where no task runs and each waiting task has a producer that also waits. Then each waiting task fails.
+- Else the task waits for the producers that it found. It looks again when all of them have ended, or were replaced or removed. It fails immediately when one of them fails. A `ctx.produced` call does not end the wait.
+- A task finds a producer that is added after its last look only at its next look. So a producer added later that fails makes the task fail only at that look, and not at all when the producer is removed before then.
+- A subscriber can remove a task during the `ctx.produced` or `ctx.deleted` of a running task. Each task that reads an output of the removed task then waits for this reporting task to end. Then it looks again. If the reporting task fails, the reader fails with `dependency of '<id>' failed`. So a reporting task that then waits for such a reader never ends ([known issue 7](limits.md#known-issues-in-010)). After any other removal, the reader stops waiting for the removed task immediately.
+- A **deadlock** is a state where no task runs and each task that has not ended waits for a producer. Then each waiting task looks once more. A task with a failed producer fails with `dependency of '<id>' failed`, and each other one with `deadlock waiting for inputs of '<id>'`. The build does not check for a deadlock while subscribers get the events of a change, because a subscriber can still change the tasks.
 
 | You add the task | The task starts |
 | --- | --- |
 | before the first `run()`, or during the scans of the first `run()` | when the first [`run()`](#buildrun) starts its tasks, after the scans |
 | at any other time, even after `run()` resolves, unless the build has a [fatal error](#fatal-errors) | immediately, with no new `run()` call. The next `run()` waits for it and puts it in its `Result` |
 
-Exception: the first `run()` sends `promised` before its scans. When a subscriber changes the tasks at one of these events, each task that has not started starts during the scans.
+Exception: the first `run()` sends `promised` before its scans. When a subscriber changes the tasks with `build.add` or `build.remove` at one of these events, each task that has not started starts immediately. Such a task looks for its producers before the scans add their tasks, so it can miss them.
 
-A task that starts immediately first checks its producers when the synchronous code that added it ends. So it waits for a producer that the same code adds after it. It can miss a producer that the code adds after an `await`.
+A task that starts immediately first looks for its producers when the synchronous code that added it ends. So it waits for a producer that the same code adds after it. It can miss a producer that the code adds after an `await`.
 
 ## The skip check
 
-This list gives the six [skip checks](guide.md#the-store-and-the-skip-rule) in full, numbered as in the guide. With a store, the build calls `stamp()` one time for each entry in `inputs`, then makes the checks in order. At the first check that fails, the build stops checking and the task runs.
+The [guide](guide.md#the-store-and-the-skip-rule) gives the six skip checks and the reason of each. These are the exact rules:
 
-1. The task has at least one input.
-2. No input is a prefix whose stamp is `null`. An artifact input whose stamp is `null` passes this check, so a missing input file does not, by itself, make the task run.
-3. [`store.get(task id)`](write-an-artifact.md#the-store) returns a record. A record counts as no record when `inputStamps` or `outputStamps` is not an object whose values are strings or `null`.
-4. The input stamps now and in the record have the same keys and values. So the order of the inputs, and an input declared two times, have no effect.
-5. For the next output in declared order, the build calls `stamp()`. The stamp is not `null`.
-6. The stamp equals the value for that output in the record. The build repeats checks 5 and 6 for each output. After the last output, the record has no other output keys.
-
-For example, a task reads `mem:src` (stamp `a`) and an `IdPrefix`. It declares the output `mem:out` but does not write it. After its run, `store.set` gets this record. The `IdPrefix` has no key, because its stamp is `null`:
-
-```text
-{"inputStamps":{"artifact mem:src":"a"},"outputStamps":{"artifact mem:out":null}}
-```
+- With a store, the build calls `stamp()` one time for each entry in `inputs`, in order, before check 1.
+- Check 2 comes before the [`store.get`](builtins.md#write-a-store) of check 3. So a prefix input whose stamp is `null` gives `input-unstamped` also in the first build. An artifact input whose stamp is `null` passes check 2, so a missing input file does not, by itself, make the task run.
+- Check 3: a record counts as no record when `inputStamps` or `outputStamps` is not an object whose values are strings or `null`.
+- Check 4 compares the input ids first (`input-ids-changed`), then the stamp of each input in declared order (`input-changed`, with the first input that differs). So the order of the inputs, and an input declared two times, do not change the decision.
+- Checks 5 and 6 go output by output, in declared order. The build stamps the output. The first of these cases that holds gives the reason:
+  1. A prefix has the stamp `null`: `output-unstamped`.
+  2. The record has no key for the output: `output-ids-changed`. So a new output that does not exist yet gives this reason.
+  3. An artifact has the stamp `null`: `output-missing`.
+  4. The stamp differs from the record: `output-changed`.
+- After the last output, a record with more output keys gives `output-ids-changed`.
+- The `id` of a reason is the id of the input or output, not its record key (`artifact <id>`).
 
 ## Events
 
@@ -105,11 +95,11 @@ The [guide](guide.md#events) tells when the build sends each kind of event. For 
 
 - `promised`: an output of a replacement is new when no output of the old task has its kind (artifact or prefix) and id. So a new object with the same kind and id gets no `promised`.
 - `withdrawn`: a prefix output gets one event, not one for each artifact under it. The build sends each `withdrawn` when the change applies, not when the old run ends.
-- `produced`: after `run` returns, the build sends its [`produced` events](guide.md#events) in declared order, each in a [drain](#terms) of its own. So a subscriber can replace or remove the task between two of these events, and then the build sends no more of them. The task finishes only after these events. So when a subscriber adds a task that reads one of these outputs, the new task waits for this task. No event takes back a `produced` that a failed task sent.
+- `produced`: after `run` returns, the build sends its [`produced` events](guide.md#events) in declared order, each in a [drain](#the-event-queue) of its own. So a subscriber can replace or remove the task between two of these events, and then the build sends no more of them. The task finishes only after these events. So when a subscriber adds a task that reads one of these outputs, the new task waits for this task. No event takes back a `produced` that a failed task sent.
 
 ## The event queue
 
-Each subscriber gets each event that the build sends after it subscribes. All subscribers get the events in one order. Each build has one first-in, first-out queue of events. `build.add`, `build.remove`, `ctx.add` and `ctx.remove` change the tasks first. Then they put the events of the change at the end of the queue. `ctx.produced` and `ctx.deleted` put one event there. Each of these calls starts a [drain](#terms) if none is in progress. When a listener on `ctx.signal` changes tasks, the events of its change come after the events of the change that aborted the signal. In this trace, subscribers S1 and S2 subscribed in that order, and S1 replaces task `t` so that `t` declares `y` instead of `x`:
+Each [subscriber](guide.md#events) gets each event that the build sends after it subscribes. All subscribers get the events in one order. Each build has one first-in, first-out queue of events. `build.add` and `build.remove` change the tasks first. Then they put the events of the change at the end of the queue. `ctx.produced` and `ctx.deleted` put one event there. Each of these calls then starts a **drain** if none is in progress. A drain sends each event of the queue to every subscriber, one at a time, in one or more **passes**. A pass sends events until the queue is empty. When a listener on `ctx.signal` changes tasks, the events of its change come after the events of the change that aborted the signal. In this trace, subscribers S1 and S2 subscribed in that order, and S1 replaces task `t` so that `t` declares `y` instead of `x`:
 
 ```text
 S1 gets promised x by t  → S1 replaces t; queue: withdrawn x, promised y
@@ -122,21 +112,23 @@ S2 gets promised y by t
 
 ## Steps
 
-An open [step](#terms) lets `build.each` change the tasks of many [joined sets](guide.md#buildeach) together. When the step closes, the build checks the two **step rules** on the tasks as they are after the whole step. Only one joined set, or `build.add`, gives each task id. No [exact output](guide.md#tasks-and-dependencies) has two declarations ([error messages](api.md#error-messages)). A broken rule is then a [fatal error](#fatal-errors).
+A **step** is a set of task changes ([adds, replacements and removals](guide.md#tasks-and-dependencies)) that the build applies at one time. An **open step** still collects changes. An open step lets `build.each` change the tasks of many [joined sets](guide.md#buildeach) together. When the step closes, the build checks the two **step rules** on the tasks as they are after the whole step. Only one joined set, or `build.add`, gives each task id. No [exact output](guide.md#tasks-and-dependencies) has two declarations ([error messages](api.md#error-messages)). A broken rule is then a [fatal error](#fatal-errors).
 
 | A step is open during | It closes |
 | --- | --- |
 | the first `run()` of a build with `build.each`, from its start | when every scan has returned |
 | each pass of a drain, when no other step is open | at the end of the pass |
-| a found or gone that a matcher sends when no step is open, for example from a file watcher | when `build.each` has handled it, and each found or gone sent while it handled it |
+| a `found` or `gone` event that a matcher sends when no step is open, for example from a file watcher | when `build.each` has handled it, and each `found` and `gone` event sent while it handled it |
+
+When the step of a pass changes tasks, the events of those changes make the next pass.
 
 - When a joined set changes two times in one step, the later change replaces the earlier one. So a joined set that the scans make and then remove adds no task.
-- `build.add`, `build.remove`, `ctx.add` and `ctx.remove` never join an open step. Each call is a step of its own, so it throws and changes nothing when it breaks a rule. It checks the rules against the tasks that the build has now, not against the changes of the open step. A clash with those changes is a fatal error when the step closes.
+- `build.add` and `build.remove` never join an open step. Each call is a step of its own, so it throws and changes nothing when it breaks a rule. It checks the rules against the tasks that the build has now, not against the changes of the open step. A clash with those changes is a fatal error when the step closes.
 - In one step, an output can move from one task to another, and a task id from one joined set to another. A moved task id is a [replacement](#replacement-and-removal), so it keeps its store record. Every `withdrawn` of the step comes before any `promised`, so a moved output gives `withdrawn x by a`, then `promised x by b`.
 
 ## The send limit
 
-The [send limit](#terms) stops a subscriber or a `build.each` that adds tasks with no end. The default is `SEND_LIMIT`, which is 10,000. When a count would go over the limit, `run()` rejects with a [fatal error](#fatal-errors) whose message starts with `send limit:` ([error messages](api.md#error-messages)):
+The **send limit**, the `sendLimit` option of `new Build`, stops a subscriber or a `build.each` that adds tasks with no end. The default is `SEND_LIMIT`, which is 10,000. When a count would go over the limit, `run()` rejects with a [fatal error](#fatal-errors) whose message starts with `send limit:` ([error messages](api.md#error-messages)):
 
 | Count | The build fails when | A usual cause |
 | --- | --- | --- |
@@ -151,17 +143,20 @@ The send limit does not stop a [loop](build-each.md#loops) whose task declares t
 
 - A subscriber, such as a matcher's [`receiveArtifactEvent`](write-a-matcher.md#what-you-write), throws or returns a promise.
 - One of the two counts of the [send limit](#the-send-limit) would go over it.
-- A scan throws, [`tasks()`](build-each.md#the-config) throws or returns no iterable, or a matcher sends vars whose names are not exactly its [`varNames`](write-a-matcher.md#what-you-write).
+- A scan throws.
+- [`tasks()`](build-each.md#the-config) throws or returns no iterable.
+- The `expand` of an [output template](build-each.md#output-templates) throws.
+- A matcher sends vars whose names are not exactly its [`varNames`](write-a-matcher.md#what-you-write).
 - An [open step](#steps) breaks a step rule when it closes.
 
-The build keeps the first fatal error and ignores later ones. It clears the event queue and drops the changes of the open step. It aborts the `signal` of each `scan` with the fatal error, and the `ctx.signal` of each running task with an `AbortError`. The build then starts no task and no `store.set`. A `store.set` that already runs still writes its record. The build sends no later event, and `build.each` handles no later found or gone.
+The build keeps the first fatal error and ignores later ones. It clears the event queue and drops the changes of the open step. It aborts the `signal` of each `scan` with the fatal error, and the `ctx.signal` of each running task with an `AbortError`. The build then starts no task and no `store.set`. A `store.set` that already runs still writes its record. The build sends no later event, and `build.each` handles no later `found` or `gone` event.
 
 - The call whose events led to the error, such as `ctx.produced` or `build.add`, does not throw. Its change stays. A later `build.add` throws only when it breaks a [step rule](#steps), as before the error.
-- A `run()` in progress rejects with the error after each running task returns. Each `run()` called after the error rejects immediately with the same `Error` object.
+- A `run()` in progress rejects with the error after each running task returns. Exception: a fatal error during the scans of the first `run()` makes each `run()` in progress reject immediately. Each `run()` called after the error rejects immediately with the same `Error` object.
 
 ## Replacement and removal
 
-`build.add`, `build.remove`, `ctx.add`, `ctx.remove`, `build.each` and [`setTasksOfGroups`](#subclass-build-settasksofgroups) can [replace or remove](guide.md#tasks-and-dependencies) a task. This table gives what happens to the old task:
+`build.add`, `build.remove`, `build.each` and [`setTasksOfGroups`](#subclass-build-settasksofgroups) can [replace or remove](guide.md#tasks-and-dependencies) a task. A **stopped run** is the run of a task that a change replaces or removes after `run` starts and before the task finishes. This table gives what happens to the old task:
 
 | The old task | Replace | Remove |
 | --- | --- | --- |
@@ -169,10 +164,10 @@ The build keeps the first fatal error and ignores later ones. It clears the even
 | `run` has started, and the task has not finished | `ctx.signal` aborts. The build cancels the task after `run` returns, even when `run` succeeds | `ctx.signal` aborts. The build cancels the task immediately, and `build.run()` waits until `run` returns |
 | The task has finished | Its outcome stays | Its outcome stays |
 
-- `ctx.signal` aborts with an `AbortError`. [One task](#one-task) tells what happens when a [stopped run](#terms) throws.
+- `ctx.signal` aborts with an `AbortError`. [One task](#one-task) tells what happens when a stopped run throws.
 - In each row, a removal deletes the task's store record with `store.delete`. An error from `store.delete` goes to `result.errors`. A replacement keeps the record.
-- After the stop, `ctx.produced` and `ctx.deleted` of the old run do nothing. [Known issues 1 and 2](limits.md#known-issues-in-010) tell what the old run can still change.
-- The same `Task` object, added again after it finished, waits, skips or runs as a new task does. The `Result` lists it one time, with its last outcome.
+- After the stop, `ctx.produced` and `ctx.deleted` of the old run do nothing. [Known issue 1](limits.md#known-issues-in-010) tells what the old run can still change.
+- The same `Task` object, added again after it finished, waits, skips or runs as a new task does. The `Result` lists it one time, with its last outcome, at the place of its first finish.
 
 ## build.each internals
 
@@ -180,18 +175,17 @@ The artifact ids of a match are the `id` of its data, or the ids of its list, in
 
 | The matcher sends | `build.each` |
 | --- | --- |
-| found from a required matcher, with var values that no current match has | keeps the match, joins it, and calls `tasks()` for each new joined set |
-| found with the var values of a current match and other artifact ids | replaces the match. For each set that holds it, calls `tasks()` again and replaces the set's tasks. The set stays |
-| found with the var values and artifact ids of a current match, or gone with var values that no current match has | does nothing, even when the found data is a new object |
-| gone from a required matcher, with the var values of a current match | removes each set that holds the match, with its tasks |
+| a `found` event from a required matcher, with var values that no current match has | keeps the match, joins it, and makes the tasks of each new joined set: `tasks()`, or the one task of `run` |
+| a `found` event with the var values of a current match and other artifact ids | replaces the match. For each set that holds it, makes its tasks again and replaces them. The set stays |
+| a `found` event with the var values and artifact ids of a current match, or a `gone` event with var values that no current match has | does nothing, even when the data of the `found` event is a new object |
+| a `gone` event from a required matcher, with the var values of a current match | removes each set that holds the match, with its tasks |
 
-- An [optional matcher](build-each.md#required) can send a found with new var values, or a gone of a current match. Then `build.each` takes each set of required matches with the same values for the vars that the optional matcher shares with the required matchers. It joins the optional matchers to each of these sets again. It calls `tasks()` for each new or changed joined set and removes each old one that it does not make again. So when the last review of a page is gone, the set with no review comes back.
-- A found or gone that comes while `build.each` handles another one, for example from `tasks()` or a subscriber, waits until that one ends.
-- In the [label](build-each.md#the-config) of a joined set, the number counts the `build.each` calls of the `Build` that did not throw, from 1. The vars come in `matchersByName` order, then in `varNames` order.
+- An [optional matcher](build-each.md#required) can send a `found` event with new var values, or a `gone` event of a current match. Then `build.each` takes each set of required matches with the same values for the vars that the optional matcher shares with the required matchers. It joins the optional matchers to each of these sets again. It makes the tasks of each new or changed joined set and removes each old one that it does not make again. So when the last review of a page is gone, the set with no review comes back.
+- A `found` or `gone` event that comes while `build.each` handles another one, for example from `tasks()` or a subscriber, waits until that one ends.
 
 ## Subclass Build: setTasksOfGroups
 
-A **task group** is a set of task ids that one call can replace as a whole. `build.each` makes one group for each [joined set](guide.md#buildeach), and `build.add` puts each id in a group of its own. Each task id is in one group. A **`TaskGroup`** object, `new TaskGroup(label)`, stands for one group. Two objects with the same label are two groups. In a subclass of `Build`, the protected method **`setTasksOfGroups(changes)`** takes `GroupTasks` objects, `{ group, tasks }`. It makes each `tasks` the whole task list of its group. The changes join the open [step](#terms). With no open step, the call is a step of its own.
+A **task group** is a set of task ids that one call can replace as a whole. `build.each` makes one group for each [joined set](guide.md#buildeach), and `build.add` puts each id in a group of its own. Each task id is in one group. A **`TaskGroup`** object, `new TaskGroup(label)`, stands for one group. Two objects with the same label are two groups. In a subclass of `Build`, the protected method **`setTasksOfGroups(changes)`** takes `GroupTasks` objects, `{ group, tasks }`. It makes each `tasks` the whole task list of its group. The changes join the open [step](#steps). With no open step, the call is a step of its own.
 
 ```ts
 import { Build, MemoryStore, Task, TaskGroup } from "dapat"
@@ -242,4 +236,7 @@ record of page:b: null
 
 ## Scheduling cost
 
-At each [wake](#terms), the build goes through every task to start the ones that have not started. To find the producers of an artifact input, each waiting task goes through every prefix output. For a prefix input, it goes through every output. When no task runs and a waiting task still has an unfinished producer, the build goes through every task to look for a [deadlock](#the-order-rule). A build with more tasks has more wakes, and each wake costs more. So the time grows faster than the number of tasks ([Scale](limits.md#scale) gives the times).
+The build keeps an index of the output ids of all tasks. For each input, a look for producers costs the length of its id plus the outputs that it finds, not the number of tasks. A task looks when it starts, and again each time all the producers that it waits for have ended. The deadlock check costs the same at any size, and a change starts only its new tasks. So dapat's own time grows about as the number of tasks ([Scale](limits.md#scale)). Two cases cost about n²:
+
+- A prefix class that overrides `covers()` or `overlaps()`. As an input, each look checks every output of the build. As an output that overrides `covers()`, each look of each artifact input checks it.
+- A prefix input whose producers come one at a time. Each look lists the outputs under the prefix to find the next producer.
