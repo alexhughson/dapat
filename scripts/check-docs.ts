@@ -2,6 +2,9 @@
 //   bun scripts/check-docs.ts [file.md ...]
 // A block that follows a line `<!-- no-run -->` is skipped (signatures and shapes).
 // A ```text block that follows a line `<!-- output -->` must equal the stdout of the ts block before it.
+// A ts block that follows a line `<!-- file: name.ts -->` does not run. It is saved as name.ts next to
+// each later program on the same page, so those programs can import it.
+// A bold term is a definition, so each one may appear in bold only once in all the docs.
 // Each relative link must name a file that exists, and each #anchor a heading in that file.
 // Each program runs in a fresh folder under .doccheck/<pid>/, so it can write files with relative paths,
 // `import ... from "dapat"` resolves to this checkout, and two checks can run at the same time.
@@ -20,6 +23,12 @@ type Sample = {
   block: Block
   expectedOutput: string | undefined
   dir: string
+  modules: Module[]
+}
+
+type Module = {
+  name: string
+  code: string
 }
 
 const root = path.resolve(import.meta.dir, "..")
@@ -47,7 +56,7 @@ function readBlocks(file: string, text: string): Block[] {
   let index = 0
   while (index < lines.length) {
     const line = lines[index]!
-    const comment = line.match(/^<!--\s*(no-run|output)\s*-->$/)
+    const comment = line.match(/^<!--\s*(no-run|output|file:\s*[\w.-]+\.ts)\s*-->$/)
     if (comment) {
       directive = comment[1]
       index++
@@ -84,6 +93,7 @@ function readBlocks(file: string, text: string): Block[] {
 
 function samplesOf(blocks: Block[]): { samples: Sample[]; skipped: number } {
   const samples: Sample[] = []
+  const modules: Module[] = []
   let skipped = 0
   for (const block of blocks) {
     if (block.directive === "output") {
@@ -104,8 +114,14 @@ function samplesOf(blocks: Block[]): { samples: Sample[]; skipped: number } {
       skipped++
       continue
     }
+    if (block.directive !== undefined && block.directive.startsWith("file:")) {
+      const moduleName = block.directive.slice("file:".length).trim()
+      modules.push({ name: moduleName, code: block.code })
+      continue
+    }
     const name = `${path.relative(root, block.file).replaceAll(/[^\w]+/g, "-")}-${block.line}`
-    samples.push({ block, expectedOutput: undefined, dir: path.join(checkRoot, name) })
+    const earlierModules = [...modules]
+    samples.push({ block, expectedOutput: undefined, dir: path.join(checkRoot, name), modules: earlierModules })
   }
   return { samples, skipped }
 }
@@ -113,6 +129,9 @@ function samplesOf(blocks: Block[]): { samples: Sample[]; skipped: number } {
 async function runSample(sample: Sample): Promise<string | undefined> {
   mkdirSync(sample.dir, { recursive: true })
   writeFileSync(path.join(sample.dir, "main.ts"), sample.block.code)
+  for (const module of sample.modules) {
+    writeFileSync(path.join(sample.dir, module.name), module.code)
+  }
   const proc = Bun.spawn(["bun", "main.ts"], { cwd: sample.dir, stdout: "pipe", stderr: "pipe" })
   const timer = setTimeout(() => proc.kill(), 30_000)
   const stdout = await new Response(proc.stdout).text()
@@ -131,7 +150,7 @@ async function runSample(sample: Sample): Promise<string | undefined> {
 async function typeCheck(samples: Sample[]): Promise<string | undefined> {
   const config = {
     extends: path.join(root, "tsconfig.json"),
-    include: samples.map((sample) => path.join(sample.dir, "main.ts")),
+    include: samples.map((sample) => path.join(sample.dir, "*.ts")),
   }
   const configPath = path.join(checkRoot, "tsconfig.json")
   writeFileSync(configPath, JSON.stringify(config, null, 2))
@@ -208,8 +227,31 @@ async function linkErrors(file: string, text: string): Promise<string[]> {
   return errors
 }
 
+function boldTerms(file: string, text: string): Map<string, string[]> {
+  const terms = new Map<string, string[]>()
+  const lines = text.split("\n")
+  let inFence = false
+  for (const [index, line] of lines.entries()) {
+    if (line.startsWith("```")) {
+      inFence = !inFence
+      continue
+    }
+    if (inFence) {
+      continue
+    }
+    for (const match of line.matchAll(/\*\*([^*]+)\*\*/g)) {
+      const term = match[1]!.trim().toLowerCase().replaceAll("`", "")
+      const places = terms.get(term) ?? []
+      places.push(`${path.relative(root, file)}:${index + 1}`)
+      terms.set(term, places)
+    }
+  }
+  return terms
+}
+
 rmSync(checkRoot, { recursive: true, force: true })
 let failures = 0
+const boldPlaces = new Map<string, string[]>()
 const samples: Sample[] = []
 let skipped = 0
 for (const file of docFiles()) {
@@ -220,6 +262,17 @@ for (const file of docFiles()) {
   for (const error of await linkErrors(file, text)) {
     failures++
     console.log(`FAIL ${error}`)
+  }
+  for (const [term, places] of boldTerms(file, text)) {
+    const all = boldPlaces.get(term) ?? []
+    all.push(...places)
+    boldPlaces.set(term, all)
+  }
+}
+for (const [term, places] of boldPlaces) {
+  if (places.length > 1) {
+    failures++
+    console.log(`FAIL bold term "${term}" is defined more than once: ${places.join(", ")}`)
   }
 }
 
