@@ -44,7 +44,7 @@ const linesPerPage = Number(linesArgument ?? "2")
 if (!Number.isInteger(linesPerPage) || linesPerPage < 1) {
   exitWithUsage(`lines per page must be a whole number of 1 or more, not '${linesArgument}'`)
 }
-const IMAGE_MODEL = "google/gemini-2.5-flash-image"
+const IMAGE_MODEL = "google/gemini-nano-banana-2.1"
 const apiKey = process.env.OPENROUTER_API_KEY
 if (apiKey === undefined || apiKey.length === 0) {
   exitWithUsage("set OPENROUTER_API_KEY to an OpenRouter API key")
