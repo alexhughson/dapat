@@ -25,3 +25,6 @@ Thumbs.db
 
 # TypeScript
 node_modules/
+
+# Doc sample checker
+.doccheck/
