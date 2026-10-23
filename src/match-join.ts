@@ -175,19 +175,20 @@ export type JoinedMembers = {
 }
 
 /**
- * For each matcher, the join steps that start from one of its matches, in an order where
- * each step shares a var name with an earlier one. Adds the index that each step needs.
- * `tables` are the required matchers. Throws if they do not form one connected group by shared var names.
+ * For each matcher, the join steps that start from one of its matches. Adds the index that each step needs.
+ * `tables` are the required matchers. A step that shares a var name with an earlier step comes first, so the
+ * lookup uses an index of those vars. A matcher that shares no var name with the earlier steps, such as a
+ * matcher with no vars, comes next with no lookup vars: its lookup gives each of its matches, so it joins
+ * as a cross product. Then the steps that share a var with it, and so on.
  */
-export function planJoins(tables: readonly MatchTable[], eachNumber: number): Map<string, JoinStep[]> {
+export function planJoins(tables: readonly MatchTable[]): Map<string, JoinStep[]> {
   const stepsByName = new Map<string, JoinStep[]>()
   for (const start of tables) {
     const steps: JoinStep[] = []
     const placedNames = new Set<string>([start.name])
     const boundVarNames = new Set<string>(start.varNames)
-    let placedOne = true
-    while (placedOne) {
-      placedOne = false
+    while (placedNames.size < tables.length) {
+      let placedOne = false
       for (const table of tables) {
         if (placedNames.has(table.name)) continue
         const lookupVarNames: string[] = []
@@ -203,17 +204,18 @@ export function planJoins(tables: readonly MatchTable[], eachNumber: number): Ma
         }
         placedOne = true
       }
-    }
-    const unplacedNames: string[] = []
-    for (const table of tables) {
-      if (!placedNames.has(table.name)) unplacedNames.push(`'${table.name}'`)
-    }
-    if (unplacedNames.length > 0) {
-      throw new Error(
-        `build.each ${eachNumber}: the required matchers [${unplacedNames.join(", ")}] share no var name with required matcher ` +
-          `'${start.name}' or its required partners; each required matcher must share a var name with another required matcher, ` +
-          `and a matcher that is not required does not connect them`,
-      )
+      if (placedOne) continue
+      // No table left shares a var with the placed ones. The first one joins as a cross product.
+      for (const table of tables) {
+        if (placedNames.has(table.name)) continue
+        table.addIndex([])
+        steps.push({ table, lookupVarNames: [] })
+        placedNames.add(table.name)
+        for (const varName of table.varNames) {
+          boundVarNames.add(varName)
+        }
+        break
+      }
     }
     stepsByName.set(start.name, steps)
   }

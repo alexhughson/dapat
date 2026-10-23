@@ -8,9 +8,13 @@
     "./contrib": "./contrib/index.ts"
   },
   "scripts": {
-    "test": "bun test"
+    "test": "bun test",
+    "docs:check": "bun scripts/check-docs.ts"
   },
   "devDependencies": {
     "@types/bun": "latest"
+  },
+  "dependencies": {
+    "pdf-lib": "^1.17.1"
   }
 }

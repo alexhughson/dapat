@@ -661,17 +661,11 @@ describe("build.each errors", () => {
     )
   })
 
-  test("build.each needs a matcher, and its matchers must share var names", () => {
+  test("build.each needs a matcher", () => {
     const build = new Build()
     expect(() => build.each({ matchersByName: {}, *tasks() {} })).toThrow(
       "build.each 1 has no matcher; build.each needs at least one matcher",
     )
-    expect(() =>
-      build.each({
-        matchersByName: { a: new MemMatcher("a:"), b: new EventMatcher<Mem>(["slug"], []) },
-        *tasks() {},
-      }),
-    ).toThrow("build.each 1: the required matchers ['b'] share no var name with required matcher 'a' or its required partners")
   })
 
   test("build.each after run() throws", async () => {
