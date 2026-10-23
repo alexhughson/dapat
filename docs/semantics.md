@@ -46,14 +46,14 @@ the build starts a task
 
 ## The order rule
 
-A task waits until each of its [producers](guide.md#what-a-build-does) has finished. For an artifact input, the producers are the task with an exact output of the same id and each task with a [prefix](guide.md#folders-prefixes) output that covers the input. For a prefix input, they are each task with an exact output that the input covers and each task with a prefix output that the input overlaps. A task is never its own producer. With the default `covers` and `overlaps`, as in `IdPrefix`:
+A task waits until each of its [producers](guide.md#what-a-build-does) has finished. A task is never its own producer. This table gives, for each kind of input and output, when another task is a producer. Its examples use the default [`covers` and `overlaps`](guide.md#folders-prefixes), as in `IdPrefix`:
 
-| Input of the task | Output of another task | The task waits |
-| --- | --- | --- |
-| artifact `mem:out/a` | prefix `mem:out/` | yes |
-| artifact `mem:p` | prefix `mem:p/` | no |
-| prefix `mem:a/b/` | artifact `mem:a/` | no |
-| prefix `mem:out/` or `mem:out/sub/` | prefix `mem:out/` or `mem:out/sub/` | yes |
+| Input of the task | Output of another task | The other task is a producer when | Example |
+| --- | --- | --- | --- |
+| artifact | artifact | the two ids are equal | `mem:a` waits for `mem:a`, but `mem:a/b` does not wait for `mem:a` |
+| artifact | prefix | `output.covers(input)` returns true | `mem:out/a` waits for `mem:out/`, but `mem:p` does not wait for `mem:p/` |
+| prefix | artifact | `input.covers(output)` returns true | `mem:a/b/` does not wait for `mem:a/` |
+| prefix | prefix | `input.overlaps(output)` returns true | `mem:out/` waits for `mem:out/sub/`, and the other way around |
 
 A task looks for its producers among the current tasks. When a producer has failed, the task fails with `dependency of '<id>' failed`, where `<id>` is the id of the waiting task. When no producer waits or runs, the task goes on. Else the task waits for the producers that it found: when one of them fails, it fails immediately, and when all of them have finished, or were replaced or removed, it looks for its producers again. A producer's `ctx.produced` call does not end the wait.
 
@@ -164,7 +164,7 @@ S2 gets promised y by t
 
 ## Steps
 
-A **step** is a set of task changes ([adds, replacements and removals](guide.md#tasks-and-dependencies)) that the build applies at one time. An **open step** still collects changes, so that `build.each` can change the tasks of many [joined sets](guide.md#buildeach) together. When the step closes, the build checks the two **step rules** against the tasks as they are after the whole step: each task id comes from one source only, one joined set or `build.add`, and no exact output is declared twice ([error messages](api.md#error-messages)). A broken rule is then a [fatal error](#fatal-errors).
+A **step** is a set of task changes ([adds, replacements and removals](guide.md#results-and-failure)) that the build applies at one time. An **open step** still collects changes, so that `build.each` can change the tasks of many [joined sets](guide.md#buildeach) together. When the step closes, the build checks the two **step rules** against the tasks as they are after the whole step: each task id comes from one source only, one joined set or `build.add`, and no exact output is declared twice ([error messages](api.md#error-messages)). A broken rule is then a [fatal error](#fatal-errors).
 
 | A step is open during | It closes |
 | --- | --- |
@@ -208,7 +208,7 @@ The `Build` keeps the first fatal error and ignores later ones. It clears the ev
 
 ## Replacement and removal
 
-`build.add`, `build.remove`, `build.each` and [`setTasksOfGroups`](#subclass-build-settasksofgroups) can [replace or remove](guide.md#tasks-and-dependencies) a task. A **stopped run** is the run of a task that a change replaces or removes after `run` starts and before the task finishes. This table gives what happens to the old task:
+`build.add`, `build.remove`, `build.each` and [`setTasksOfGroups`](#subclass-build-settasksofgroups) can [replace or remove](guide.md#results-and-failure) a task. A **stopped run** is the run of a task that a change replaces or removes after `run` starts and before the task finishes. This table gives what happens to the old task:
 
 | The old task | Replace | Remove |
 | --- | --- | --- |

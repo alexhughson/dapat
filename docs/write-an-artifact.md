@@ -1,6 +1,6 @@
 # Write an artifact type
 
-An **artifact type** is a class that extends `Artifact`. Write one when tasks read or write a value that dapat has no class for, such as a database row. On this page you write `JsonKey` for one key of a JSON file, and the `Prefix` class `JsonKeyPrefix` for the keys under `pages/`. Read part 1 of the [guide](guide.md) first.
+An **artifact type** is a class that extends `Artifact`. Write one when tasks read or write a value that dapat has no class for, such as a database row. On this page you write `JsonKey` for one key of a JSON file, the `Prefix` class `JsonKeyPrefix` for the keys under `pages/`, and the output template `JsonKeyTemplate`. Read part 1 of the [guide](guide.md) first, and [part 2](guide.md#buildeach) before step 3.
 
 ## What you write
 
@@ -8,6 +8,7 @@ An **artifact type** is a class that extends `Artifact`. Write one when tasks re
 - Extend [`Prefix`](guide.md#folders-prefixes) for a group of artifacts: give it an `id` and a `stamp()`.
 - Extend the class, not a plain object. The build tests each output with `instanceof`, so no task waits for a plain object, and `ctx.produced` throws for it.
 - Only `stamp()` decides a skip. `Prefix` also has the methods `covers(artifact)` and `overlaps(other)`, whose defaults compare the start of the ids. They decide the order of the tasks and which reports a task can make ([How the build uses your classes](#how-the-build-uses-your-classes)).
+- Implement [`ArtifactTemplate`](api.md#artifacttemplate) to name an output of your type in [`build.each`](guide.md#buildeach): give it `varNames` and an `expand(vars)` that returns an object of your class.
 
 ## Step 1: one key of a JSON file
 
@@ -171,18 +172,55 @@ In build 1, `index` lists both page keys, although the program adds `make-index`
 
 This `split` does not delete the page keys of an old, longer book. To delete them, delete each old key and report it with `ctx.deleted`, as `split` does in [Outputs with unknown names](guide.md#outputs-with-unknown-names).
 
+## Step 3: an output template
+
+An [output template](build-each.md#output-templates) names an output with the vars of a joined set of [`build.each`](guide.md#buildeach). `JsonKeyTemplate` takes a key pattern, such as `titles/<lang>/<slug>`: `varNames` lists its vars, and `expand` fills them in. `build.each` does not check the var values, so `expand` throws for a value with `/`. Without this check, the values `a/b` and `c` would give the same key as `a` and `b/c`. A throw makes `run()` reject. Each page gets its own task, and these tasks do not wait for each other. So with more than one page, make the writes of `writeKey` wait for each other ([checklist](#checklist)).
+
+```ts
+import { Build, type ArtifactTemplate, type Vars } from "dapat"
+import { FileMatcher } from "dapat/contrib"
+import { JsonKey, writeKey } from "./json-key"
+
+class JsonKeyTemplate implements ArtifactTemplate<JsonKey<string>> {
+  readonly varNames: string[]
+  constructor(readonly file: string, readonly keyPattern: string) {
+    this.varNames = [...keyPattern.matchAll(/<(\w+)>/g)].map((match) => match[1])
+  }
+  expand(vars: Vars) {
+    const bad = this.varNames.find((name) => vars[name].includes("/"))
+    if (bad !== undefined) throw new Error(`JsonKeyTemplate: the value of <${bad}> holds a /`)
+    return new JsonKey<string>(this.file, this.keyPattern.replaceAll(/<(\w+)>/g, (_, name) => vars[name]))
+  }
+}
+
+await Bun.write("content/en/hello.md", "Hello World")
+const build = new Build()
+build.each({
+  matchersByName: { page: new FileMatcher("content/<lang>/<slug>.md") },
+  outputsByName: { title: new JsonKeyTemplate("data.json", "titles/<lang>/<slug>") },
+  name: "title",
+  async run({ matched, outputs }) {
+    await writeKey("data.json", outputs.title.key, await Bun.file(matched.page.data.path).text())
+  },
+})
+await build.run()
+console.log(await Bun.file("data.json").text())
+```
+
+<!-- output -->
+```text
+{"titles/en/hello":"Hello World"}
+```
+
 ## How the build uses your classes
 
-The build connects outputs to inputs to find the [producers](guide.md#what-a-build-does) of a task. It also connects each `ctx.produced` and `ctx.deleted` to the outputs of the task. [One task](semantics.md#one-task) gives the order of these calls.
+The build connects outputs to inputs to find the [producers](guide.md#what-a-build-does) of a task. [The order rule](semantics.md#the-order-rule) gives the method that decides for each kind of input and output. The build also connects each `ctx.produced(a)` and `ctx.deleted(a)` to an exact output of the task with the id of `a`, or to a prefix output whose `covers(a)` returns true. [One task](semantics.md#one-task) gives the order of these calls.
 
-- Two artifacts connect when their ids are equal.
-- For a prefix and an artifact, the `covers` of the prefix decides.
-- For two prefixes, the `overlaps` of the prefix input decides.
 - `covers` and `overlaps` get the artifacts and prefixes of every task, of any class. Make them fast, give the same result for the same ids, and check the class before you read a field that only your class has.
 - A throw in `covers` or `overlaps` while a task looks for its producers leaves the task out of the `Result`, and `result.success` stays true. The throw is an unhandled rejection. Bun prints it, and the process exits with code 1 when it ends. A throw in `ctx.produced` or `ctx.deleted` fails the reporting task.
 - The build calls no `exists`, `delete` or `list` method. A subclass can add one, as `FilesystemPrefix` adds `list()`. To delete a value, your task deletes it, then reports it with `ctx.deleted`.
 
-Some prefixes do not compare the start of ids, such as a prefix for rows 100 to 199 of a table. For such a prefix, override `covers` and `overlaps`. Return `true` from `overlaps` when both prefixes can cover one id. An artifact input of any class waits for your prefix output when your `covers` returns true for it. A task whose prefix input has the default `overlaps`, such as an `IdPrefix`, waits for your prefix output only when one id starts with the other. To make such a task wait, give it an input of your own prefix class. With an override, n tasks that use such a prefix cost about n² ([Scheduling cost](semantics.md#scheduling-cost)), even when the override keeps the default rule.
+Some prefixes do not compare the start of ids, such as a prefix for rows 100 to 199 of a table. For such a prefix, override `covers` and `overlaps`. Return `true` from `overlaps` when both prefixes can cover one id. For a task with an `IdPrefix` input, the build never calls your `overlaps` ([the order rule](semantics.md#the-order-rule)), so the task waits for your prefix output only when one id starts with the other. To make it wait, give it an input of your own prefix class. With an override, n tasks that use such a prefix cost about n² ([Scheduling cost](semantics.md#scheduling-cost)), even when the override keeps the default rule.
 
 ## Checklist
 
@@ -191,8 +229,9 @@ Some prefixes do not compare the start of ids, such as a prefix for rows 100 to 
 - A prefix stamp changes when a task or a person adds, deletes or changes an artifact that the prefix covers. Otherwise, the stamp stays the same. With no artifacts, it is still a string, not `null`. Return `null` only when the prefix cannot tell what it covers.
 - `stamp()` is fast: with a store, the build stamps an artifact again for each task that declares it. Tasks that do not wait for each other can call it at the same time, so a cache in it must allow this.
 - A prefix stamp does not include the store's records, such as the `dapat_task_state` table of a `SqliteStore` in the same database. Each `set` changes that table, so each task that uses the prefix runs on every build ([keep the store file out of task folders](guide.md#keep-the-store-file-out-of-task-folders)).
-- Your task code writes each value completely in one operation, such as a temporary file and a rename. The samples on this page use a plain `Bun.write` to stay short. Tasks that write different keys of one file do not wait for each other. Make these writes wait for each other, as [`JsonStore`](../contrib/store/json.ts) does with a promise chain. If they do not, a later write can remove the change of an earlier one.
+- Your task code writes each value completely in one operation, such as a temporary file and a rename. The samples on this page use a plain `Bun.write` to stay short. Tasks that write different keys of one file, such as the tasks of `build.each` in step 3, do not wait for each other. Make these writes wait for each other, as [`JsonStore`](../contrib/store/json.ts) does with a promise chain. If they do not, a later write can remove the change of an earlier one.
+- The `expand` of an output template throws for each var value that could give two joined sets one id.
 
 ## Next
 
-[Write a matcher](write-a-matcher.md) makes [`build.each`](guide.md#buildeach) find S3 objects. To keep the records in a database of your own, see [Write a store](builtins.md#write-a-store). To name an output of your type in `build.each`, write an [output template](build-each.md#output-templates) for it.
+[Write a matcher](write-a-matcher.md) makes [`build.each`](guide.md#buildeach) find S3 objects. To keep the records in a database of your own, see [Write a store](builtins.md#write-a-store).

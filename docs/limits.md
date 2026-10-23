@@ -21,7 +21,7 @@ dapat's own time, without the work of the tasks, grows about as the number of ta
 
 ### A replacement does not wait for the old run
 
-After a [replacement](guide.md#tasks-and-dependencies), the new task can start before the [stopped run](semantics.md#replacement-and-removal) of the old task returns. The stopped run can write its output after the new task does, so the old value stays. In `run`, return before each write when `ctx.signal.aborted` is true.
+After a [replacement](guide.md#results-and-failure), the new task can start before the [stopped run](semantics.md#replacement-and-removal) of the old task returns. The stopped run can write its output after the new task does, so the old value stays. In `run`, return before each write when `ctx.signal.aborted` is true.
 
 ### `ctx` still sends events after `run` returns
 
@@ -34,6 +34,14 @@ With a store, a task fails after its run when `store.set` or the `stamp()` of an
 ### A removal at a report can make `run()` wait forever
 
 A subscriber or `build.each` can remove a producer at a [report](guide.md#outputs-with-unknown-names). When the reporting task then waits for a reader of that producer's output, `run()` never resolves, and dapat reports no deadlock ([the order rule](semantics.md#the-order-rule)). Do not make a reporting task wait for other tasks.
+
+### A task change at the first `promised` events starts tasks before the scans
+
+When a subscriber calls `build.add` or `build.remove` at a `promised` event that the first `run()` sends before its scans, every task that has not started starts immediately, so a task can run before the [`build.each`](build-each.md#how-buildeach-works) tasks that write its inputs ([the order rule](semantics.md#the-order-rule)). Make such changes before you call `run()`, because these events only promise the outputs of the tasks that you added before it.
+
+### A throw in `covers` or `overlaps` leaves a task out of the `Result`
+
+When the [`covers` or `overlaps`](write-an-artifact.md#how-the-build-uses-your-classes) of a prefix throws while a task looks for its producers, the task never runs and is in no list of the `Result`, `result.success` stays true, and a task that waits for it makes `run()` wait forever. Make `covers` and `overlaps` never throw: check the class of the argument before you read a field of your class, and return `true` from a `catch`, so that the task waits.
 
 ### A matched var can make an output template reject
 

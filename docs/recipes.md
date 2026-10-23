@@ -142,7 +142,24 @@ await build.run()
 
 ## Run in CI
 
-A task skips in a CI job only when the job has the task's [record](guide.md#what-a-build-does) from an earlier job. Its output files must also have the stamps in that record. Use a `JsonStore` or a `SqliteStore` ([Stores](builtins.md#stores)). At the end of each job, save the store file (for example `.dapat/state.json`) and the output files in the CI cache. At the start of each job, restore them. The GitHub Actions step `actions/cache` does both: set `path` to the store folder and the output folders, `key` to a new value in each job, such as `dapat-${{ github.job }}-${{ github.run_id }}-${{ github.run_attempt }}`, and `restore-keys` to `dapat-${{ github.job }}-`. A saved cache never changes, so a fixed `key` keeps the records of the first job. Check out the project at the same path in each job, because [file ids](builtins.md#files) are absolute paths. Keep the default hash stamps, because a checkout changes the mtime of every file ([Hash or time](builtins.md#hash-or-time)).
+A task skips in a CI job only when the job has the task's [record](guide.md#what-a-build-does) from an earlier job, and its output files have the stamps in that record. So use a `JsonStore` or a `SqliteStore` ([Stores](builtins.md#stores)), and keep the store file and the output files in the CI cache. In GitHub Actions, the `actions/cache` step restores the folders in `path`, and it saves them at the end of a job that succeeds. For a program `pipeline.ts` that keeps its store in `.dapat/` and writes its outputs in `site/`, add these steps to the job:
+
+```yaml
+- uses: actions/checkout@v7
+- uses: oven-sh/setup-bun@v2
+- uses: actions/cache@v6
+  with:
+    path: |
+      .dapat
+      site
+    key: dapat-${{ github.job }}-${{ github.run_id }}-${{ github.run_attempt }}
+    restore-keys: dapat-${{ github.job }}-
+- run: bun pipeline.ts
+```
+
+- The `key` is new in each job. A saved cache never changes, so with a fixed `key`, every job gets the records of the first job.
+- When no cache has the `key`, as in each job here, the step restores the newest cache whose key starts with `restore-keys`.
+- Check out the project at the same path in each job, because [file ids](builtins.md#files) are absolute paths. Keep the default hash stamps, because a checkout changes the mtime of every file ([Hash or time](builtins.md#hash-or-time)).
 
 ## Call a paid model
 

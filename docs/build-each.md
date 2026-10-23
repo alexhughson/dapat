@@ -7,7 +7,7 @@ This page gives the details of `build.each`, output templates, `FileMatcher` and
 - A matcher sends a **`found` event** when it adds a match or changes the data of a match, and a **`gone` event** when it removes a match. Only `build.each` and the matcher's own subscribers get these events, not the subscribers of the `Build`.
 - At each of these events, `build.each` adds, replaces or removes the tasks of each joined set that holds the match. A task that it replaces or removes before the task finishes is in `result.cancelled`.
 
-This tree shows what `build.each` does in a build. [Matches during the run](#matches-during-the-run) gives the rules of its last row, and [the order rule](semantics.md#the-order-rule) gives the one exception for `build.add`.
+This tree shows what `build.each` does in a build. [Matches during the run](#matches-during-the-run) gives the rules of its last row. As a [known issue](limits.md#a-task-change-at-the-first-promised-events-starts-tasks-before-the-scans), a task change at the first `promised` events starts the `build.add` tasks before the scans.
 
 ```text
 build.each(config)                            throws on a bad config, or after the first run() starts
@@ -17,7 +17,7 @@ first build.run()                             a later run() on this Build does n
 │  └─ found event → tasks of its joined sets
 ├─ the last scan returns
 ├─ the build adds the tasks of all the sets
-└─ the tasks start                            build.add tasks also wait for this, with one exception
+└─ the tasks start                            build.add tasks also wait for this
 during the run
 └─ ctx.produced(file with no match) → produced → found event → its tasks → ctx.produced returns
 ```
@@ -237,7 +237,7 @@ summary:1 runs
 - A task looks for its producers when it starts, and again when they all finish ([the order rule](semantics.md#the-order-rule)). A task that reads the outputs of tasks that `build.each` adds during the run can therefore start before those tasks exist. For example, `index` reads `summaries/`, and `build.each` adds a `summary` task for each chapter that `split` reports. Give `index` the input `chapters/` too, the folder output of `split`: `index` then waits for `split`, and then for each `summary` task.
 
 Edge cases:
-- Each report that changes the list of a `FileGroupMatcher` makes new tasks for its sets, which [replace](guide.md#tasks-and-dependencies) the old ones: `result.cancelled` can then hold several tasks with one id, and the build time grows with the square of the number of reports ([scale](limits.md#scale)). A declared file joins the list at its `promised` event, so its report changes nothing.
+- Each report that changes the list of a `FileGroupMatcher` makes new tasks for its sets, which [replace](guide.md#results-and-failure) the old ones: `result.cancelled` can then hold several tasks with one id, and the build time grows with the square of the number of reports ([scale](limits.md#scale)). A declared file joins the list at its `promised` event, so its report changes nothing.
 
 ## Loops
 

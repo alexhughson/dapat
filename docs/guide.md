@@ -1,51 +1,23 @@
 # Guide
 
-This page defines the terms of dapat and shows how a build orders and skips tasks. Part 1 covers tasks that you add with `build.add`. Part 2 starts at [build.each](#buildeach) and covers `build.each`, events and the [layout rules](#layout-rules). Read the [README example](../README.md#example) first, because this page uses its program.
+This page defines the terms of dapat and shows how a build orders and skips tasks. Part 1 is about tasks that you add with `build.add`. Part 2 starts at [build.each](#buildeach) and explains `build.each` and events. Read the [README example](../README.md#example) first, because this page uses its program.
 
 ## What a build does
 
-An **artifact** is one thing that a task reads or writes, such as a file, an S3 object or a key in a JSON file. Each artifact has an **id**, a string such as `file:/home/me/project/in.txt`. Two artifacts with the same id are the same artifact.
+An **artifact** is one thing that a task reads or writes, such as a file, an S3 object or a key in a JSON file. Its id is a string, such as `file:/home/me/project/in.txt`. Two artifacts with the same id are the same artifact.
 
-A **task** has these fields:
+You make a **task** with `new Task({ id, inputs, outputs, run })`:
 
 - `id`: a string that names the task, such as `upper`.
 - `inputs`: the artifacts that the task reads.
 - `outputs`: the artifacts that the task writes.
-- `run`: your function that reads the inputs and writes the outputs.
+- `run`: your async function that reads the inputs and writes the outputs.
 
 A task **declares** the artifacts in its `inputs` and `outputs`. A **build** is one run of your tasks: make a new `Build`, add tasks with `build.add`, and call `run()`. In a build, each task **finishes** in one of four ways: executed, skipped, failed or cancelled ([Results and failure](#results-and-failure)).
 
-A **producer** of an input is another task that declares the input as an output. A task runs only after each producer of its inputs finishes. In the README program, `upper` is the producer of `mid.txt`, so `wrap` waits for `upper`.
+A **producer** of an input is another task that declares the input as an output. A task runs only after each producer of its inputs finishes. In the README program, `upper` is the producer of `mid.txt`, so `wrap` waits for `upper`. The program adds `wrap` first: the order of the `build.add` calls before `run()` has no effect ([the order rule](semantics.md#the-order-rule)).
 
 The **stamp** of an artifact is a string that changes when the artifact changes, or `null` when the artifact is missing. A **store** keeps one **record** for each task id between builds: the stamps of the task's inputs and outputs from its last successful run. When a task **skips**, the build does not call its `run` function. A task skips only when it has inputs and the current stamps of its inputs and outputs equal its record ([the skip rule](#the-skip-rule)). After a successful run of a task, the build stamps its outputs and saves a new record.
-
-## Artifacts and stamps
-
-Use a `FileArtifact` from `dapat/contrib` for one file. For an S3 object, use an [`S3ObjectArtifact`](builtins.md#s3). For another value, [write an artifact type](write-an-artifact.md). The second argument of `new FileArtifact(path, { stamp })` sets the **stamp mode**. The mode decides which file changes give a new stamp ([Hash or time](builtins.md#hash-or-time)).
-
-| Mode | Stamp | After a `touch`, or a rewrite with the same bytes |
-| --- | --- | --- |
-| `{ stamp: "hash" }`, the default | a **hash stamp**: the SHA-256 hash of the bytes, in hex | the stamp does not change |
-| `{ stamp: "time" }` | a **time stamp**: `<mtime in ns>:<size>`. dapat reads no bytes | the stamp changes |
-
-## Folders: prefixes
-
-A **prefix** is an input or an output that stands for a group of artifacts, such as the files in a folder. `dapat/contrib` has [`FilesystemPrefix`](builtins.md#folders) for a folder and [`S3Prefix`](builtins.md#s3) for the S3 objects whose keys start with one string. A prefix **covers** each artifact whose id starts with the prefix id. Two prefixes **overlap** when the id of one starts with the id of the other, such as `pages/` and `pages/en/`.
-
-When the current folder is `/home/me/project`, `new FilesystemPrefix("chapters")` has the id `file:/home/me/project/chapters/`. It covers every file under `chapters/`, at any depth. Its stamp changes when a task or a person adds, changes or deletes a file under it. Its `list()` returns the absolute path of each of these files.
-
-- As an input, a prefix makes its task wait for each task with an output that the prefix covers or overlaps. Each of these tasks is a producer of the prefix.
-- As an output, a prefix makes its task a producer of each input that the prefix covers or overlaps.
-
-[`IdPrefix(id)`](builtins.md#idprefix) from `dapat` is a prefix with only an id and the stamp `null`. Use it to make one task wait for another when no file connects them.
-
-## Tasks and dependencies
-
-You make a task with `new Task({ id, inputs, outputs, run })`. `inputs` and `outputs` are optional arrays of artifacts or [prefixes](#folders-prefixes). `run` gets one argument, [`ctx`](#outputs-with-unknown-names), and returns a promise. Tasks that do not wait for each other run at the same time. The order of the `build.add` calls before `build.run()` has no effect ([the order rule](semantics.md#the-order-rule)).
-
-An **exact output** is an output that is an artifact, not a prefix. Only one task can declare a given exact output: when a task with another id declares it too, `build.add` throws.
-
-To **replace** a task, call `build.add` with a new task that has the same id. `build.add` gives no warning when it replaces a task, so give each task its own id. To **remove** a task, call `build.remove(id)` ([Replacement and removal](semantics.md#replacement-and-removal)).
 
 ## The skip rule
 
@@ -95,15 +67,33 @@ await runBuild("4. out.txt edited")
 
 The **skip rule** is five checks, which the build makes after the producers of the task finish. At the first check that fails, the task runs, and `result.outcomes` gives the **reason** that the table names for that check. With no store, every task runs, with the reason `no-store`.
 
-| # | The task skips only when | Else the reason is |
+| # | The task skips only when | Otherwise the reason is |
 | --- | --- | --- |
 | 1 | the task has at least one input | `no-inputs` |
-| 2 | no input is a [prefix](#folders-prefixes) with the stamp `null` | `input-unstamped` |
+| 2 | no input is a group of artifacts (a [prefix](#folders-prefixes)) with the stamp `null` | `input-unstamped` |
 | 3 | the store has a record for the task id | `no-record` |
 | 4 | the inputs have the same ids and stamps as in the record | `input-ids-changed`, `input-changed` |
 | 5 | the outputs have the same ids and stamps as in the record, and no output stamp is `null` | `output-unstamped`, `output-ids-changed`, `output-missing`, `output-changed` |
 
 The skip rule does not look at the `run` function ([Rerun when your code changes](recipes.md#rerun-when-your-code-changes)). It also does not look at a file that the task reads but does not declare. [The skip rule: exact checks](semantics.md#the-skip-rule-exact-checks) gives each check in full.
+
+## Artifacts and stamps
+
+Use a `FileArtifact` from `dapat/contrib` for one file. For an S3 object, use an [`S3ObjectArtifact`](builtins.md#s3). For another value, [write an artifact type](write-an-artifact.md). The second argument of `new FileArtifact(path, { stamp })` sets the **stamp mode**. The mode decides which file changes give a new stamp ([Hash or time](builtins.md#hash-or-time)).
+
+| Mode | Stamp | After a `touch`, or a rewrite with the same bytes |
+| --- | --- | --- |
+| `{ stamp: "hash" }`, the default | a **hash stamp**: the SHA-256 hash of the bytes, in hex | the stamp does not change |
+| `{ stamp: "time" }` | a **time stamp**: `<mtime in ns>:<size>`. dapat reads no bytes | the stamp changes |
+
+## Folders: prefixes
+
+A **prefix** is an input or an output that stands for a group of artifacts, such as the files in a folder. A prefix **covers** each artifact whose id starts with the prefix id. Two prefixes **overlap** when the id of one starts with the id of the other, such as `pages/` and `pages/en/`.
+
+- As an input, a prefix makes its task wait for each task with an output that the prefix covers or overlaps. Each of these tasks is a producer of the prefix.
+- As an output, a prefix makes its task a producer of each input that the prefix covers or overlaps.
+
+For a folder, use a [`FilesystemPrefix`](builtins.md#folders) from `dapat/contrib`. `new FilesystemPrefix("chapters")` covers each file under `chapters/`, at any depth. Its stamp changes when a task or a person adds, changes or deletes a file under it. Its `list()` returns the absolute path of each of these files. To make one task wait for another when no file connects them, use an [`IdPrefix`](builtins.md#idprefix).
 
 ## Outputs with unknown names
 
@@ -170,7 +160,7 @@ dapat [deletes no file](#dapat-deletes-no-file), so `split` deletes the chapters
 
 ## Results and failure
 
-`build.run()` resolves with a **Result**, which lists each task by its **outcome**: how it finished. The lists are in finish order. `result.success` is `true` when `result.failed` and `result.errors` are empty. In this program, `make-a` throws, `use-a` reads the output of `make-a`, and `other` has no inputs:
+`build.run()` resolves with a **Result**, which lists each task by its **outcome**: how it finished. Tasks that do not wait for each other run at the same time, and the lists are in finish order. `result.success` is `true` when `result.failed` and `result.errors` are empty. In this program, `make-a` throws, `use-a` reads the output of `make-a`, and `other` has no inputs:
 
 ```ts
 import { Build, Task } from "dapat"
@@ -201,20 +191,54 @@ failed make-a: disk full
 failed use-a: dependency of 'use-a' failed
 ```
 
+To **replace** a task, call `build.add` with a new task that has the same id. `build.add` gives no warning when it replaces a task, so give each task its own id. To **remove** a task, call `build.remove(id)` ([Replacement and removal](semantics.md#replacement-and-removal)).
+
 | Field | What it holds |
 | --- | --- |
 | `executed`, `skipped` | the **executed** tasks, which ran to the end with no error, and the skipped tasks |
 | `failed` | a `Map` from each **failed** task to its `Error`. A task fails when its `run` function throws, or when a producer of its inputs fails ([all causes](semantics.md#one-task)) |
-| `cancelled` | the **cancelled** tasks: tasks that a [replacement or removal](#tasks-and-dependencies) took out of the `Build` before they ran to the end |
+| `cancelled` | the **cancelled** tasks: tasks that a replacement or a removal took out of the `Build` before they ran to the end |
 | `outcomes` | a `Map` from each task of the lists above to its outcome: `executed` with a reason, `skipped`, `failed` with its `Error`, or `cancelled` with `replaced` or `removed` |
 | `errors` | errors that belong to no task, from a replacement or a removal ([all cases](api.md#error-messages)) |
 
 - A failed task does not stop the other tasks. The build does not call the `run` function of `use-a`, and its error names `use-a`, not `make-a`. To find the cause, look in `result.failed` for a message that does not start with `dependency of`.
 - `run()` rejects only for a **fatal error**: an error after which no more tasks start. A subscriber or a `build.each` call can cause one ([Fatal errors](semantics.md#fatal-errors)).
 
+## Layout rules
+
+An **exact output** is an output that is an artifact, not a prefix. Only one task can declare a given exact output: when a task with another id declares it too, `build.add` throws. The rules below say where tasks write files, and the build does not check them. [Self-feeding and shared folders](semantics.md#self-feeding-and-shared-folders) shows what happens, build by build, when a program breaks one.
+
+### dapat deletes no file
+
+dapat deletes no output file, because other programs and people also write in your folders. So an **old output** stays on disk: a file that a task wrote in an earlier build and that no task writes now. For example, when the book in [Outputs with unknown names](#outputs-with-unknown-names) gets shorter, `chapters/3.txt` is an old output, and `count` would still count it. So `split` deletes it. To delete old outputs, see [the recipe](recipes.md#delete-old-outputs).
+
+### One task writes one folder
+
+Only the task that declares a folder as its output should write in that folder. If another task writes in it, the tasks that declare or read the folder can run again on the next build. With time stamps, they can run on every build. Give each task its own folder, or declare exact outputs in a folder that no task declares.
+
+### A task that may write nothing declares a folder
+
+When a task may write nothing, declare a folder as its output, not an exact output. An exact output that the task does not write has the stamp `null`, so the task runs on every build. A missing or empty folder has a stamp, so with a folder output the task can skip.
+
+### Write an index next to its folder
+
+An index is a file that lists a folder. Write it next to the folder, not in it. When a task writes in a folder that it reads, each run that changes the folder makes the task run again on the next build. With time stamps, it runs on every build. For example, `count` writes `count.txt` next to `chapters/` in [Outputs with unknown names](#outputs-with-unknown-names).
+
+### Keep the store file out of task folders
+
+Keep the `JsonStore` or `SqliteStore` file out of every folder that a task reads or writes. Each saved record changes the store file, which changes the stamp of the folder, so each task that has the folder as an input or an output runs on every build. Put the store file in a folder of its own, such as `.dapat/`.
+
+## Before you ship
+
+1. If `result.success` is false, print `result.failed` and `result.errors` ([Results](#results-and-failure)), and exit with code 1. When `run()` rejects, also exit with code 1: Bun does this for you when you do not catch the error.
+2. Use a `JsonStore` or a `SqliteStore`, and [keep its file out of task folders](#keep-the-store-file-out-of-task-folders).
+3. Run the program twice with no change. In the second run, each task must skip, except a task with no inputs or with an [`IdPrefix`](builtins.md#idprefix) input or output. For each task that runs, `result.outcomes` gives the [reason](#the-skip-rule).
+4. Sort ids and paths before you print or compare them. `result.executed` and `result.skipped` are in finish order, and the `list()` of a `FilesystemPrefix` is in file-system order.
+5. Keep the project at one path, in CI too, because file ids are absolute paths ([Files](builtins.md#files)).
+
 ---
 
-You can stop here. Part 1 is enough for a build whose tasks you add with `build.add`. Read the [layout rules](#layout-rules) before you let a task write in a folder that it reads, or in a folder that another task writes. Before you ship the program, read the [checklist](#before-you-ship).
+You can stop here. Part 1 is enough for a build whose tasks you add with `build.add`. Part 2 explains events and `build.each`, which makes tasks from files.
 
 ## build.each
 
@@ -288,38 +312,6 @@ The build also sends `deleted` for each `ctx.deleted` call, and `withdrawn` when
 
 - Call `build.subscribe` before `run()`, so that the subscriber gets every event.
 - A subscriber must be synchronous. A subscriber that throws or returns a promise, such as an `async` function, causes a [fatal error](#results-and-failure).
-
-## Layout rules
-
-These rules say where tasks write files. The build does not check them. [Self-feeding and shared folders](semantics.md#self-feeding-and-shared-folders) shows what happens, build by build, when a program breaks one.
-
-### dapat deletes no file
-
-dapat deletes no output file, because other programs and people also write in your folders. So an **old output** stays on disk: a file that a task wrote in an earlier build and that no task writes now. For example, after you delete `content/en/about.md` in the [build.each](#buildeach) program, `site/en/about.html` stays, and a `FileMatcher` whose pattern fits it still finds it. To delete old outputs, see [the recipe](recipes.md#delete-old-outputs).
-
-### One task writes one folder
-
-Only the task that declares a folder as its output should write in that folder. If another task writes in it, the tasks that declare or read the folder can run again on the next build. With time stamps, they can run on every build. Give each task its own folder, or declare exact outputs in a folder that no task declares.
-
-### A task that may write nothing declares a folder
-
-When a task may write nothing, declare a folder as its output, not an exact output. An exact output that the task does not write has the stamp `null`, so the task runs on every build. A missing or empty folder has a stamp, so with a folder output the task can skip.
-
-### Write an index next to its folder
-
-An index is a file that lists a folder. Write it next to the folder, not in it. When a task writes in a folder that it reads, each run that changes the folder makes the task run again on the next build. With time stamps, it runs on every build. For example, `count` writes `count.txt` next to `chapters/` in [Outputs with unknown names](#outputs-with-unknown-names).
-
-### Keep the store file out of task folders
-
-Keep the `JsonStore` or `SqliteStore` file out of every folder that a task reads or writes. Each saved record changes the store file, which changes the stamp of the folder, so each task that has the folder as an input or an output runs on every build. Put the store file in a folder of its own, such as `.dapat/`.
-
-## Before you ship
-
-1. If `result.success` is false, print `result.failed` and `result.errors` ([Results](#results-and-failure)), and exit with code 1. When `run()` rejects, also exit with code 1: Bun does this for you when you do not catch the error.
-2. Use a `JsonStore` or a `SqliteStore`, and [keep its file out of task folders](#keep-the-store-file-out-of-task-folders).
-3. Run the program two times with no change. In the second run, each task must skip, except a task with no inputs or with an `IdPrefix` input or output. For each task that runs, `result.outcomes` gives the [reason](#the-skip-rule).
-4. Sort ids and paths before you print or compare them. `result.executed` and `result.skipped` are in finish order, and the `list()` of a `FilesystemPrefix` is in file-system order.
-5. Keep the project at one path, in CI too, because file ids are absolute paths ([Files](builtins.md#files)).
 
 ## Next
 

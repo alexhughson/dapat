@@ -5,7 +5,7 @@ Run the [README example](../README.md#example) first, then read part 1 of the gu
 | Goal | Page | Read it when |
 | --- | --- | --- |
 | Write a first program | [Guide](guide.md), part 1 | you start: it defines the terms that the other pages use |
-| Write a pipeline | [Guide](guide.md#buildeach), part 2 | you use `build.subscribe` or `build.each`, or tasks share a folder |
+| Write a pipeline | [Guide](guide.md#buildeach), part 2 | you use `build.subscribe` or `build.each` |
 | | [build.each](build-each.md) | you write a pattern or an output template, join matchers, or write a loop, such as an agent loop |
 | | [Built-in artifacts and stores](builtins.md) | you choose a stamp mode or a store, or use folders or S3 |
 | Do a common job | [Recipes](recipes.md) | you force a rerun, rerun after a code change, delete old outputs, limit parallel work, run in CI, or call a paid model |
