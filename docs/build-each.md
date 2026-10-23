@@ -7,7 +7,7 @@ This page gives the details of `build.each`, output templates, `FileMatcher` and
 - A matcher sends a **`found` event** when it adds a match or changes the data of a match, and a **`gone` event** when it removes a match. Only `build.each` and the matcher's own subscribers get these events, not the subscribers of the `Build`.
 - At each of these events, `build.each` adds, replaces or removes the tasks of each joined set that holds the match. A task that it replaces or removes before the task finishes is in `result.cancelled`.
 
-This tree shows what `build.each` does in a build. [Matches during the run](#matches-during-the-run) gives the rules of its last row. As a [known issue](limits.md#a-task-change-at-the-first-promised-events-starts-tasks-before-the-scans), a task change at the first `promised` events starts the `build.add` tasks before the scans.
+This tree shows what `build.each` does in a build. [Matches during the run](#matches-during-the-run) gives the rules of its last row.
 
 ```text
 build.each(config)                            throws on a bad config, or after the first run() starts
@@ -21,6 +21,8 @@ first build.run()                             a later run() on this Build does n
 during the run
 └─ ctx.produced(file with no match) → produced → found event → its tasks → ctx.produced returns
 ```
+
+As a [known issue](limits.md#a-task-change-at-the-first-promised-events-starts-tasks-before-the-scans), when a subscriber adds or removes a task at the first `promised` events, the `build.add` tasks start before the scans.
 
 ## The config
 
@@ -64,7 +66,9 @@ Edge cases:
 An [output template](guide.md#buildeach) names an output of each joined set with the vars of the set. `FileTemplate` gives a `FileArtifact`, and `FolderTemplate` gives a `FilesystemPrefix`. Both come from `dapat/contrib`, take `(pattern, { stamp, syntax })` and follow the [FileMatcher](#filematcher) rules, but the pattern has no `*` or `**`, because an output names one path. For the book `owl`, `new FolderTemplate("out/<book>")` gives the folder `out/owl/`. Give the templates in `outputsByName`.
 
 - Each var of a template must be a var of a matcher, or `build.each` throws. A var of an optional matcher is allowed, and a set with no match of that matcher gets no task.
-- Put every var of the set in each template path: when two sets fill a `FileTemplate` with one path, `run()` rejects with `duplicate output`, and when they fill a `FolderTemplate` with one path, two tasks write one folder with no error ([one task writes one folder](guide.md#one-task-writes-one-folder)).
+- Put every var of the set in each template path. When two sets fill a template with one path:
+  - `FileTemplate`: `run()` rejects with `duplicate output`.
+  - `FolderTemplate`: two tasks write one folder, with no error ([one task writes one folder](guide.md#one-task-writes-one-folder)).
 - `expand` throws for a var value that is empty, `.` or `..`, or holds `/`, and then `run()` rejects ([a matched var can make an output template reject](limits.md#a-matched-var-can-make-an-output-template-reject)).
 - For an output of your own artifact type, write a class that implements [`ArtifactTemplate<YourType>`](api.md#artifacttemplate), with `varNames` and `expand(vars: Vars)`. Then `outputs.<name>` has your type. `build.each` does not check the var values, so check them in `expand`.
 
@@ -144,9 +148,21 @@ A [joined set](guide.md#buildeach) holds one match of each [required](#required)
 | `pages/<lang>/<slug>.md`, `banners/<lang>/<banner>.png` | pages `en/hello`, `en/about`; banners `en/blue`, `en/red` | 4: each page with each banner, because the matchers share only `lang` |
 | `templates/<lang>.html`, `authors/<slug>.txt`, `pages/<lang>/<slug>.md` | template `en`; author `hello`; pages `en/hello`, `en/about`, `de/hallo` | 1: `en/hello`. `en/about` has no author, and `de/hallo` has no template and no author |
 | `content/<lang>/*.md` (a `FileGroupMatcher`), `templates/<lang>.html` | pages `en/hello`, `en/about`, `de/hallo`; template `en` | 1: `en`, with the list of the two `en` pages and the `en` template. `de` has no template |
+| `templates/<lang>.html`, `pages/<slug>.md` | templates `en`, `de`; pages `hello`, `about` | 4: each template with each page, because the matchers share no var name |
+| `pages/<page>.txt`, `plan.txt` | pages `001`, `002`; `plan.txt` | 2: each page with `plan.txt`, because `plan.txt` has no var |
 
-- The required matchers must all connect through shared var names, or `build.each` throws ([error messages](api.md#error-messages)). A chain of required matchers is enough: in row 2, the template and author matchers share no var name, but each shares one with the page matcher.
-- A matcher with no var, such as `templates/site.html`, shares no var name. To give its match to every set, leave it out of `required`.
+Two required matchers join as a **cross product** when no chain of shared var names connects them: each match of one joins each match of the other, as in row 4. The number of sets is the product of their match counts. In row 2, the page matcher connects the template and author matchers, so they do not join as a cross product.
+
+A matcher with no var, such as `plan.txt` in row 5, joins every set:
+
+| When | Then |
+| --- | --- |
+| `plan.txt` has no match | there is no set |
+| its matcher sends `found` | the sets come: one for each page |
+| the file changes | the sets stay. Each task with the file as an input runs again, because its stamp changed |
+| its matcher sends `gone` | the sets go, with their tasks and the records of the tasks. When the file comes back, each task runs again |
+
+To keep the sets while `plan.txt` is missing, leave its matcher out of `required`.
 
 ## required
 
@@ -194,11 +210,14 @@ Edge cases:
 
 ## Matches during the run
 
-During the run, `FileMatcher` and `FileGroupMatcher` also get the [events](guide.md#events) of the `Build`, so a file that a task declares or reports gets its tasks in the same `run()`. In this program, `write` reports `chapters/1.txt`:
+During the run, `FileMatcher` and `FileGroupMatcher` also get the [events](guide.md#events) of the `Build`, so a file that a task declares or reports gets its tasks in the same `run()`. In this program, `write` reports `chapters/1.txt`, and `index` reads the summaries:
 
 ```ts
 import { Build, Task, type Context } from "dapat"
 import { FileArtifact, FileMatcher, FilesystemPrefix } from "dapat/contrib"
+
+const chapters = new FilesystemPrefix("chapters")
+const summaries = new FilesystemPrefix("summaries")
 
 async function write(ctx: Context) {
   const chapter = new FileArtifact("chapters/1.txt")
@@ -209,15 +228,25 @@ async function write(ctx: Context) {
   console.log("write ends")
 }
 
+async function index() {
+  const names = (await summaries.list()).map((file) => file.split("/").pop()).sort()
+  console.log(`index reads ${names.join(" ")}`)
+}
+
 const build = new Build()
-const chapters = new FilesystemPrefix("chapters")
 build.add(new Task({ id: "write", outputs: [chapters], run: write }))
+// without chapters, index does not wait for summary:1
+build.add(new Task({ id: "index", inputs: [summaries, chapters], run: index }))
 build.each({
   matchersByName: { chapter: new FileMatcher("chapters/<n>.txt") },
   *tasks(vars, matched) {
     console.log(`tasks() for chapter ${vars.n}`) // only to show the order
-    const run = async () => console.log(`summary:${vars.n} runs`)
-    yield new Task({ id: `summary:${vars.n}`, inputs: [matched.chapter.data], run })
+    const summary = new FileArtifact(`summaries/${vars.n}.txt`)
+    async function run() {
+      await Bun.write(summary.path, `Summary ${vars.n}`)
+      console.log(`summary:${vars.n} runs`)
+    }
+    yield new Task({ id: `summary:${vars.n}`, inputs: [matched.chapter.data], outputs: [summary], run })
   },
 })
 await build.run()
@@ -229,12 +258,15 @@ tasks() for chapter 1
 ctx.produced returned
 write ends
 summary:1 runs
+index reads 1.txt
 ```
 
 - `summary:1` starts only when `write` finishes, because `write` declares the folder that holds the chapter.
-- A `FileMatcher` gives a file a match, and a `FileGroupMatcher` puts it in a list, while the file is on disk or a task declares it as an exact output. For the matcher, a file is on disk from its `produced` event, or the [scan](guide.md#buildeach) that finds it, until its `deleted` event. A task declares the file from its `promised` event until its `withdrawn` event. When a task declares a file and does not write it, `build.each` still makes the tasks that read the file, and they run ([declare a folder](guide.md#a-task-that-may-write-nothing-declares-a-folder)).
+- A task that reads the outputs of tasks that `build.each` adds during the run also needs the folder output of the reporting task as an input, as `index` has `chapters/` ([the order rule](semantics.md#the-order-rule)).
+- A `FileMatcher` gives a file a match, and a `FileGroupMatcher` puts it in a list, while one of these holds:
+  - The matcher counts the file as on disk: from the [scan](guide.md#buildeach) that finds it or its `produced` event, until its `deleted` event.
+  - A task declares the file as an exact output: from its `promised` event until its `withdrawn` event. So a file that a task declares and does not write still gets its tasks, and they run ([declare a folder](guide.md#a-task-that-may-write-nothing-declares-a-folder)).
 - The matcher uses only the events of a `FileArtifact` or a subclass, so a `promised` event for a folder makes no match. Report each file that a task writes in a folder, or the file gets a match only at the scan of the next build.
-- A task looks for its producers when it starts, and again when they all finish ([the order rule](semantics.md#the-order-rule)). A task that reads the outputs of tasks that `build.each` adds during the run can therefore start before those tasks exist. For example, `index` reads `summaries/`, and `build.each` adds a `summary` task for each chapter that `split` reports. Give `index` the input `chapters/` too, the folder output of `split`: `index` then waits for `split`, and then for each `summary` task.
 
 Edge cases:
 - Each report that changes the list of a `FileGroupMatcher` makes new tasks for its sets, which [replace](guide.md#results-and-failure) the old ones: `result.cancelled` can then hold several tasks with one id, and the build time grows with the square of the number of reports ([scale](limits.md#scale)). A declared file joins the list at its `promised` event, so its report changes nothing.

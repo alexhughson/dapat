@@ -9,6 +9,7 @@ The first table gives the short meaning of each main term of the docs, and links
 | build | one run of your tasks: make a new `Build`, add tasks, and call `run()` | [Guide › What a build does](guide.md#what-a-build-does) |
 | cancelled | a task that a replacement or a removal took out of the `Build` before it ran to the end | [Guide › Results and failure](guide.md#results-and-failure) |
 | covers | a prefix covers each artifact whose id starts with the prefix id | [Guide › Folders: prefixes](guide.md#folders-prefixes) |
+| cross product | the join of two required matchers that no chain of shared var names connects: each match of one joins each match of the other | [build.each › Joins](build-each.md#joins) |
 | `ctx` | the `Context` that the `run` function of a task gets. It has `produced`, `deleted` and `signal` | [Guide › Outputs with unknown names](guide.md#outputs-with-unknown-names) |
 | data | the artifact or the list of artifacts in a match, such as the `FileArtifact` of the file that a `FileMatcher` found | [Guide › build.each](guide.md#buildeach) |
 | deadlock | the state in which no task runs and each task that has not finished waits for a producer. The waiting tasks then fail | [How a build works › The order rule](semantics.md#the-order-rule) |
@@ -24,7 +25,7 @@ The first table gives the short meaning of each main term of the docs, and links
 | `gone` event | a matcher tells `build.each` that it removed a match | [build.each › How build.each works](build-each.md#how-buildeach-works) |
 | hash stamp | the stamp of a file in the default stamp mode: the SHA-256 hash of its bytes, in hex | [Guide › Artifacts and stamps](guide.md#artifacts-and-stamps) |
 | id | the string that names a task or an artifact. A `Build` holds one task for each id, and two artifacts with the same id are the same artifact | [Guide › What a build does](guide.md#what-a-build-does) |
-| joined set | one match of each matcher, with the same value for each var that two matches share | [Guide › build.each](guide.md#buildeach) |
+| joined set | one match of each required matcher, and at most one match of each optional matcher, with the same value for each var that two matches share | [Guide › build.each](guide.md#buildeach) |
 | loop | a `build.each` in which each task writes the file that its matcher finds next, such as an agent loop | [build.each › Loops](build-each.md#loops) |
 | match | one result of a matcher, with its vars and its data | [Guide › build.each](guide.md#buildeach) |
 | matcher | an object that finds artifacts for `build.each`, such as a `FileMatcher` for the files that fit a pattern | [Guide › build.each](guide.md#buildeach) |

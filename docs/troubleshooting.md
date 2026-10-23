@@ -1,6 +1,6 @@
 # Troubleshooting
 
-This page lists problems that give no error message. Each row gives one cause, and a row with no symptom gives another cause of the symptom above it. For an error message, find its text in [Error messages](api.md#error-messages). For a task that runs when you expect a skip, print its reason from `result.outcomes` ([the skip rule](guide.md#the-skip-rule)).
+This page lists problems that give no error message. Each row gives one cause. A row with an empty Symptom cell gives one more cause of the symptom above it. For an error message, find its text in [Error messages](api.md#error-messages). For a task that runs when you expect a skip, print its reason from `result.outcomes` ([the skip rule](guide.md#the-skip-rule)).
 
 | Symptom | Cause | Fix |
 | --- | --- | --- |
@@ -20,12 +20,12 @@ This page lists problems that give no error message. Each row gives one cause, a
 | A task skips after you change its code | The skip rule does not look at the `run` function | Add an input for the code version ([Rerun when your code changes](recipes.md#rerun-when-your-code-changes)) |
 | A task never runs, and `result.cancelled` lists it | Before it started, a new task with the same id replaced it. Its reason is `replaced` | Give each task its own id ([Results and failure](guide.md#results-and-failure)) |
 | | A `build.remove` call, or a `gone` event at `build.each`, removed it. Its reason is `removed` | Find the `build.remove` call or the match that is gone ([How build.each works](build-each.md#how-buildeach-works)) |
-| A task is in no list of the `Result` | The `covers` or `overlaps` of a prefix threw while the task looked for its producers. Bun prints the error as an unhandled rejection | Make `covers` and `overlaps` never throw ([a throw in covers or overlaps](limits.md#a-throw-in-covers-or-overlaps-leaves-a-task-out-of-the-result)) |
+| A task is in no list of the `Result`, and Bun prints an unhandled rejection | The `covers` or `overlaps` of a prefix threw while the task looked for its producers | Make `covers` and `overlaps` never throw ([a throw in covers or overlaps](limits.md#a-throw-in-covers-or-overlaps-leaves-a-task-out-of-the-result)) |
 | An old output stays on disk, and `build.each` makes a task for it | [dapat deletes no file](guide.md#dapat-deletes-no-file), so the scan finds the old output | [Delete old outputs](recipes.md#delete-old-outputs), or write a pattern that fits no output |
 | Task `b` runs before task `a`, which writes its input | No output of `a` is the file or a prefix that covers it | Declare the file or its folder as an output of `a` |
 | | The output of `a` is a plain object, not an `Artifact` or a `Prefix` | Extend `Artifact` or `Prefix` ([What you write](write-an-artifact.md#what-you-write)) |
 | | After `run()` starts the tasks, your code adds `b`, awaits, and then adds `a` | Add `a` before the `await` ([the order rule](semantics.md#the-order-rule)) |
-| | `a` is a `build.each` task for a file that another task reports after `b` starts | Give `b` the folder output of the reporting task as an input too |
+| | `a` is a `build.each` task for a file that another task reports after `b` starts | Give `b` the folder output of the reporting task as an input too ([matches during the run](build-each.md#matches-during-the-run)) |
 | | `a` is a `build.each` task, and a subscriber called `build.add` or `build.remove` at a `promised` event before the scans of the first `run()` | Make the change before `run()` ([a task change at the first promised events](limits.md#a-task-change-at-the-first-promised-events-starts-tasks-before-the-scans)) |
 | `run()` never resolves | A matcher's scan does not return | Make the scan throw after a timeout ([Write a matcher](write-a-matcher.md#checklist)) |
 | | A task awaits the `run()` of its own `Build` | Do not await `run()` in a task ([build.run()](semantics.md#buildrun)) |
@@ -35,3 +35,4 @@ This page lists problems that give no error message. Each row gives one cause, a
 | A `build.each` task is missing | No match of a required matcher has the same values for the shared vars | Check the vars of each matcher ([Joins](build-each.md#joins)) |
 | | A task writes a file in its output folder and does not report it | Report the file with `ctx.produced` ([Outputs with unknown names](guide.md#outputs-with-unknown-names)) |
 | | An output template uses a var of an optional matcher, and the set has no match of it | Name the output with the vars of the required matchers ([Output templates](build-each.md#output-templates)) |
+| `build.each` makes a task for each pair of matches | Two required matchers share no var name, such as `<lang>` in one pattern and `<language>` in the other, so they join as a cross product | Give the var one name in both patterns ([Joins](build-each.md#joins)) |

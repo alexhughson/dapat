@@ -16,6 +16,7 @@ Save this as `json-key.ts`. It holds `JsonKey`, and the helpers `load` and `writ
 
 <!-- file: json-key.ts -->
 ```ts
+import { rename } from "node:fs/promises"
 import path from "node:path"
 import { Artifact } from "dapat"
 
@@ -27,10 +28,17 @@ export async function load(file: string): Promise<Record<string, unknown>> {
   return await Bun.file(file).json()
 }
 
+let lastWrite: Promise<void> = Promise.resolve() // the next write waits for it
+
 export async function writeKey(file: string, key: string, value: unknown) {
-  const doc = await load(file)
-  doc[key] = value
-  await Bun.write(file, JSON.stringify(doc))
+  const write = lastWrite.then(async () => {
+    const doc = await load(file)
+    doc[key] = value
+    await Bun.write(`${file}.tmp`, JSON.stringify(doc))
+    await rename(`${file}.tmp`, file)
+  })
+  lastWrite = write.catch(() => {}) // a failed write does not stop the next one
+  await write
 }
 
 export class JsonKey<T = unknown> extends Artifact<T> {
@@ -61,6 +69,7 @@ export class JsonKey<T = unknown> extends Artifact<T> {
 - The id is `json:<absolute path>#<key>`. It starts with `json:`, a fixed text that no other kind of value uses. The `#` ends the path, so a prefix for the keys of `data.json` does not cover the keys of `data.json.bak`. A task that reads `data.json` as a `FileArtifact` does not wait for the tasks that write its keys, because a file id starts with `file:`.
 - `stamp()` returns the SHA-256 hash of `JSON.stringify(value)`, or `null` when the key is missing. For an input, the build compares a `null` stamp with the record, as it does any other stamp ([the skip rule](guide.md#the-skip-rule)). `stamp()` throws when the file is not valid JSON.
 - `read()` returns the value, and throws when the key is missing.
+- `writeKey` writes a temporary file and renames it, so `load` never reads a half-written file. Each call waits for the calls before it. So when two tasks write keys of one file at the same time, neither removes the key of the other.
 
 This program shows that each key has its own stamp:
 
@@ -174,7 +183,7 @@ This `split` does not delete the page keys of an old, longer book. To delete the
 
 ## Step 3: an output template
 
-An [output template](build-each.md#output-templates) names an output with the vars of a joined set of [`build.each`](guide.md#buildeach). `JsonKeyTemplate` takes a key pattern, such as `titles/<lang>/<slug>`: `varNames` lists its vars, and `expand` fills them in. `build.each` does not check the var values, so `expand` throws for a value with `/`. Without this check, the values `a/b` and `c` would give the same key as `a` and `b/c`. A throw makes `run()` reject. Each page gets its own task, and these tasks do not wait for each other. So with more than one page, make the writes of `writeKey` wait for each other ([checklist](#checklist)).
+An [output template](build-each.md#output-templates) names an output with the vars of a joined set of [`build.each`](guide.md#buildeach). `JsonKeyTemplate` takes a key pattern, such as `titles/<lang>/<slug>`: `varNames` lists its vars, and `expand` fills them in. `build.each` does not check the var values, so `expand` throws for a value with `/`. Without this check, the values `a/b` and `c` would give the same key as `a` and `b/c`. A throw makes `run()` reject.
 
 ```ts
 import { Build, type ArtifactTemplate, type Vars } from "dapat"
@@ -217,7 +226,6 @@ console.log(await Bun.file("data.json").text())
 The build connects outputs to inputs to find the [producers](guide.md#what-a-build-does) of a task. [The order rule](semantics.md#the-order-rule) gives the method that decides for each kind of input and output. The build also connects each `ctx.produced(a)` and `ctx.deleted(a)` to an exact output of the task with the id of `a`, or to a prefix output whose `covers(a)` returns true. [One task](semantics.md#one-task) gives the order of these calls.
 
 - `covers` and `overlaps` get the artifacts and prefixes of every task, of any class. Make them fast, give the same result for the same ids, and check the class before you read a field that only your class has.
-- A throw in `covers` or `overlaps` while a task looks for its producers leaves the task out of the `Result`, and `result.success` stays true. The throw is an unhandled rejection. Bun prints it, and the process exits with code 1 when it ends. A throw in `ctx.produced` or `ctx.deleted` fails the reporting task.
 - The build calls no `exists`, `delete` or `list` method. A subclass can add one, as `FilesystemPrefix` adds `list()`. To delete a value, your task deletes it, then reports it with `ctx.deleted`.
 
 Some prefixes do not compare the start of ids, such as a prefix for rows 100 to 199 of a table. For such a prefix, override `covers` and `overlaps`. Return `true` from `overlaps` when both prefixes can cover one id. For a task with an `IdPrefix` input, the build never calls your `overlaps` ([the order rule](semantics.md#the-order-rule)), so the task waits for your prefix output only when one id starts with the other. To make it wait, give it an input of your own prefix class. With an override, n tasks that use such a prefix cost about n² ([Scheduling cost](semantics.md#scheduling-cost)), even when the override keeps the default rule.
@@ -229,7 +237,8 @@ Some prefixes do not compare the start of ids, such as a prefix for rows 100 to 
 - A prefix stamp changes when a task or a person adds, deletes or changes an artifact that the prefix covers. Otherwise, the stamp stays the same. With no artifacts, it is still a string, not `null`. Return `null` only when the prefix cannot tell what it covers.
 - `stamp()` is fast: with a store, the build stamps an artifact again for each task that declares it. Tasks that do not wait for each other can call it at the same time, so a cache in it must allow this.
 - A prefix stamp does not include the store's records, such as the `dapat_task_state` table of a `SqliteStore` in the same database. Each `set` changes that table, so each task that uses the prefix runs on every build ([keep the store file out of task folders](guide.md#keep-the-store-file-out-of-task-folders)).
-- Your task code writes each value completely in one operation, such as a temporary file and a rename. The samples on this page use a plain `Bun.write` to stay short. Tasks that write different keys of one file, such as the tasks of `build.each` in step 3, do not wait for each other. Make these writes wait for each other, as [`JsonStore`](../contrib/store/json.ts) does with a promise chain. If they do not, a later write can remove the change of an earlier one.
+- `covers` and `overlaps` never throw ([a throw in covers or overlaps](limits.md#a-throw-in-covers-or-overlaps-leaves-a-task-out-of-the-result)).
+- Your task code writes each value completely in one operation, such as a temporary file and a rename. Writes to one file wait for each other. `writeKey` in step 1 does both.
 - The `expand` of an output template throws for each var value that could give two joined sets one id.
 
 ## Next

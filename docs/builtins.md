@@ -134,4 +134,14 @@ The build calls the store at these times:
 | `clear()` | never |
 
 - `get` returns `null` for a task id with no record. Otherwise it returns the keys and values that `set` got, `null` values too.
-- The build can call the store for several tasks at the same time. It can also call `delete` while a `set` for the same id runs. Do the writes in the order of the calls, as [`JsonStore`](../contrib/store/json.ts) does with a promise chain.
+- The build can call the store for several tasks at the same time. It can also call `delete` while a `set` for the same id runs. So do the writes in the order of the calls: `set` and `delete` each pass their write to a `queue` such as this one.
+
+```ts
+let lastWrite: Promise<void> = Promise.resolve() // the next write waits for it
+
+function queue(write: () => Promise<void>): Promise<void> {
+  const next = lastWrite.then(write)
+  lastWrite = next.catch(() => {}) // a failed write does not stop the next one
+  return next
+}
+```

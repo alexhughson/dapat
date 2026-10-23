@@ -37,11 +37,17 @@ A subscriber or `build.each` can remove a producer at a [report](guide.md#output
 
 ### A task change at the first `promised` events starts tasks before the scans
 
-When a subscriber calls `build.add` or `build.remove` at a `promised` event that the first `run()` sends before its scans, every task that has not started starts immediately, so a task can run before the [`build.each`](build-each.md#how-buildeach-works) tasks that write its inputs ([the order rule](semantics.md#the-order-rule)). Make such changes before you call `run()`, because these events only promise the outputs of the tasks that you added before it.
+The first `run()` sends `promised` events before its scans. When a subscriber calls `build.add` or `build.remove` at one of them, every task that has not started starts immediately ([the order rule](semantics.md#the-order-rule)). So a task can run before the [`build.each`](build-each.md#how-buildeach-works) tasks that write its inputs. These events promise only the outputs of the tasks that you added before `run()`, so make such changes before you call `run()`.
 
 ### A throw in `covers` or `overlaps` leaves a task out of the `Result`
 
-When the [`covers` or `overlaps`](write-an-artifact.md#how-the-build-uses-your-classes) of a prefix throws while a task looks for its producers, the task never runs and is in no list of the `Result`, `result.success` stays true, and a task that waits for it makes `run()` wait forever. Make `covers` and `overlaps` never throw: check the class of the argument before you read a field of your class, and return `true` from a `catch`, so that the task waits.
+When the [`covers` or `overlaps`](write-an-artifact.md#how-the-build-uses-your-classes) of a prefix throws while a task looks for its producers ([One task](semantics.md#one-task)):
+
+- The task never runs, and it is in no list of the `Result`. `result.success` stays true.
+- A task that waits for it makes `run()` wait forever.
+- Bun prints the throw as an unhandled rejection, and the process exits with code 1 when it ends.
+
+Make `covers` and `overlaps` never throw. Check the class of the argument before you read a field of your class, and return `true` from a `catch`, so that the task waits.
 
 ### A matched var can make an output template reject
 

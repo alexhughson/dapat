@@ -41,6 +41,7 @@ the build starts a task
 └─ executed, with the reason of the first check that failed
 ```
 
+- When `covers` or `overlaps` throws while the task looks for its producers, the task never finishes ([a known issue](limits.md#a-throw-in-covers-or-overlaps-leaves-a-task-out-of-the-result)).
 - When `run` throws, the task fails with that error, even when the error is an `AbortError`. When an output `stamp()` or `store.set` throws, the task fails too ([a task can fail after its produced events](limits.md#a-task-can-fail-after-its-produced-events)).
 - The task of a [stopped run](#replacement-and-removal) finishes as `cancelled`, even when `run` throws, and a thrown error whose name is not `AbortError` goes to `result.errors`. The build saves no record unless the stop comes while `store.set` runs.
 
@@ -55,10 +56,24 @@ A task waits until each of its [producers](guide.md#what-a-build-does) has finis
 | prefix | artifact | `input.covers(output)` returns true | `mem:a/b/` does not wait for `mem:a/` |
 | prefix | prefix | `input.overlaps(output)` returns true | `mem:out/` waits for `mem:out/sub/`, and the other way around |
 
-A task looks for its producers among the current tasks. When a producer has failed, the task fails with `dependency of '<id>' failed`, where `<id>` is the id of the waiting task. When no producer waits or runs, the task goes on. Else the task waits for the producers that it found: when one of them fails, it fails immediately, and when all of them have finished, or were replaced or removed, it looks for its producers again. A producer's `ctx.produced` call does not end the wait.
+A task looks for its producers among the current tasks.
 
-- A waiting task finds a producer that is added in the meantime only when it looks for its producers again. So if that producer fails, the task fails only then, and if the producer is removed before then, the task does not fail.
-- When a subscriber removes a task during a `ctx.produced` or `ctx.deleted` call of a running task, each task that reads an output of the removed task waits for the reporting task to finish, and then looks for its producers again. If the reporting task fails, the reader fails with `dependency of '<id>' failed`. A reporting task that waits for such a reader never finishes ([a removal at a report can make run() wait forever](limits.md#a-removal-at-a-report-can-make-run-wait-forever)). After any other removal, a reader stops waiting for the removed task immediately.
+| When the task looks for its producers, it finds | Then |
+| --- | --- |
+| a producer that failed | the task fails with `dependency of '<id>' failed`, where `<id>` is the id of the waiting task |
+| no producer that waits or runs | the task goes on |
+| producers that wait or run | the task waits for them. When one of them fails, the task fails immediately. When each has finished, or was replaced or removed, the task looks for its producers again |
+
+A producer's `ctx.produced` call does not end the wait.
+
+| A task is removed | Each task that reads one of its outputs |
+| --- | --- |
+| during a [report](guide.md#outputs-with-unknown-names) of a running task | waits until the reporting task finishes, then looks for its producers again. When the reporting task fails, the reader fails with `dependency of '<id>' failed` |
+| at any other time | stops waiting for the removed task immediately |
+
+A reporting task that waits for such a reader never finishes ([a removal at a report can make run() wait forever](limits.md#a-removal-at-a-report-can-make-run-wait-forever)).
+
+- A waiting task finds a producer that is added in the meantime only when it looks for its producers again. If that producer fails, the task fails only at its next look. If the producer is removed before that look, the task does not fail.
 - A **deadlock** is the state in which no task runs and each task that has not finished waits for a producer. Then each waiting task looks for its producers once more: a task with a failed producer fails with `dependency of '<id>' failed`, and each other task fails with `deadlock waiting for inputs of '<id>'`. The build does not check for a deadlock while subscribers get the events of a change, because a subscriber can still change the tasks.
 
 | You add the task | The task starts |
@@ -66,7 +81,7 @@ A task looks for its producers among the current tasks. When a producer has fail
 | before the first `run()`, or during the scans of the first `run()` | when the first [`run()`](#buildrun) starts its tasks, after the scans |
 | at any other time, even after `run()` resolves, unless the `Build` has a [fatal error](#fatal-errors) | immediately, with no new `run()` call. The next `run()` waits for it and puts it in its `Result` |
 
-Exception: the first `run()` sends `promised` events before its scans start. When a subscriber calls `build.add` or `build.remove` at one of these events, every task that has not started starts immediately. These tasks look for their producers before the scans add their tasks, so they can miss them.
+Exception: the first `run()` sends `promised` events before its scans start. When a subscriber calls `build.add` or `build.remove` at one of these events, every task that has not started starts immediately. These tasks look for their producers before the scans add their tasks, so they can miss them ([a known issue](limits.md#a-task-change-at-the-first-promised-events-starts-tasks-before-the-scans)).
 
 A task that starts immediately looks for its producers only after the synchronous code that added it ends. So it waits for a producer that the same code adds after it, but it can miss one that the code adds after an `await`.
 
