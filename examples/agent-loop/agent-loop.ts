@@ -8,8 +8,9 @@
 // Run it two times from an empty folder: the second run skips each task. Edit inbox/demo.txt to rerun.
 import { existsSync } from "node:fs"
 import path from "node:path"
-import { Build, Task } from "dapat"
-import { FileArtifact, FileMatcher, FileTemplate, FilesystemPrefix, JsonStore } from "dapat/contrib"
+import { Build } from "dapat"
+import { FileArtifact, FileMatcher, FileTemplate, FolderTemplate, JsonStore } from "dapat/contrib"
+import { LambdaFileMatcher } from "./lambda-file-matcher"
 
 type Step = { kind: "tools"; terms: string[] } | { kind: "answer"; text: string }
 
@@ -54,37 +55,41 @@ build.each({
   },
 })
 
+// The vars of a step file: turns/<sid>/<n>/step.json gives { sid, n, next }, where next is n + 1.
+// A pattern cannot compute next, so this matcher takes a function.
+function stepVars(relativePath: string) {
+  const parts = relativePath.split("/")
+  if (parts.length !== 3 || parts[2] !== "step.json") {
+    return null
+  }
+  const sid = parts[0]!
+  const n = parts[1]!
+  return { sid, n, next: String(Number(n) + 1) }
+}
+
 // advance writes the next prompt only when the model asked for tools. An output that may not be
 // written must be a folder: a declared file would make the next turn at the start of each build,
 // and that turn the next one, until build.run() rejects with "send limit".
 // The folder of turn n+1 has one writer, this task. A shared folder makes tasks rerun.
 build.each({
+  name: "advance",
   matchersByName: {
     prompt: new FileMatcher("prompts/<sid>/<n>/prompt.txt"),
-    step: new FileMatcher("turns/<sid>/<n>/step.json"),
+    step: new LambdaFileMatcher("turns", ["sid", "n", "next"], stepVars),
   },
-  *tasks(vars, matched) {
-    const prompt = matched.prompt.data
-    const step = matched.step.data
-    const nextFolder = new FilesystemPrefix(`prompts/${vars.sid}/${Number(vars.n) + 1}`)
-    yield new Task({
-      id: `advance:${vars.sid}/${vars.n}`,
-      inputs: [prompt, step],
-      outputs: [nextFolder],
-      run: async (ctx) => {
-        const reply: Step = JSON.parse(await Bun.file(step.path).text())
-        if (reply.kind === "answer") {
-          return
-        }
-        let text = await Bun.file(prompt.path).text()
-        for (const term of reply.terms) {
-          text += `${search(term)}\n`
-        }
-        const next = new FileArtifact(path.join(nextFolder.path, "prompt.txt"))
-        await Bun.write(next.path, text)
-        ctx.produced(next)
-      },
-    })
+  outputsByName: { nextPrompt: new FolderTemplate("prompts/<sid>/<next>/") },
+  async run({ matched, outputs, ctx }) {
+    const reply: Step = JSON.parse(await Bun.file(matched.step.data.path).text())
+    if (reply.kind === "answer") {
+      return
+    }
+    let text = await Bun.file(matched.prompt.data.path).text()
+    for (const term of reply.terms) {
+      text += `${search(term)}\n`
+    }
+    const next = new FileArtifact(path.join(outputs.nextPrompt.path, "prompt.txt"))
+    await Bun.write(next.path, text)
+    ctx.produced(next)
   },
 })
 
