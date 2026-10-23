@@ -1,7 +1,7 @@
 // An agent loop as a dapat build. Each turn is a file, so a rerun with no edits calls the model zero times.
 //
 //   inbox/<sid>.txt              you write the question
-//   prompts/<sid>/<n>/prompt.txt seed writes turn 0; advance:<sid>/<n-1> writes the others
+//   prompts/<sid>/<n>/prompt.txt seed writes turn 0; advance:<sid>/<n-1>/<n> writes the others
 //   turns/<sid>/<n>/step.json    think:<sid>/<n> asks the model: tool calls, or the answer
 //
 // The number of turns is known only at run time. Each new prompt file makes the next think task.
@@ -10,7 +10,7 @@ import { existsSync } from "node:fs"
 import path from "node:path"
 import { Build } from "dapat"
 import { FileArtifact, FileMatcher, FileTemplate, FolderTemplate, JsonStore } from "dapat/contrib"
-import { LambdaFileMatcher } from "./lambda-file-matcher"
+import { ComputedVarsMatcher } from "./computed-vars-matcher"
 
 type Step = { kind: "tools"; terms: string[] } | { kind: "answer"; text: string }
 
@@ -55,18 +55,6 @@ build.each({
   },
 })
 
-// The vars of a step file: turns/<sid>/<n>/step.json gives { sid, n, next }, where next is n + 1.
-// A pattern cannot compute next, so this matcher takes a function.
-function stepVars(relativePath: string) {
-  const parts = relativePath.split("/")
-  if (parts.length !== 3 || parts[2] !== "step.json") {
-    return null
-  }
-  const sid = parts[0]!
-  const n = parts[1]!
-  return { sid, n, next: String(Number(n) + 1) }
-}
-
 // advance writes the next prompt only when the model asked for tools. An output that may not be
 // written must be a folder: a declared file would make the next turn at the start of each build,
 // and that turn the next one, until build.run() rejects with "send limit".
@@ -75,7 +63,10 @@ build.each({
   name: "advance",
   matchersByName: {
     prompt: new FileMatcher("prompts/<sid>/<n>/prompt.txt"),
-    step: new LambdaFileMatcher("turns", ["sid", "n", "next"], stepVars),
+    // next = n + 1 names the folder of the next prompt. A pattern cannot compute it.
+    step: new ComputedVarsMatcher(new FileMatcher("turns/<sid>/<n>/step.json"), {
+      next: (vars) => String(Number(vars.n) + 1),
+    }),
   },
   outputsByName: { nextPrompt: new FolderTemplate("prompts/<sid>/<next>/") },
   async run({ matched, outputs, ctx }) {
