@@ -1,5 +1,6 @@
 // A matcher that adds vars to the matches of another matcher. Each added var is a function of the
 // vars of the match, like a computed column in a database view. For example, `next` = `n` + 1.
+// Each function must give the same value for the same vars: a gone event computes the vars again.
 import { Matcher, type ArtifactEvent, type MatchedData, type Ref, type Vars } from "dapat"
 
 export type VarFunctions = Record<string, (vars: Vars) => string>
