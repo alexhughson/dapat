@@ -1,25 +1,33 @@
-// An agent loop with tool calls, as a dapat build. Each turn is a file.
+// An agent loop as a dapat build. Each model call and each tool call is one task that writes one file.
 //
 //   inbox/<session>.txt                       you write the question
 //   requests/<session>/<turn>/request.json    the chat request of this turn: model, tools, messages
 //   replies/<session>/<turn>/reply.json       the reply of the model: text, tool calls, or both
+//   calls/<session>/<turn>/<call>.json        one tool call of the reply: the tool name and the arguments
+//   results/<session>/<turn>/<call>.txt       the text that the tool returned for that call
 //
-//   start:<session>                    question → request of turn 0
-//   model:<session>/<turn>             request → reply (one call to the model through OpenRouter)
-//   tools:<session>/<turn>/<nextTurn>  runs each tool call of the reply, and writes the request of the
-//                                      next turn with the results. No tool call: the loop ends.
+//   start:<session>                   question → request of turn 0
+//   model:<session>/<turn>            request → reply (one call to the model through OpenRouter)
+//   calls:<session>/<turn>            reply → one call file for each tool call. No tool call: no file,
+//                                     so no later task of this session exists, and the loop ends.
+//   tool:<session>/<turn>/<call>      call file → result file (runs one tool, see tools.ts)
+//   next:<session>/<turn>/<nextTurn>  request + reply + every result of the turn → request of the next turn
 //
-// The number of turns is known only at run time. Each new request file makes the next model task.
-// The model and the tools are in each request file, so a change to either runs the session again.
+// The tool calls of one turn run at the same time. A tool call that fails stops only its own session,
+// and the next run starts again at that call: it sends no finished model call and runs no finished
+// tool call again. The second run with no edit calls the model zero times.
 //
-// Set OPENROUTER_API_KEY, then run it from an empty folder. The second run calls the model zero times.
+// Set OPENROUTER_API_KEY, then run it from an empty folder. The first run writes a sample question
+// and the notes that the tools read.
 import { existsSync } from "node:fs"
 import path from "node:path"
 import { Build } from "dapat"
-import { FileArtifact, FileMatcher, FileTemplate, FolderTemplate, JsonStore } from "dapat/contrib"
+import { FileArtifact, FileGroupMatcher, FileMatcher, FileTemplate, FolderTemplate, JsonStore } from "dapat/contrib"
 import { ComputedVarsMatcher } from "./computed-vars-matcher"
+import { tools, type ToolDefinition } from "./tools"
 
 const MODEL = "deepseek/deepseek-v4.1-flash"
+const MAX_TURNS = 8
 
 // The shapes of the OpenAI chat completions API with tools, which OpenRouter uses for each model.
 type ToolCall = { id: string; type: "function"; function: { name: string; arguments: string } }
@@ -27,39 +35,10 @@ type Message =
   | { role: "user"; content: string }
   | { role: "assistant"; content: string | null; tool_calls?: ToolCall[] }
   | { role: "tool"; tool_call_id: string; content: string }
-type ToolDefinition = { type: "function"; function: { name: string; description: string; parameters: object } }
 type ChatRequest = { model: string; tools: ToolDefinition[]; messages: Message[] }
 
-// The tools that the model can call. Each one is a local function of the arguments that the model sends.
-const temperatures: Record<string, number> = { paris: 21, london: 15, tokyo: 26 }
-const tools: Record<string, { definition: ToolDefinition; run: (args: Record<string, unknown>) => string }> = {
-  get_temperature: {
-    definition: {
-      type: "function",
-      function: {
-        name: "get_temperature",
-        description: "The temperature in a city now, in degrees Celsius.",
-        parameters: { type: "object", properties: { city: { type: "string" } }, required: ["city"] },
-      },
-    },
-    run: (args) => {
-      const city = String(args.city)
-      const celsius = temperatures[city.toLowerCase()]
-      if (celsius === undefined) return `no data for ${city}`
-      return String(celsius)
-    },
-  },
-  celsius_to_fahrenheit: {
-    definition: {
-      type: "function",
-      function: {
-        name: "celsius_to_fahrenheit",
-        description: "Converts degrees Celsius to degrees Fahrenheit.",
-        parameters: { type: "object", properties: { celsius: { type: "number" } }, required: ["celsius"] },
-      },
-    },
-    run: (args) => String((Number(args.celsius) * 9) / 5 + 32),
-  },
+async function readJson<T>(file: FileArtifact): Promise<T> {
+  return JSON.parse(await Bun.file(file.path).text())
 }
 
 async function callModel(request: ChatRequest): Promise<Message> {
@@ -81,7 +60,11 @@ if (process.env.OPENROUTER_API_KEY === undefined) {
   process.exit(2)
 }
 if (!existsSync("inbox")) {
-  await Bun.write("inbox/demo.txt", "Is it warmer in Paris or in Tokyo now? Give both in Fahrenheit.\n")
+  await Bun.write("notes/mon.md", "Ran 5.2 km along the river.\n")
+  await Bun.write("notes/wed.md", "Rest day. Stretching only.\n")
+  await Bun.write("notes/thu.md", "Ran 8 km, with hills.\n")
+  await Bun.write("notes/sat.md", "Long run: 14.5 km.\n")
+  await Bun.write("inbox/demo.txt", "How many kilometres did I run this week? Read my training notes.\n")
 }
 
 const build = new Build({ store: new JsonStore(".dapat/state.json") })
@@ -96,6 +79,8 @@ build.each({
     for (const tool of Object.values(tools)) {
       toolDefinitions.push(tool.definition)
     }
+    // The model and the tool definitions are in the request file, so a change to either one changes
+    // this file, and the session runs again.
     const request: ChatRequest = {
       model: MODEL,
       tools: toolDefinitions,
@@ -110,44 +95,86 @@ build.each({
   matchersByName: { request: new FileMatcher("requests/<session>/<turn>/request.json") },
   outputsByName: { reply: new FileTemplate("replies/<session>/<turn>/reply.json") },
   async run({ matched, outputs }) {
-    const request: ChatRequest = JSON.parse(await Bun.file(matched.request.data.path).text())
+    const request = await readJson<ChatRequest>(matched.request.data)
     const reply = await callModel(request)
     await Bun.write(outputs.reply.path, JSON.stringify(reply, null, 2))
   },
 })
 
-// No tool call means the loop ends, so the next turn may not exist. That is why the output is a folder:
-// a declared file would start a new turn on every build, until build.run() rejects with "send limit".
-// This task is the only writer of that folder. A folder with two writers makes tasks rerun.
+// The number of tool calls is known only when the reply exists, so the output is a folder, and the
+// task reports each call file that it writes. Each report makes the tool task of that call.
 build.each({
-  name: "tools",
+  name: "calls",
+  matchersByName: { reply: new FileMatcher("replies/<session>/<turn>/reply.json") },
+  outputsByName: { callsFolder: new FolderTemplate("calls/<session>/<turn>/") },
+  async run({ vars, matched, outputs, ctx }) {
+    const reply = await readJson<Message>(matched.reply.data)
+    if (reply.role !== "assistant") {
+      throw new Error(`the reply has the role '${reply.role}', not 'assistant'`)
+    }
+    const toolCalls = reply.tool_calls ?? []
+    if (toolCalls.length === 0) {
+      console.log(`answer for ${vars.session}: ${reply.content}`)
+    }
+    for (const [index, toolCall] of toolCalls.entries()) {
+      const callFile = new FileArtifact(path.join(outputs.callsFolder.path, `${index}.json`))
+      await Bun.write(callFile.path, JSON.stringify(toolCall, null, 2))
+      ctx.produced(callFile)
+    }
+  },
+})
+
+build.each({
+  name: "tool",
+  matchersByName: { call: new FileMatcher("calls/<session>/<turn>/<call>.json") },
+  outputsByName: { result: new FileTemplate("results/<session>/<turn>/<call>.txt") },
+  async run({ vars, matched, outputs }) {
+    const toolCall = await readJson<ToolCall>(matched.call.data)
+    const tool = tools[toolCall.function.name]
+    if (tool === undefined) {
+      throw new Error(`the model called an unknown tool '${toolCall.function.name}'`)
+    }
+    const result = await tool.run(JSON.parse(toolCall.function.arguments))
+    console.log(`${vars.session} turn ${vars.turn}: ${toolCall.function.name}(${toolCall.function.arguments}) = ${JSON.stringify(result)}`)
+    await Bun.write(outputs.result.path, result)
+  },
+})
+
+// `results` is one match with the list of every result file of the turn, so this task waits for
+// every tool task of the turn. A turn with no tool call has no result file, so it has no `next` task.
+build.each({
+  name: "next",
   matchersByName: {
     request: new FileMatcher("requests/<session>/<turn>/request.json"),
     // nextTurn = turn + 1 names the folder of the next request. A pattern cannot compute it.
     reply: new ComputedVarsMatcher(new FileMatcher("replies/<session>/<turn>/reply.json"), {
       nextTurn: (vars) => String(Number(vars.turn) + 1),
     }),
+    results: new FileGroupMatcher("results/<session>/<turn>/*.txt"),
   },
+  // A folder, because a declared file would get its `model` task before this task runs. With a
+  // folder, the next turn starts only at the report of the request file.
   outputsByName: { nextTurnFolder: new FolderTemplate("requests/<session>/<nextTurn>/") },
-  async run({ matched, outputs, ctx }) {
-    const request: ChatRequest = JSON.parse(await Bun.file(matched.request.data.path).text())
-    const reply: Message = JSON.parse(await Bun.file(matched.reply.data.path).text())
-    if (reply.role !== "assistant") {
-      throw new Error(`the reply has the role '${reply.role}', not 'assistant'`)
-    }
-    if (reply.tool_calls === undefined || reply.tool_calls.length === 0) {
-      console.log(`answer for ${matched.request.vars.session}: ${reply.content}`)
+  async run({ vars, matched, outputs, ctx }) {
+    const request = await readJson<ChatRequest>(matched.request.data)
+    const reply = await readJson<Message>(matched.reply.data)
+    // dapat deletes no file, so after an edit to the question, the call and result files of the old
+    // reply can still be there. The reply decides which results go into the next request.
+    const toolCalls = (reply.role === "assistant" && reply.tool_calls) || []
+    if (toolCalls.length === 0) {
       return
     }
+    if (Number(vars.nextTurn) >= MAX_TURNS) {
+      throw new Error(`session '${vars.session}' has no answer after ${MAX_TURNS} turns`)
+    }
     const nextMessages: Message[] = [...request.messages, reply]
-    for (const call of reply.tool_calls) {
-      const tool = tools[call.function.name]
-      if (tool === undefined) {
-        throw new Error(`the model called an unknown tool '${call.function.name}'`)
+    for (const [index, toolCall] of toolCalls.entries()) {
+      const resultFile = matched.results.data.find((file) => path.basename(file.path) === `${index}.txt`)
+      if (resultFile === undefined) {
+        throw new Error(`turn ${vars.turn} of '${vars.session}' has no result for call ${index}`)
       }
-      const result = tool.run(JSON.parse(call.function.arguments))
-      console.log(`${matched.request.vars.session} turn ${matched.request.vars.turn}: ${call.function.name}(${call.function.arguments}) = ${result}`)
-      nextMessages.push({ role: "tool", tool_call_id: call.id, content: result })
+      const content = await Bun.file(resultFile.path).text()
+      nextMessages.push({ role: "tool", tool_call_id: toolCall.id, content })
     }
     const nextRequest: ChatRequest = { ...request, messages: nextMessages }
     const nextRequestFile = new FileArtifact(path.join(outputs.nextTurnFolder.path, "request.json"))
