@@ -9,13 +9,14 @@
 //   start:<session>                   question → request of turn 0
 //   model:<session>/<turn>            request → reply (one call to the model through OpenRouter)
 //   calls:<session>/<turn>            reply → one call file for each tool call. No tool call: no file,
-//                                     so no later task of this session exists, and the loop ends.
-//   tool:<session>/<turn>/<call>      call file → result file (runs one tool, see tools.ts)
+//                                     so the turn gets no later task, and the loop ends.
+//   tool:<session>/<turn>/<call>      call file + notes/ → result file (runs one tool, see tools.ts)
 //   next:<session>/<turn>/<nextTurn>  request + reply + every result of the turn → request of the next turn
 //
-// The tool calls of one turn run at the same time. A tool call that fails stops only its own session,
-// and the next run starts again at that call: it sends no finished model call and runs no finished
-// tool call again. The second run with no edit calls the model zero times.
+// The tool calls of one turn run at the same time. When a tool throws, only its own session stops,
+// and the next run starts again at that call. A second run with no edit calls the model zero times.
+// dapat deletes no file: after an edit to a question, the files of the old turns stay, and their
+// tasks skip. To start a session again from an empty state, delete its folders.
 //
 // Set OPENROUTER_API_KEY, then run it from an empty folder. The first run writes a sample question
 // and the notes that the tools read.
@@ -29,7 +30,6 @@ import { tools, type ToolDefinition } from "./tools"
 const MODEL = "deepseek/deepseek-v4.1-flash"
 const MAX_TURNS = 8
 
-// The shapes of the OpenAI chat completions API with tools, which OpenRouter uses for each model.
 type ToolCall = { id: string; type: "function"; function: { name: string; arguments: string } }
 type Message =
   | { role: "user"; content: string }
@@ -75,15 +75,9 @@ build.each({
   outputsByName: { request: new FileTemplate("requests/<session>/0/request.json") },
   async run({ matched, outputs }) {
     const question = await Bun.file(matched.question.data.path).text()
-    const toolDefinitions: ToolDefinition[] = []
-    for (const tool of Object.values(tools)) {
-      toolDefinitions.push(tool.definition)
-    }
-    // The model and the tool definitions are in the request file, so a change to either one changes
-    // this file, and the session runs again.
     const request: ChatRequest = {
       model: MODEL,
-      tools: toolDefinitions,
+      tools: Object.values(tools).map((tool) => tool.definition),
       messages: [{ role: "user", content: question.trim() }],
     }
     await Bun.write(outputs.request.path, JSON.stringify(request, null, 2))
@@ -109,10 +103,7 @@ build.each({
   outputsByName: { callsFolder: new FolderTemplate("calls/<session>/<turn>/") },
   async run({ vars, matched, outputs, ctx }) {
     const reply = await readJson<Message>(matched.reply.data)
-    if (reply.role !== "assistant") {
-      throw new Error(`the reply has the role '${reply.role}', not 'assistant'`)
-    }
-    const toolCalls = reply.tool_calls ?? []
+    const toolCalls = (reply.role === "assistant" && reply.tool_calls) || []
     if (toolCalls.length === 0) {
       console.log(`answer for ${vars.session}: ${reply.content}`)
     }
@@ -124,29 +115,36 @@ build.each({
   },
 })
 
+// The note tools read notes/, so the list of its files is an input: an edit to a note runs the tool
+// calls again, and `next` runs again only for a result that changed.
 build.each({
   name: "tool",
-  matchersByName: { call: new FileMatcher("calls/<session>/<turn>/<call>.json") },
+  matchersByName: {
+    call: new FileMatcher("calls/<session>/<turn>/<call>.json"),
+    notes: new FileGroupMatcher("notes/*"),
+  },
+  required: ["call"],
   outputsByName: { result: new FileTemplate("results/<session>/<turn>/<call>.txt") },
   async run({ vars, matched, outputs }) {
     const toolCall = await readJson<ToolCall>(matched.call.data)
     const tool = tools[toolCall.function.name]
-    if (tool === undefined) {
-      throw new Error(`the model called an unknown tool '${toolCall.function.name}'`)
-    }
-    const result = await tool.run(JSON.parse(toolCall.function.arguments))
+    // The model gets the text for an unknown tool as the result, so it can correct the call.
+    const result =
+      tool === undefined
+        ? `there is no tool named ${toolCall.function.name}`
+        : await tool.run(JSON.parse(toolCall.function.arguments))
     console.log(`${vars.session} turn ${vars.turn}: ${toolCall.function.name}(${toolCall.function.arguments}) = ${JSON.stringify(result)}`)
     await Bun.write(outputs.result.path, result)
   },
 })
 
 // `results` is one match with the list of every result file of the turn, so this task waits for
-// every tool task of the turn. A turn with no tool call has no result file, so it has no `next` task.
+// every tool task of the turn.
 build.each({
   name: "next",
   matchersByName: {
     request: new FileMatcher("requests/<session>/<turn>/request.json"),
-    // nextTurn = turn + 1 names the folder of the next request. A pattern cannot compute it.
+    // A pattern cannot compute turn + 1, which names the folder of the next request.
     reply: new ComputedVarsMatcher(new FileMatcher("replies/<session>/<turn>/reply.json"), {
       nextTurn: (vars) => String(Number(vars.turn) + 1),
     }),
@@ -158,8 +156,8 @@ build.each({
   async run({ vars, matched, outputs, ctx }) {
     const request = await readJson<ChatRequest>(matched.request.data)
     const reply = await readJson<Message>(matched.reply.data)
-    // dapat deletes no file, so after an edit to the question, the call and result files of the old
-    // reply can still be there. The reply decides which results go into the next request.
+    // After an edit to the question, the result files of the old reply can still be there, so the
+    // reply decides which results go into the next request.
     const toolCalls = (reply.role === "assistant" && reply.tool_calls) || []
     if (toolCalls.length === 0) {
       return
@@ -184,11 +182,7 @@ build.each({
 })
 
 const result = await build.run()
-const executedIds: string[] = []
-for (const task of result.executed) {
-  executedIds.push(task.id)
-}
-console.log("executed:", executedIds.sort())
+console.log("executed:", result.executed.map((task) => task.id).sort())
 console.log("skipped:", result.skipped.length)
 if (!result.success) {
   for (const [task, error] of result.failed) {

@@ -38,11 +38,8 @@ export const tools: Record<string, Tool> = {
     "The sum of a list of numbers.",
     { numbers: { type: "array", items: { type: "number" } } },
     async (args) => {
-      if (!Array.isArray(args.numbers)) {
-        return "numbers must be a list of numbers"
-      }
       let sum = 0
-      for (const value of args.numbers) {
+      for (const value of args.numbers as unknown[]) {
         sum += Number(value)
       }
       return String(Math.round(sum * 1000) / 1000)
